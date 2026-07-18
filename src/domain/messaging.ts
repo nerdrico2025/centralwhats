@@ -1,0 +1,205 @@
+import type { Repo } from '../repo';
+import type { Instance, Message } from '../repo/types';
+import { getProvider, makeOutboxSender } from '../providers';
+import { MetaApiError, UnsupportedByProviderError } from '../providers/errors';
+import type {
+  ListSection,
+  MediaPayload,
+  Provider,
+  ProviderCapabilities,
+  ReplyButton,
+  SendResult,
+} from '../providers/types';
+import { normalizePhone } from '../util/phone';
+import { resolveTemplateLanguage } from './templates';
+
+/** Entrada de envio avulso — união discriminada por `type`. */
+export type SendInput =
+  | { type: 'text'; to: string; text: string }
+  | { type: 'media'; to: string; media: MediaPayload }
+  | {
+      type: 'template';
+      to: string;
+      // language é opcional: se omitido, é resolvido pelo template sincronizado
+      // (fonte da verdade da Meta). Nunca há default pt_BR.
+      template: { name: string; language?: string };
+      vars?: Record<string, string>;
+    }
+  | { type: 'buttons'; to: string; body: string; buttons: ReplyButton[] }
+  | { type: 'list'; to: string; body: string; buttonText: string; sections: ListSection[] }
+  | { type: 'reaction'; to: string; messageId: string; emoji: string }
+  | { type: 'cta_url'; to: string; body: string; buttonText: string; url: string };
+
+/** Falha de envio já logada em messages. Carrega o código/mensagem da Meta. */
+export class SendFailedError extends Error {
+  constructor(
+    readonly code: string | null,
+    message: string,
+    readonly httpStatus: number,
+    readonly loggedMessageId: string,
+  ) {
+    super(message);
+    this.name = 'SendFailedError';
+  }
+}
+
+export interface MessagingDeps {
+  /** Resolve o provider da instância. Injetável em testes (mock). */
+  providerFor?: (instance: Instance) => Provider;
+}
+
+/** Capacidade exigida por tipo de envio (para checar provider.capabilities). */
+const CAPABILITY: Record<SendInput['type'], keyof ProviderCapabilities> = {
+  text: 'text',
+  media: 'media',
+  template: 'template',
+  buttons: 'buttons',
+  list: 'list',
+  reaction: 'reaction',
+  cta_url: 'cta',
+};
+
+/** Tipo interno gravado em messages.type. */
+function messageType(input: SendInput): string {
+  switch (input.type) {
+    case 'media':
+      return input.media.kind;
+    case 'buttons':
+    case 'list':
+    case 'cta_url':
+      return 'interactive';
+    default:
+      return input.type; // 'text' | 'template' | 'reaction'
+  }
+}
+
+/** Conteúdo estruturado gravado em messages.content (sem o campo `to`). */
+function messageContent(input: SendInput): unknown {
+  const rest = { ...input } as Record<string, unknown>;
+  delete rest.to;
+  return rest;
+}
+
+function callProvider(
+  provider: Provider,
+  instance: Instance,
+  input: SendInput,
+  resolvedTemplateLanguage?: string,
+): Promise<SendResult> {
+  switch (input.type) {
+    case 'text':
+      return provider.sendText(instance, input.to, input.text);
+    case 'media':
+      return provider.sendMedia(instance, input.to, input.media);
+    case 'template':
+      return provider.sendTemplate(
+        instance,
+        input.to,
+        { name: input.template.name, language: resolvedTemplateLanguage ?? '' },
+        input.vars,
+      );
+    case 'buttons':
+      return provider.sendButtons(instance, input.to, input.body, input.buttons);
+    case 'list':
+      return provider.sendList(instance, input.to, input.body, input.buttonText, input.sections);
+    case 'reaction':
+      return provider.sendReaction(instance, input.to, input.messageId, input.emoji);
+    case 'cta_url':
+      return provider.sendCtaUrl(instance, input.to, input.body, input.buttonText, input.url);
+  }
+}
+
+/**
+ * Envia uma mensagem avulsa por uma instância e LOGA o resultado em messages
+ * (direction=out) — sucesso E falha (CLAUDE.md: "logue TODO envio").
+ *
+ * - Usa provider.* (getProvider). NUNCA chama a Graph API direto.
+ * - Sucesso: grava com wa_message_id retornado pela Meta e status inicial.
+ * - Falha da Meta: grava status=failed com error_code/error_message e lança
+ *   SendFailedError (estruturado) para o handler devolver ao client.
+ *
+ * @param campaignId opcional — vincula a mensagem a uma campanha (P3).
+ */
+export async function sendViaProvider(
+  repo: Repo,
+  instance: Instance,
+  input: SendInput,
+  deps: MessagingDeps = {},
+  campaignId: string | null = null,
+): Promise<{ message: Message; result: SendResult }> {
+  // Default: Meta direto; Baileys via OUTBOX (a camada web nunca fala com o
+  // socket — o worker consome a intenção e envia).
+  const provider = deps.providerFor
+    ? deps.providerFor(instance)
+    : getProvider(instance, { baileysSender: makeOutboxSender(repo) });
+
+  // Respeita capacidades do provider (ex.: template/cta não existem no Baileys).
+  const cap = CAPABILITY[input.type];
+  if (!provider.capabilities[cap]) {
+    throw new UnsupportedByProviderError(cap, provider.type);
+  }
+
+  // Template: resolve o idioma pelo registro SINCRONIZADO (fonte da verdade).
+  // Nunca há default pt_BR — resolveTemplateLanguage lança se for ambíguo.
+  let resolvedTemplateLanguage: string | undefined;
+  let contentInput: SendInput = input;
+  if (input.type === 'template') {
+    resolvedTemplateLanguage = await resolveTemplateLanguage(
+      repo,
+      instance,
+      input.template.name,
+      input.template.language,
+    );
+    contentInput = {
+      ...input,
+      template: { name: input.template.name, language: resolvedTemplateLanguage },
+    };
+  }
+
+  const from = instance.phone_number_id ?? '';
+  const to = normalizePhone(input.to);
+  const type = messageType(input);
+  const content = messageContent(contentInput);
+
+  try {
+    const result = await callProvider(provider, instance, input, resolvedTemplateLanguage);
+    const message = await repo.messages.create({
+      instance_id: instance.id,
+      direction: 'out',
+      from_number: from,
+      to_number: to,
+      type,
+      content,
+      status: result.status === 'queued' ? 'queued' : 'sent',
+      error_code: null,
+      error_message: null,
+      wa_message_id: result.waMessageId,
+      campaign_id: campaignId,
+    });
+    // Envio Baileys enfileirado: linka a outbox ao registro logado, para o
+    // worker confirmar (queued→sent) depois de enviar de verdade.
+    if (result.outboxId) {
+      await repo.outbox.setMessageId(result.outboxId, message.id);
+    }
+    return { message, result };
+  } catch (err) {
+    if (err instanceof MetaApiError) {
+      // Loga a FALHA (nunca "só grava se deu certo").
+      const logged = await repo.messages.create({
+        instance_id: instance.id,
+        direction: 'out',
+        from_number: from,
+        to_number: to,
+        type,
+        content,
+        status: 'failed',
+        error_code: err.code,
+        error_message: err.message,
+        wa_message_id: null,
+        campaign_id: campaignId,
+      });
+      throw new SendFailedError(err.code, err.message, err.httpStatus, logged.id);
+    }
+    throw err;
+  }
+}

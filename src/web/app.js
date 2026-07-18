@@ -1,0 +1,2316 @@
+/* WA Manager — SPA shell (Vanilla JS, sem framework/bundler).
+   Roteamento client-side, seletor de instância global e API client que injeta
+   o instance_id atual. Telas são placeholders (Fase 2+), exceto Instâncias. */
+
+'use strict';
+
+// ------------------------------------------------------------------- sessão
+// V2: token JWT + usuário em localStorage. Sem usuários cadastrados a API
+// opera em modo bootstrap (org default, sem login) — o painel detecta pelo 401.
+const auth = {
+  token: localStorage.getItem('wa.jwt'),
+  user: JSON.parse(localStorage.getItem('wa.user') || 'null'),
+  set(token, user) {
+    this.token = token;
+    this.user = user;
+    localStorage.setItem('wa.jwt', token);
+    localStorage.setItem('wa.user', JSON.stringify(user));
+  },
+  clear() {
+    this.token = null;
+    this.user = null;
+    localStorage.removeItem('wa.jwt');
+    localStorage.removeItem('wa.user');
+  },
+  role() {
+    return this.user ? this.user.role : 'owner'; // bootstrap = owner
+  },
+};
+
+// ----------------------------------------------------------------- API client
+const api = {
+  currentInstanceId: null,
+
+  async raw(method, path, body) {
+    const res = await fetch(path, {
+      method,
+      headers: {
+        ...(body ? { 'Content-Type': 'application/json' } : {}),
+        ...(auth.token ? { Authorization: 'Bearer ' + auth.token } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (res.status === 401 && !path.startsWith('/api/auth/')) {
+      // Sessão inválida/expirada (ou sistema trancado): volta pro login.
+      auth.clear();
+      renderLoginScreen();
+      throw new Error('Não autenticado');
+    }
+    if (!res.ok) {
+      let detail = '';
+      try {
+        detail = (await res.json()).error || '';
+      } catch {
+        /* corpo não-JSON: ignora */
+      }
+      throw new Error(detail || `HTTP ${res.status}`);
+    }
+    return res.status === 204 ? null : res.json();
+  },
+  get(path) {
+    return this.raw('GET', path);
+  },
+  post(path, body) {
+    return this.raw('POST', path, body);
+  },
+
+  /** Monta um path escopado na instância atual: injeta o instance_id. */
+  forInstance(suffix) {
+    if (!this.currentInstanceId) throw new Error('Nenhuma instância selecionada');
+    return `/api/instances/${this.currentInstanceId}${suffix}`;
+  },
+
+  listInstances() {
+    return this.get('/api/instances');
+  },
+};
+
+// ------------------------------------------------------------------ app state
+const state = {
+  instances: [],
+  route: '/dashboard',
+};
+
+// ------------------------------------------------- estrutura de navegação (§12)
+const NAV = [
+  {
+    section: 'PRINCIPAL',
+    items: [
+      { path: '/dashboard', label: 'Dashboard', icon: '▤' },
+      { path: '/instancias', label: 'Instâncias', icon: '☰' },
+    ],
+  },
+  {
+    section: 'ENVIOS',
+    items: [
+      { path: '/disparar', label: 'Disparar Mensagem', icon: '✉' },
+      { path: '/disparo-massa', label: 'Disparo em Massa', icon: '📢' },
+      { path: '/templates', label: 'Templates', icon: '▦' },
+    ],
+  },
+  {
+    section: 'ATENDIMENTO',
+    items: [
+      { path: '/livechat', label: 'Live Chat', icon: '💬', badgeKey: 'unread' },
+      { path: '/chatbot', label: 'Chatbot', icon: '🤖' },
+    ],
+  },
+  {
+    section: 'MARKETING',
+    items: [
+      { path: '/listas', label: 'Listas', icon: '≣' },
+      { path: '/crm', label: 'CRM', icon: '◱' },
+      { path: '/campanhas', label: 'Campanhas', icon: '◎' },
+    ],
+  },
+  {
+    section: 'ANÁLISE',
+    items: [
+      { path: '/relatorios', label: 'Relatórios', icon: '▧' },
+      { path: '/faturamento', label: 'Faturamento', icon: '$' },
+    ],
+  },
+  {
+    section: 'CONFIGURAÇÕES',
+    items: [{ path: '/usuarios', label: 'Usuários', icon: '👥' }],
+  },
+];
+
+// Papel 'agent' só atende: enxerga apenas o Live Chat (o backend já dá 403
+// no resto — aqui a UI esconde o que ele não pode usar).
+function visibleNav() {
+  if (auth.role() !== 'agent') return NAV;
+  return [
+    {
+      section: 'ATENDIMENTO',
+      items: [{ path: '/livechat', label: 'Live Chat', icon: '💬', badgeKey: 'unread' }],
+    },
+  ];
+}
+
+const BADGES = { unread: 0 }; // preenchido na Fase 2 (Live Chat)
+
+// ----------------------------------------------------------------- utilidades
+function h(tag, attrs = {}, children = []) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'class') el.className = v;
+    else if (k === 'html') el.innerHTML = v;
+    else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2), v);
+    else if (v != null) el.setAttribute(k, v);
+  }
+  for (const c of [].concat(children)) {
+    if (c == null) continue;
+    el.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+  }
+  return el;
+}
+
+function pageHeader(title, subtitle) {
+  return h('div', {}, [
+    h('h1', { class: 'page-title' }, title),
+    subtitle ? h('p', { class: 'page-subtitle' }, subtitle) : null,
+  ]);
+}
+
+function placeholderScreen(title, subtitle, emoji) {
+  return h('div', {}, [
+    pageHeader(title, subtitle),
+    h('div', { class: 'card' }, [
+      h('div', { class: 'placeholder' }, [
+        h('div', { class: 'placeholder__emoji' }, emoji || '🚧'),
+        h('div', {}, 'Tela em construção — chega nas próximas fases.'),
+      ]),
+    ]),
+  ]);
+}
+
+// -------------------------------------------------------------------- screens
+// --------------------------------------------------------- helpers SVG (P2.3)
+const SVG_NS = 'http://www.w3.org/2000/svg';
+function svg(tag, attrs = {}, children = []) {
+  const el = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs)) if (v != null) el.setAttribute(k, String(v));
+  for (const c of [].concat(children)) if (c != null) el.appendChild(c);
+  return el;
+}
+const CHART_COLORS = ['#25d366', '#3b82f6', '#f59e0b', '#8b5cf6', '#14b8a6', '#ef4444', '#64748b'];
+
+/** Gráfico de área: enviadas (verde) vs recebidas (azul) nos últimos 30 dias. */
+function areaChart(series) {
+  const W = 640;
+  const H = 220;
+  const padL = 34;
+  const padR = 10;
+  const padT = 12;
+  const padB = 22;
+  const n = series.length;
+  const maxV = Math.max(1, ...series.map((d) => Math.max(d.sent, d.received)));
+  const x = (i) => padL + (i * (W - padL - padR)) / Math.max(1, n - 1);
+  const y = (v) => padT + (H - padT - padB) * (1 - v / maxV);
+  const baseline = y(0);
+
+  function pathFor(key) {
+    const pts = series.map((d, i) => `${x(i)},${y(d[key])}`);
+    return {
+      line: 'M' + pts.join(' L'),
+      area: `M${x(0)},${baseline} L` + pts.join(' L') + ` L${x(n - 1)},${baseline} Z`,
+    };
+  }
+  const sent = pathFor('sent');
+  const recv = pathFor('received');
+
+  const gridLines = [0, 0.5, 1].map((f) =>
+    svg('line', {
+      x1: padL,
+      x2: W - padR,
+      y1: padT + (H - padT - padB) * f,
+      y2: padT + (H - padT - padB) * f,
+      stroke: '#e2e8f0',
+    }),
+  );
+  // rótulos de x: primeiro, meio, último
+  const xticks = [0, Math.floor(n / 2), n - 1].map((i) =>
+    svg('text', { x: x(i), y: H - 6, 'font-size': 10, fill: '#94a3b8', 'text-anchor': 'middle' }, [
+      document.createTextNode(series[i] ? series[i].date.slice(5) : ''),
+    ]),
+  );
+  const ymax = svg('text', { x: 4, y: padT + 8, 'font-size': 10, fill: '#94a3b8' }, [
+    document.createTextNode(String(maxV)),
+  ]);
+
+  return svg('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img' }, [
+    ...gridLines,
+    svg('path', { d: recv.area, fill: '#3b82f6', opacity: 0.12 }),
+    svg('path', { d: recv.line, fill: 'none', stroke: '#3b82f6', 'stroke-width': 2 }),
+    svg('path', { d: sent.area, fill: '#25d366', opacity: 0.14 }),
+    svg('path', { d: sent.line, fill: 'none', stroke: '#25d366', 'stroke-width': 2 }),
+    ...xticks,
+    ymax,
+  ]);
+}
+
+/** Donut de distribuição por tipo de mensagem. */
+function donutChart(items) {
+  const total = items.reduce((s, i) => s + i.count, 0);
+  const cx = 80;
+  const cy = 80;
+  const r = 70;
+  const ri = 44;
+  const paths = [];
+  if (total === 0) {
+    paths.push(svg('circle', { cx, cy, r: (r + ri) / 2, fill: 'none', stroke: '#e2e8f0', 'stroke-width': r - ri }));
+  } else {
+    let a0 = -Math.PI / 2;
+    items.forEach((it, idx) => {
+      const a1 = a0 + (it.count / total) * Math.PI * 2;
+      const large = a1 - a0 > Math.PI ? 1 : 0;
+      const p = (rad, ang) => `${cx + rad * Math.cos(ang)},${cy + rad * Math.sin(ang)}`;
+      const d = `M${p(r, a0)} A${r},${r} 0 ${large} 1 ${p(r, a1)} L${p(ri, a1)} A${ri},${ri} 0 ${large} 0 ${p(ri, a0)} Z`;
+      paths.push(svg('path', { d, fill: CHART_COLORS[idx % CHART_COLORS.length] }));
+      a0 = a1;
+    });
+  }
+  const chart = svg('svg', { viewBox: '0 0 160 160', width: 160, height: 160 }, paths);
+  const legend = h(
+    'div',
+    { class: 'legend' },
+    items.map((it, idx) =>
+      h('span', { class: 'legend__item' }, [
+        h('span', {
+          class: 'legend__dot',
+          style: `background:${CHART_COLORS[idx % CHART_COLORS.length]}`,
+        }),
+        `${it.type} (${it.count})`,
+      ]),
+    ),
+  );
+  return h('div', { class: 'donut-wrap' }, [chart, legend]);
+}
+
+const screens = {
+  '/dashboard': () => dashboardScreen(),
+
+  '/instancias': () => instanciasScreen(),
+
+  '/disparar': () => dispararScreen(),
+  '/disparo-massa': () =>
+    placeholderScreen('Disparo em Massa', 'Use a tela Campanhas para disparos em massa.', '📢'),
+  '/templates': () => templatesScreen(),
+  '/livechat': () => livechatScreen(),
+  '/chatbot': () => chatbotScreen(),
+  '/listas': () => listasScreen(),
+  '/crm': () => crmScreen(),
+  '/campanhas': () => campanhasScreen(),
+  '/relatorios': () => placeholderScreen('Relatórios', 'Análises e exportações.', '▧'),
+  '/faturamento': () => placeholderScreen('Faturamento', 'Custos e cobrança.', '$'),
+  '/usuarios': () => usuariosScreen(),
+};
+
+// ------------------------------------------------------------- Live Chat (P2.2)
+function messageText(type, content) {
+  const c = content || {};
+  switch (type) {
+    case 'text':
+      // inbound loga { body }; outbound loga { text } — tolera os dois.
+      return c.body || c.text || '';
+    case 'image':
+      return '🖼️ [imagem]';
+    case 'video':
+      return '🎬 [vídeo]';
+    case 'audio':
+      return '🔊 [áudio]';
+    case 'document':
+      return '📎 ' + (c.filename || '[documento]');
+    case 'sticker':
+      return '[sticker]';
+    case 'interactive':
+      return c.title || c.body || '[interativo]';
+    case 'button':
+      return c.text || '[botão]';
+    case 'template':
+      return '[template ' + (c.template?.name || '') + ']';
+    case 'reaction':
+      return c.emoji || '[reação]';
+    default:
+      return '[' + type + ']';
+  }
+}
+
+function formatTime(iso) {
+  try {
+    return new Date(iso).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+  } catch {
+    return '';
+  }
+}
+
+function livechatScreen() {
+  const listEl = h('div', { class: 'conv-list' });
+  const rightEl = h('div', {});
+  const root = h('div', {}, [
+    pageHeader('Live Chat', 'Conversas em tempo real.'),
+    h('div', { class: 'livechat' }, [listEl, rightEl]),
+  ]);
+
+  let selected = null;
+  let convs = [];
+
+  function previewOf(c) {
+    const prefix = c.last_message_direction === 'out' ? 'Você: ' : '';
+    return prefix + messageText(c.last_message_type, c.last_message_content);
+  }
+
+  function renderList() {
+    listEl.innerHTML = '';
+    if (!convs.length) {
+      listEl.appendChild(h('div', { class: 'placeholder' }, 'Sem conversas ainda.'));
+      return;
+    }
+    for (const c of convs) {
+      listEl.appendChild(
+        h(
+          'div',
+          {
+            class: 'conv-item' + (c.phone === selected ? ' active' : ''),
+            onclick: () => selectConversation(c.phone),
+          },
+          [
+            h('div', { class: 'conv-item__top' }, [
+              h('span', { class: 'conv-item__name' }, c.name || c.phone),
+              c.unread ? h('span', { class: 'conv-unread' }, String(c.unread)) : null,
+            ]),
+            h('div', { class: 'conv-item__preview' }, previewOf(c)),
+          ],
+        ),
+      );
+    }
+  }
+
+  async function loadConversations() {
+    try {
+      convs = await api.get(api.forInstance('/conversations'));
+    } catch {
+      convs = [];
+    }
+    renderList();
+    // Atualiza o badge de não-lidas do menu (soma das conversas).
+    const total = convs.reduce((s, c) => s + (c.unread || 0), 0);
+    if (BADGES.unread !== total) {
+      BADGES.unread = total;
+      refreshSidebar();
+    }
+  }
+
+  function renderConversation(msgs) {
+    const conv = convs.find((c) => c.phone === selected);
+    const header = h('div', { class: 'conversation__header' }, [
+      h('strong', {}, (conv && conv.name) || selected),
+      ' ',
+      h('span', { class: 'muted' }, selected),
+    ]);
+    const msgsEl = h('div', { class: 'conversation__messages' }, msgs.map((mm) =>
+      h('div', { class: 'bubble bubble--' + (mm.direction === 'in' ? 'in' : 'out') }, [
+        h('div', {}, messageText(mm.type, mm.content)),
+        h('div', { class: 'bubble__time' }, formatTime(mm.created_at)),
+      ]),
+    ));
+    const input = h('textarea', {
+      class: 'composer__input',
+      rows: '1',
+      placeholder: 'Digite uma mensagem…',
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        doSend(input);
+      }
+    });
+    const composer = h('div', { class: 'conversation__composer' }, [
+      input,
+      h('button', { class: 'btn btn--primary', onclick: () => doSend(input) }, 'Enviar'),
+    ]);
+
+    rightEl.innerHTML = '';
+    rightEl.appendChild(h('div', { class: 'conversation' }, [header, msgsEl, composer]));
+    msgsEl.scrollTop = msgsEl.scrollHeight; // rola pro fim
+  }
+
+  async function loadMessages() {
+    if (!selected) return;
+    let msgs = [];
+    try {
+      msgs = await api.get(
+        api.forInstance(`/conversations/${encodeURIComponent(selected)}/messages?limit=200`),
+      );
+    } catch {
+      msgs = [];
+    }
+    renderConversation(msgs.slice().reverse()); // repo retorna DESC; exibe ASC
+  }
+
+  async function selectConversation(phone) {
+    selected = phone;
+    try {
+      await api.post(api.forInstance(`/conversations/${encodeURIComponent(phone)}/read`));
+    } catch {
+      /* segue mesmo se falhar o read */
+    }
+    await loadMessages();
+    await loadConversations(); // zera não-lidas na lista e no badge
+  }
+
+  async function doSend(input) {
+    const text = input.value.trim();
+    if (!text || !selected) return;
+    input.value = '';
+    try {
+      await api.post(api.forInstance('/messages'), { type: 'text', to: selected, text });
+    } catch (e) {
+      alert('Falha ao enviar: ' + e.message);
+    }
+    await loadMessages();
+    await loadConversations();
+  }
+
+  rightEl.appendChild(h('div', { class: 'placeholder' }, 'Selecione uma conversa.'));
+
+  loadConversations();
+  // Atualização por POLLING curto (sem WebSocket na camada web — serverless).
+  const timer = setInterval(() => {
+    loadConversations();
+    if (selected) loadMessages();
+  }, 4000);
+  registerCleanup(() => clearInterval(timer));
+
+  return root;
+}
+
+// ------------------------------------------------------------- Dashboard (P2.3)
+function dashboardScreen() {
+  const body = h('div', {}, [h('div', { class: 'muted' }, 'Carregando…')]);
+  const root = h('div', {}, [pageHeader('Dashboard', 'Visão geral das suas métricas.'), body]);
+
+  const pct = (v) => (v * 100).toFixed(1) + '%';
+  const stat = (label, value) =>
+    h('div', { class: 'card stat' }, [
+      h('span', { class: 'stat__label' }, label),
+      h('span', { class: 'stat__value' }, String(value)),
+    ]);
+  const legendDot = (color, label) =>
+    h('span', { class: 'legend__item' }, [
+      h('span', { class: 'legend__dot', style: 'background:' + color }),
+      label,
+    ]);
+
+  (async () => {
+    let data;
+    try {
+      data = await api.get(api.forInstance('/dashboard'));
+    } catch (e) {
+      body.innerHTML = '';
+      body.appendChild(h('div', { class: 'muted' }, 'Erro ao carregar: ' + e.message));
+      return;
+    }
+    body.innerHTML = '';
+
+    body.appendChild(
+      h('div', { class: 'stat-row' }, [
+        stat('Mensagens Enviadas', data.sent),
+        stat('Mensagens Recebidas', data.received),
+        stat('Contatos', data.contacts),
+        stat('Instâncias Ativas', data.active_instances),
+        stat('Taxa de Entrega', pct(data.delivery_rate)),
+        stat('Taxa de Leitura', pct(data.read_rate)),
+      ]),
+    );
+
+    body.appendChild(
+      h('div', { class: 'card chart' }, [
+        h('h3', { class: 'card__title' }, 'Volume — Últimos 30 dias'),
+        areaChart(data.volume_30d),
+        h('div', { class: 'legend' }, [
+          legendDot('#25d366', 'Enviadas'),
+          legendDot('#3b82f6', 'Recebidas'),
+        ]),
+      ]),
+    );
+
+    const donutCard = h('div', { class: 'card' }, [
+      h('h3', { class: 'card__title' }, 'Tipos de Mensagem'),
+      donutChart(data.by_type),
+    ]);
+    const rows = data.by_instance.map((i) =>
+      h('tr', {}, [h('td', {}, i.name), h('td', {}, String(i.total))]),
+    );
+    const tableCard = h('div', { class: 'card' }, [
+      h('h3', { class: 'card__title' }, 'Volume por Instância'),
+      h('table', { class: 'table' }, [
+        h('thead', {}, [h('tr', {}, [h('th', {}, 'Instância'), h('th', {}, 'Mensagens')])]),
+        h('tbody', {}, rows),
+      ]),
+    ]);
+    body.appendChild(h('div', { class: 'dash-grid' }, [donutCard, tableCard]));
+  })();
+
+  return root;
+}
+
+// ------------------------------------------------------------- Listas (P3.1)
+function listasScreen() {
+  const leftCard = h('div', { class: 'card' });
+  const rightCard = h('div', { class: 'card' });
+  const root = h('div', {}, [
+    pageHeader('Listas', 'Segmentação de contatos.'),
+    h('div', { class: 'dash-grid' }, [leftCard, rightCard]),
+  ]);
+
+  let lists = [];
+  let selected = null;
+
+  async function loadLists() {
+    lists = await api.get(api.forInstance('/lists')).catch(() => []);
+    renderLists();
+  }
+
+  function renderLists() {
+    leftCard.innerHTML = '';
+    leftCard.appendChild(h('h3', { class: 'card__title' }, 'Listas'));
+    const nameInput = h('input', { class: 'select', placeholder: 'Nova lista' });
+    leftCard.appendChild(
+      h('div', { style: 'display:flex;gap:8px;margin-bottom:12px' }, [
+        nameInput,
+        h(
+          'button',
+          {
+            class: 'btn btn--primary',
+            onclick: async () => {
+              const name = nameInput.value.trim();
+              if (!name) return;
+              await api.post(api.forInstance('/lists'), { name });
+              nameInput.value = '';
+              loadLists();
+            },
+          },
+          'Criar',
+        ),
+      ]),
+    );
+    if (!lists.length) {
+      leftCard.appendChild(h('div', { class: 'muted' }, 'Nenhuma lista ainda.'));
+      return;
+    }
+    const rows = lists.map((l) =>
+      h('tr', {}, [
+        h('td', { style: 'cursor:pointer', onclick: () => selectList(l) }, l.name),
+        h('td', {}, [
+          h(
+            'button',
+            {
+              class: 'btn',
+              onclick: async () => {
+                await api.raw('DELETE', api.forInstance('/lists/' + l.id));
+                if (selected && selected.id === l.id) selected = null;
+                loadLists();
+                renderRight();
+              },
+            },
+            'Excluir',
+          ),
+        ]),
+      ]),
+    );
+    leftCard.appendChild(h('table', { class: 'table' }, [h('tbody', {}, rows)]));
+  }
+
+  function selectList(l) {
+    selected = l;
+    renderRight();
+  }
+
+  async function renderRight() {
+    rightCard.innerHTML = '';
+    if (!selected) {
+      rightCard.appendChild(h('div', { class: 'placeholder' }, 'Selecione uma lista.'));
+      return;
+    }
+    rightCard.appendChild(h('h3', { class: 'card__title' }, 'Contatos de "' + selected.name + '"'));
+    const inList = await api.get(api.forInstance('/lists/' + selected.id + '/contacts')).catch(() => []);
+    if (inList.length) {
+      rightCard.appendChild(
+        h('table', { class: 'table' }, [
+          h('tbody', {}, inList.map((c) =>
+            h('tr', {}, [
+              h('td', {}, c.name || c.phone),
+              h('td', {}, [
+                h(
+                  'button',
+                  {
+                    class: 'btn',
+                    onclick: async () => {
+                      await api.post(api.forInstance('/lists/' + selected.id + '/contacts/remove'), {
+                        contactIds: [c.id],
+                      });
+                      renderRight();
+                    },
+                  },
+                  'Remover',
+                ),
+              ]),
+            ]),
+          )),
+        ]),
+      );
+    } else {
+      rightCard.appendChild(h('div', { class: 'muted' }, 'Nenhum contato nesta lista.'));
+    }
+
+    // Adicionar contatos: multi-select dos que ainda não estão na lista.
+    const all = await api.get(api.forInstance('/contacts')).catch(() => []);
+    const ids = new Set(inList.map((c) => c.id));
+    const candidates = all.filter((c) => !ids.has(c.id));
+    if (candidates.length) {
+      const sel = h(
+        'select',
+        { class: 'select', multiple: 'multiple', style: 'min-height:120px;width:100%' },
+        candidates.map((c) => h('option', { value: c.id }, c.name || c.phone)),
+      );
+      rightCard.appendChild(h('div', { style: 'margin-top:12px' }, [
+        h('div', { class: 'muted', style: 'margin-bottom:6px' }, 'Adicionar contatos:'),
+        sel,
+        h(
+          'button',
+          {
+            class: 'btn btn--primary',
+            style: 'margin-top:8px',
+            onclick: async () => {
+              const chosen = [...sel.selectedOptions].map((o) => o.value);
+              if (!chosen.length) return;
+              await api.post(api.forInstance('/lists/' + selected.id + '/contacts'), {
+                contactIds: chosen,
+              });
+              renderRight();
+            },
+          },
+          'Adicionar selecionados',
+        ),
+      ]));
+    }
+  }
+
+  loadLists();
+  renderRight();
+  return root;
+}
+
+// ------------------------------------------------------------- Campanhas (P3.1)
+function campanhasScreen() {
+  const formCard = h('div', { class: 'card' });
+  const listCard = h('div', { class: 'card' });
+  const previewCard = h('div', { class: 'card', style: 'margin-top:16px' });
+  const root = h('div', {}, [
+    pageHeader('Campanhas', 'Monte uma campanha (sem disparar — o envio é a próxima fase).'),
+    h('div', { class: 'dash-grid' }, [formCard, listCard]),
+    previewCard,
+  ]);
+
+  const varRows = [{ ph: '1', src: 'name' }];
+
+  async function loadCampaigns() {
+    const camps = await api.get(api.forInstance('/campaigns')).catch(() => []);
+    listCard.innerHTML = '';
+    listCard.appendChild(h('h3', { class: 'card__title' }, 'Campanhas'));
+    if (!camps.length) {
+      listCard.appendChild(h('div', { class: 'muted' }, 'Nenhuma campanha ainda.'));
+      return;
+    }
+    listCard.appendChild(
+      h('table', { class: 'table' }, [
+        h('thead', {}, [
+          h('tr', {}, [h('th', {}, 'Nome'), h('th', {}, 'Status'), h('th', {}, 'Destinatários')]),
+        ]),
+        h('tbody', {}, camps.map((c) =>
+          h('tr', { style: 'cursor:pointer', onclick: () => preview(c.id) }, [
+            h('td', {}, c.name),
+            h('td', {}, [h('span', { class: 'badge' }, c.status)]),
+            h('td', {}, String(c.total_recipients)),
+          ]),
+        )),
+      ]),
+    );
+  }
+
+  // Polling do disparo (P3.2): enquanto running, cada intervalo chama /tick
+  // (idempotente) — é a UI quem "puxa" os lotes; nada roda preso no servidor.
+  let dispatchTimer = null;
+  function stopDispatchPolling() {
+    if (dispatchTimer) {
+      clearInterval(dispatchTimer);
+      dispatchTimer = null;
+    }
+  }
+  registerCleanup(() => stopDispatchPolling());
+
+  async function preview(campaignId) {
+    stopDispatchPolling();
+    previewCard.innerHTML = '';
+    const campaign = await api
+      .get(api.forInstance('/campaigns/' + campaignId))
+      .catch(() => null);
+    if (!campaign) {
+      previewCard.appendChild(h('div', { class: 'muted' }, 'Campanha não encontrada.'));
+      return;
+    }
+
+    const title = h('h3', { class: 'card__title' }, 'Campanha "' + campaign.name + '"');
+    const statusLine = h('div', { class: 'muted', style: 'margin-bottom:8px' });
+    const controls = h('div', { style: 'display:flex;gap:8px;margin-bottom:12px' });
+    const detail = h('div', {});
+    previewCard.appendChild(title);
+    previewCard.appendChild(statusLine);
+    previewCard.appendChild(controls);
+    previewCard.appendChild(detail);
+
+    function renderStatus(c, counts) {
+      statusLine.innerHTML = '';
+      const parts = [
+        'Status: ' + c.status,
+        'Total: ' + c.total_recipients,
+        'Enviados: ' + c.sent_count,
+        'Falhados: ' + c.failed_count,
+      ];
+      if (counts) parts.push('Pendentes: ' + counts.pending);
+      statusLine.appendChild(h('span', {}, parts.join(' · ')));
+    }
+    renderStatus(campaign, null);
+
+    async function showFailures() {
+      const fails = await api
+        .get(api.forInstance('/campaigns/' + campaignId + '/sends?status=failed'))
+        .catch(() => []);
+      detail.innerHTML = '';
+      detail.appendChild(h('h3', { class: 'card__title' }, 'Falhas (' + fails.length + ')'));
+      if (!fails.length) {
+        detail.appendChild(h('div', { class: 'muted' }, 'Nenhuma falha registrada.'));
+        return;
+      }
+      detail.appendChild(
+        h('table', { class: 'table' }, [
+          h('thead', {}, [h('tr', {}, [
+            h('th', {}, 'Telefone'), h('th', {}, 'Código'), h('th', {}, 'Motivo'), h('th', {}, 'Tentativas'),
+          ])]),
+          h('tbody', {}, fails.map((f) =>
+            h('tr', {}, [
+              h('td', {}, f.contact_phone),
+              h('td', {}, f.error_code || '—'),
+              h('td', {}, f.error_message || '—'),
+              h('td', {}, String(f.attempts)),
+            ]),
+          )),
+        ]),
+      );
+    }
+
+    async function showRecipients() {
+      const data = await api
+        .get(api.forInstance('/campaigns/' + campaignId + '/recipients?limit=50'))
+        .catch((e) => ({ error: e.message }));
+      detail.innerHTML = '';
+      if (data.error) {
+        detail.appendChild(h('div', { class: 'muted' }, 'Erro: ' + data.error));
+        return;
+      }
+      const tplInfo = data.template
+        ? `Template: ${data.template.name} (${data.template.language})`
+        : 'Sem template';
+      detail.appendChild(
+        h('div', { class: 'muted', style: 'margin-bottom:8px' }, `${tplInfo} · ${data.total} destinatário(s)`),
+      );
+      if (!data.recipients.length) {
+        detail.appendChild(h('div', { class: 'muted' }, 'Nenhum destinatário nas listas escolhidas.'));
+        return;
+      }
+      const varKeys = Object.keys(data.recipients[0].vars);
+      detail.appendChild(
+        h('table', { class: 'table' }, [
+          h('thead', {}, [h('tr', {}, [
+            h('th', {}, 'Telefone'), h('th', {}, 'Nome'),
+            ...varKeys.map((k) => h('th', {}, '{{' + k + '}}')),
+          ])]),
+          h('tbody', {}, data.recipients.map((r) =>
+            h('tr', {}, [
+              h('td', {}, r.phone),
+              h('td', {}, r.name || '—'),
+              ...varKeys.map((k) => h('td', {}, r.vars[k] || '')),
+            ]),
+          )),
+        ]),
+      );
+    }
+
+    function startPolling() {
+      stopDispatchPolling();
+      dispatchTimer = setInterval(async () => {
+        try {
+          const t = await api.post(api.forInstance('/campaigns/' + campaignId + '/tick'));
+          renderStatus(
+            { status: t.status, total_recipients: t.sent + t.failed + t.pending, sent_count: t.sent, failed_count: t.failed },
+            t,
+          );
+          if (t.status !== 'running') {
+            stopDispatchPolling();
+            loadCampaigns();
+            showFailures();
+          }
+        } catch (e) {
+          stopDispatchPolling();
+          alert('Erro no disparo: ' + e.message);
+        }
+      }, 2500);
+    }
+
+    controls.appendChild(
+      h('button', {
+        class: 'btn btn--primary',
+        onclick: async () => {
+          try {
+            const started = await api.post(api.forInstance('/campaigns/' + campaignId + '/start'));
+            renderStatus(started, null);
+            startPolling();
+          } catch (e) {
+            alert('Erro ao iniciar: ' + e.message);
+          }
+        },
+      }, campaign.status === 'paused' ? 'Retomar disparo' : 'Iniciar disparo'),
+    );
+    controls.appendChild(
+      h('button', {
+        class: 'btn',
+        onclick: async () => {
+          stopDispatchPolling();
+          await api.post(api.forInstance('/campaigns/' + campaignId + '/pause')).catch(() => {});
+          preview(campaignId);
+        },
+      }, 'Pausar'),
+    );
+    controls.appendChild(h('button', { class: 'btn', onclick: showRecipients }, 'Destinatários'));
+    controls.appendChild(h('button', { class: 'btn', onclick: showFailures }, 'Falhas'));
+
+    if (campaign.status === 'running') {
+      startPolling();
+      showFailures();
+    } else if (campaign.status === 'completed') {
+      showFailures();
+    } else {
+      showRecipients();
+    }
+  }
+
+  async function renderForm() {
+    formCard.innerHTML = '';
+    formCard.appendChild(h('h3', { class: 'card__title' }, 'Nova campanha'));
+    const templates = await api.get(api.forInstance('/templates')).catch(() => []);
+    const lists = await api.get(api.forInstance('/lists')).catch(() => []);
+
+    const nameInput = h('input', { class: 'select', placeholder: 'Nome da campanha', style: 'width:100%' });
+    const tplSelect = h(
+      'select',
+      { class: 'select', style: 'width:100%' },
+      [h('option', { value: '' }, '— sem template —')].concat(
+        templates.map((t) => h('option', { value: t.id }, `${t.name} (${t.language})`)),
+      ),
+    );
+    const intervalInput = h('input', { class: 'select', type: 'number', value: '1000', style: 'width:100%' });
+    const listChecks = lists.map((l) => {
+      const cb = h('input', { type: 'checkbox', value: l.id });
+      return { cb, node: h('label', { style: 'display:block' }, [cb, ' ' + l.name]) };
+    });
+    const varsWrap = h('div', {});
+    function renderVars() {
+      varsWrap.innerHTML = '';
+      varRows.forEach((row, idx) => {
+        const ph = h('input', { class: 'select', value: row.ph, placeholder: 'nº', style: 'width:70px' });
+        const src = h('input', { class: 'select', value: row.src, placeholder: 'origem (ex.: name)', style: 'flex:1' });
+        ph.addEventListener('input', () => (varRows[idx].ph = ph.value));
+        src.addEventListener('input', () => (varRows[idx].src = src.value));
+        varsWrap.appendChild(h('div', { style: 'display:flex;gap:6px;margin-bottom:6px' }, [ph, src]));
+      });
+    }
+    renderVars();
+
+    const field = (label, node) => h('div', { style: 'margin-bottom:10px' }, [
+      h('div', { class: 'muted', style: 'margin-bottom:4px' }, label),
+      node,
+    ]);
+
+    formCard.appendChild(field('Nome', nameInput));
+    formCard.appendChild(field('Template (idioma da Meta)', tplSelect));
+    formCard.appendChild(field('Listas alvo', h('div', {}, listChecks.map((c) => c.node))));
+    formCard.appendChild(field('Intervalo entre envios (ms)', intervalInput));
+    formCard.appendChild(
+      field(
+        'Variáveis {{n}} → origem (name, phone, crm.stage, crm.custom_fields.x, lit:texto)',
+        h('div', {}, [
+          varsWrap,
+          h('button', {
+            class: 'btn',
+            onclick: () => {
+              varRows.push({ ph: String(varRows.length + 1), src: '' });
+              renderVars();
+            },
+          }, '+ variável'),
+        ]),
+      ),
+    );
+    formCard.appendChild(
+      h('button', {
+        class: 'btn btn--primary',
+        onclick: async () => {
+          const name = nameInput.value.trim();
+          if (!name) return alert('Informe o nome.');
+          const variables = {};
+          for (const r of varRows) if (r.ph.trim() && r.src.trim()) variables[r.ph.trim()] = r.src.trim();
+          const body = {
+            name,
+            template_id: tplSelect.value || null,
+            list_ids: listChecks.filter((c) => c.cb.checked).map((c) => c.cb.value),
+            variables,
+            interval_ms: Number(intervalInput.value) || 1000,
+          };
+          try {
+            const created = await api.post(api.forInstance('/campaigns'), body);
+            nameInput.value = '';
+            await loadCampaigns();
+            await preview(created.id); // mostra destinatários resolvidos
+          } catch (e) {
+            alert('Erro ao criar: ' + e.message);
+          }
+        },
+      }, 'Criar campanha'),
+    );
+  }
+
+  renderForm();
+  loadCampaigns();
+  previewCard.appendChild(h('div', { class: 'muted' }, 'Crie ou selecione uma campanha para ver os destinatários.'));
+  return root;
+}
+
+// ----------------------------------------------------- Builder de fluxos (P4.5)
+const NODE_META = {
+  start: { label: '▶ Início', data: () => ({}) },
+  message: { label: '💬 Mensagem', data: () => ({ text: 'Olá {{nome}}!' }) },
+  media: { label: '🖼 Mídia', data: () => ({ kind: 'image', url: '', caption: '' }) },
+  buttons: {
+    label: '🔘 Botões',
+    data: () => ({ text: 'Escolha:', buttons: [{ id: 'b1', title: 'Opção 1' }] }),
+  },
+  list: {
+    label: '📋 Lista',
+    data: () => ({ text: 'Escolha:', buttonText: 'Ver opções', sections: [{ title: '', rows: [{ id: 'r1', title: 'Item 1' }] }] }),
+  },
+  delay: { label: '⏱ Aguardar', data: () => ({ seconds: 5 }) },
+  tag: { label: '🏷 Tag', data: () => ({ name: '' }) },
+  randomizer: { label: '🎲 Randomizador', data: () => ({ mode: 'round_robin', outputs: 2 }) },
+  condition: { label: '🔀 Condição', data: () => ({ rules: [{ handle: 'r1', kind: 'text_contains', value: '' }] }) },
+  wait_input: { label: '⌨ Aguardar Resposta', data: () => ({ variable: 'resposta', timeoutSeconds: 0 }) },
+  webhook: { label: '🌐 Webhook', data: () => ({ url: '', method: 'GET', saveTo: '' }) },
+  end: { label: '⏹ Fim', data: () => ({}) },
+};
+
+function nodeOutputs(node) {
+  const d = node.data || {};
+  switch (node.type) {
+    case 'end':
+      return [];
+    case 'buttons':
+      return (d.buttons || []).map((b) => ({ handle: b.id, label: b.title }));
+    case 'list':
+      return ((d.sections || [])[0]?.rows || []).map((r) => ({ handle: r.id, label: r.title }));
+    case 'wait_input':
+      return [
+        { handle: 'reply', label: 'resposta' },
+        { handle: 'timeout', label: 'sem resposta' },
+      ];
+    case 'randomizer':
+      return Array.from({ length: Number(d.outputs) || 2 }, (_, i) => ({
+        handle: String(i),
+        label: 'caminho ' + (i + 1),
+      }));
+    case 'condition':
+      return (d.rules || [])
+        .map((r) => ({ handle: r.handle, label: r.kind + ' "' + r.value + '"' }))
+        .concat([{ handle: 'else', label: 'senão' }]);
+    default:
+      return [{ handle: null, label: 'seguir' }];
+  }
+}
+
+function nodeSummary(node) {
+  const d = node.data || {};
+  switch (node.type) {
+    case 'message': return d.text || '';
+    case 'media': return (d.kind || '') + ' ' + (d.url || '');
+    case 'buttons': return d.text || '';
+    case 'list': return d.text || '';
+    case 'delay': return d.seconds + 's' + (Number(d.seconds) >= 10 ? ' (persistido)' : ' (inline)');
+    case 'tag': return d.name || '';
+    case 'randomizer': return d.mode === 'round_robin' ? 'round-robin' : 'aleatório';
+    case 'wait_input': return '→ {{' + (d.variable || 'resposta') + '}}';
+    case 'webhook': return (d.method || 'GET') + ' ' + (d.url || '');
+    case 'condition': return (d.rules || []).length + ' regra(s)';
+    default: return '';
+  }
+}
+
+// Validação local (espelha /domain/flowValidation — avisar ANTES de salvar).
+function validateFlowLocal(nodes, edges) {
+  const warnings = [];
+  const ids = new Set(nodes.map((n) => n.id));
+  const starts = nodes.filter((n) => n.type === 'start');
+  if (!starts.length) warnings.push('Fluxo sem nó Início — nunca será disparado.');
+  for (const e of edges) {
+    if (!ids.has(e.source)) warnings.push('Aresta solta: origem "' + e.source + '" não existe.');
+    if (!ids.has(e.target)) warnings.push('Aresta solta: destino "' + e.target + '" não existe.');
+  }
+  if (starts.length) {
+    const adj = {};
+    for (const e of edges) (adj[e.source] = adj[e.source] || []).push(e.target);
+    const seen = new Set();
+    const stack = starts.map((s) => s.id);
+    while (stack.length) {
+      const cur = stack.pop();
+      if (seen.has(cur)) continue;
+      seen.add(cur);
+      for (const nx of adj[cur] || []) stack.push(nx);
+    }
+    for (const n of nodes) {
+      if (!seen.has(n.id)) warnings.push('Nó órfão: "' + n.id + '" (' + n.type + ') inalcançável.');
+    }
+  }
+  return warnings;
+}
+
+function chatbotScreen() {
+  const listPanel = h('div', { class: 'card builder__panel' });
+  const canvasWrap = h('div', { class: 'canvas-wrap' });
+  const editorPanel = h('div', { class: 'card builder__panel' });
+  const warningsEl = h('div', {});
+  const root = h('div', {}, [
+    pageHeader('Chatbot', 'Construtor visual de fluxos.'),
+    warningsEl,
+    h('div', { class: 'builder' }, [listPanel, canvasWrap, editorPanel]),
+  ]);
+
+  // Fluxo em edição (cópia de trabalho).
+  let current = null; // { id?, name, trigger_keywords, active, nodes, edges }
+  let selectedId = null;
+  let pendingConnect = null; // { source, handle }
+  let nextNum = 1;
+
+  function newId() {
+    // Ids únicos e ESTÁVEIS: nunca reaproveitar (lição 4 — recriar muda o id).
+    return 'n' + Date.now().toString(36) + '_' + nextNum++;
+  }
+
+  function setWarnings(list, extra) {
+    warningsEl.innerHTML = '';
+    const items = [].concat(list || []);
+    if (extra) items.unshift(extra);
+    if (!items.length) return;
+    warningsEl.appendChild(
+      h('div', { class: 'builder-warnings' }, [
+        h('strong', {}, '⚠ Avisos: '),
+        h('ul', { style: 'margin:6px 0 0 18px;padding:0' }, items.map((w) => h('li', {}, w))),
+      ]),
+    );
+  }
+
+  // ---------------------------------------------------------------- lista
+  async function loadFlows() {
+    const flows = await api.get(api.forInstance('/flows')).catch(() => []);
+    listPanel.innerHTML = '';
+    listPanel.appendChild(h('h3', { class: 'card__title' }, 'Fluxos'));
+    listPanel.appendChild(
+      h('button', {
+        class: 'btn btn--primary',
+        style: 'width:100%;margin-bottom:10px',
+        onclick: () => {
+          const startId = newId();
+          current = {
+            name: 'Novo fluxo',
+            trigger_keywords: [],
+            active: false,
+            nodes: [{ id: startId, type: 'start', data: {}, x: 40, y: 60 }],
+            edges: [],
+          };
+          selectedId = startId;
+          renderAll();
+        },
+      }, '+ Novo fluxo'),
+    );
+    for (const f of flows) {
+      listPanel.appendChild(
+        h('div', {
+          class: 'conv-item',
+          onclick: async () => {
+            const full = await api.get(api.forInstance('/flows/' + f.id));
+            current = {
+              id: full.id,
+              name: full.name,
+              trigger_keywords: full.trigger_keywords || [],
+              active: full.active,
+              nodes: full.nodes || [],
+              edges: full.edges || [],
+            };
+            selectedId = null;
+            pendingConnect = null;
+            renderAll();
+            // LIÇÃO 4: avisa sobre execuções ativas ao abrir p/ edição.
+            const act = await api
+              .get(api.forInstance('/flows/' + f.id + '/executions/active'))
+              .catch(() => null);
+            if (act && act.total > 0) {
+              setWarnings([], `Este fluxo tem ${act.total} execução(ões) ATIVA(s). ` +
+                'Prefira editar o conteúdo dos nós a apagar+recriar (apagar muda o id e ' +
+                'derruba execuções paradas nele).');
+            }
+          },
+        }, [
+          h('div', { class: 'conv-item__top' }, [
+            h('span', { class: 'conv-item__name' }, f.name),
+            h('span', { class: 'badge ' + (f.active ? 'badge--ok' : '') }, f.active ? 'ativo' : 'rascunho'),
+          ]),
+          h('div', { class: 'conv-item__preview' }, (f.trigger_keywords || []).join(', ') || 'sem gatilho'),
+        ]),
+      );
+    }
+  }
+
+  // ---------------------------------------------------------------- canvas
+  function portPos(node, handleIndex) {
+    return { x: node.x + 190, y: node.y + 28 + 24 + handleIndex * 22 + 11 };
+  }
+  function inputPos(node) {
+    return { x: node.x, y: node.y + 18 };
+  }
+
+  function renderCanvas() {
+    canvasWrap.innerHTML = '';
+    if (!current) {
+      canvasWrap.appendChild(h('div', { class: 'placeholder' }, 'Selecione ou crie um fluxo.'));
+      return;
+    }
+    const inner = h('div', { class: 'canvas-inner' });
+    canvasWrap.appendChild(inner);
+
+    // Arestas (SVG por baixo dos nós).
+    const svgEl = svg('svg', { class: 'edges' });
+    inner.appendChild(svgEl);
+    const byId = Object.fromEntries(current.nodes.map((n) => [n.id, n]));
+    for (const e of current.edges) {
+      const s = byId[e.source];
+      const t = byId[e.target];
+      if (!s || !t) continue;
+      const outs = nodeOutputs(s);
+      const idx = Math.max(0, outs.findIndex((o) => (o.handle || null) === (e.sourceHandle || null)));
+      const p1 = portPos(s, idx);
+      const p2 = inputPos(t);
+      const dx = Math.max(40, Math.abs(p2.x - p1.x) / 2);
+      svgEl.appendChild(
+        svg('path', {
+          d: `M${p1.x},${p1.y} C${p1.x + dx},${p1.y} ${p2.x - dx},${p2.y} ${p2.x},${p2.y}`,
+          fill: 'none',
+          stroke: '#1da851',
+          'stroke-width': 2,
+          opacity: 0.75,
+        }),
+      );
+    }
+
+    // Nós.
+    for (const node of current.nodes) {
+      const meta = NODE_META[node.type] || { label: node.type };
+      const outs = nodeOutputs(node);
+      const el = h('div', {
+        class: 'fnode' + (node.id === selectedId ? ' selected' : ''),
+        style: `left:${node.x}px;top:${node.y}px`,
+      }, [
+        h('div', { class: 'fnode__head' }, [meta.label]),
+        h('div', { class: 'fnode__body' }, nodeSummary(node)),
+        ...outs.map((o) => {
+          const port = h('span', {
+            class: 'port' +
+              (pendingConnect && pendingConnect.source === node.id &&
+               (pendingConnect.handle || null) === (o.handle || null) ? ' pending' : ''),
+          });
+          port.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            pendingConnect = { source: node.id, handle: o.handle };
+            renderCanvas();
+          });
+          return h('div', { class: 'fnode__out' }, [o.label, port]);
+        }),
+      ]);
+
+      // Porta de ENTRADA (destino de conexão pendente).
+      if (node.type !== 'start') {
+        const inPort = h('span', { class: 'port port--in' });
+        inPort.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          if (!pendingConnect || pendingConnect.source === node.id) return;
+          // Uma aresta por saída: substitui a existente da mesma saída.
+          current.edges = current.edges.filter(
+            (e) => !(e.source === pendingConnect.source &&
+                     (e.sourceHandle || null) === (pendingConnect.handle || null)),
+          );
+          const edge = { source: pendingConnect.source, target: node.id };
+          if (pendingConnect.handle != null) edge.sourceHandle = pendingConnect.handle;
+          current.edges.push(edge);
+          pendingConnect = null;
+          renderCanvas();
+        });
+        el.appendChild(inPort);
+      }
+
+      // Seleção + drag pelo cabeçalho.
+      el.addEventListener('click', () => {
+        selectedId = node.id;
+        renderEditor();
+        renderCanvas();
+      });
+      const head = el.querySelector('.fnode__head');
+      head.addEventListener('pointerdown', (ev) => {
+        ev.preventDefault();
+        const startX = ev.clientX;
+        const startY = ev.clientY;
+        const origX = node.x;
+        const origY = node.y;
+        function move(mv) {
+          node.x = Math.max(0, origX + (mv.clientX - startX));
+          node.y = Math.max(0, origY + (mv.clientY - startY));
+          renderCanvas();
+        }
+        function up() {
+          document.removeEventListener('pointermove', move);
+          document.removeEventListener('pointerup', up);
+        }
+        document.addEventListener('pointermove', move);
+        document.addEventListener('pointerup', up);
+      });
+
+      inner.appendChild(el);
+    }
+  }
+
+  // ---------------------------------------------------------------- editor
+  function field(label, input) {
+    return h('div', { class: 'field' }, [h('label', {}, label), input]);
+  }
+  function boundInput(obj, key, attrs = {}, tag = 'input') {
+    const el = h(tag, { ...attrs, value: obj[key] != null ? String(obj[key]) : '' });
+    if (tag === 'textarea') el.value = obj[key] || '';
+    el.addEventListener('input', () => {
+      obj[key] = attrs.type === 'number' ? Number(el.value) : el.value;
+      renderCanvas();
+    });
+    return el;
+  }
+
+  function nodeEditor(node) {
+    const d = node.data;
+    const parts = [];
+    switch (node.type) {
+      case 'message':
+        parts.push(field('Texto ({{variáveis}} ok)', boundInput(d, 'text', { rows: '4' }, 'textarea')));
+        break;
+      case 'media': {
+        const sel = h('select', {}, ['image', 'video', 'audio', 'document'].map((k) =>
+          h('option', { value: k, ...(d.kind === k ? { selected: 'selected' } : {}) }, k)));
+        sel.addEventListener('change', () => { d.kind = sel.value; renderCanvas(); });
+        parts.push(field('Tipo', sel));
+        parts.push(field('URL', boundInput(d, 'url')));
+        parts.push(field('Legenda', boundInput(d, 'caption')));
+        break;
+      }
+      case 'buttons': {
+        parts.push(field('Texto', boundInput(d, 'text', { rows: '2' }, 'textarea')));
+        (d.buttons || []).forEach((b, i) => {
+          parts.push(field('Botão ' + (i + 1) + ' (id: ' + b.id + ')', boundInput(b, 'title')));
+        });
+        if ((d.buttons || []).length < 3) {
+          parts.push(h('button', {
+            class: 'btn',
+            onclick: () => {
+              d.buttons.push({ id: 'b' + (d.buttons.length + 1) + '_' + newId(), title: 'Opção' });
+              renderEditor(); renderCanvas();
+            },
+          }, '+ botão'));
+        }
+        break;
+      }
+      case 'list': {
+        parts.push(field('Texto', boundInput(d, 'text', { rows: '2' }, 'textarea')));
+        parts.push(field('Texto do botão', boundInput(d, 'buttonText')));
+        const rows = d.sections[0].rows;
+        rows.forEach((r, i) => {
+          parts.push(field('Opção ' + (i + 1) + ' (id: ' + r.id + ')', boundInput(r, 'title')));
+        });
+        if (rows.length < 10) {
+          parts.push(h('button', {
+            class: 'btn',
+            onclick: () => {
+              rows.push({ id: 'r' + (rows.length + 1) + '_' + newId(), title: 'Item' });
+              renderEditor(); renderCanvas();
+            },
+          }, '+ opção'));
+        }
+        break;
+      }
+      case 'delay':
+        parts.push(field('Segundos (≥10 persiste e retoma sozinho)', boundInput(d, 'seconds', { type: 'number' })));
+        break;
+      case 'tag':
+        parts.push(field('Nome da tag', boundInput(d, 'name')));
+        break;
+      case 'randomizer': {
+        const sel = h('select', {}, [
+          h('option', { value: 'round_robin', ...(d.mode === 'round_robin' ? { selected: 'selected' } : {}) }, 'round-robin (equilibrado)'),
+          h('option', { value: 'random', ...(d.mode === 'random' ? { selected: 'selected' } : {}) }, 'aleatório'),
+        ]);
+        sel.addEventListener('change', () => { d.mode = sel.value; renderCanvas(); });
+        parts.push(field('Modo', sel));
+        parts.push(field('Nº de caminhos', boundInput(d, 'outputs', { type: 'number' })));
+        break;
+      }
+      case 'condition': {
+        (d.rules || []).forEach((r, i) => {
+          const kindSel = h('select', {}, ['text_contains', 'variable_contains', 'has_tag'].map((k) =>
+            h('option', { value: k, ...(r.kind === k ? { selected: 'selected' } : {}) }, k)));
+          kindSel.addEventListener('change', () => { r.kind = kindSel.value; renderEditor(); renderCanvas(); });
+          parts.push(field('Regra ' + (i + 1) + ' — tipo', kindSel));
+          if (r.kind === 'variable_contains') {
+            parts.push(field('Variável', boundInput(r, 'variable')));
+          }
+          parts.push(field('Valor', boundInput(r, 'value')));
+        });
+        parts.push(h('button', {
+          class: 'btn',
+          onclick: () => {
+            d.rules.push({ handle: 'r' + (d.rules.length + 1) + '_' + newId(), kind: 'text_contains', value: '' });
+            renderEditor(); renderCanvas();
+          },
+        }, '+ regra'));
+        break;
+      }
+      case 'wait_input':
+        parts.push(field('Salvar resposta na variável', boundInput(d, 'variable')));
+        parts.push(field('Timeout em segundos (0 = sem timeout)', boundInput(d, 'timeoutSeconds', { type: 'number' })));
+        break;
+      case 'webhook': {
+        parts.push(field('URL', boundInput(d, 'url')));
+        const sel = h('select', {}, ['GET', 'POST'].map((mth) =>
+          h('option', { value: mth, ...(d.method === mth ? { selected: 'selected' } : {}) }, mth)));
+        sel.addEventListener('change', () => { d.method = sel.value; renderCanvas(); });
+        parts.push(field('Método', sel));
+        parts.push(field('Salvar resposta na variável', boundInput(d, 'saveTo')));
+        break;
+      }
+      default:
+        parts.push(h('div', { class: 'muted' }, 'Este nó não tem configurações.'));
+    }
+    return parts;
+  }
+
+  async function renderEditor() {
+    editorPanel.innerHTML = '';
+    if (!current) return;
+
+    editorPanel.appendChild(h('h3', { class: 'card__title' }, 'Fluxo'));
+    const nameIn = boundInput(current, 'name');
+    editorPanel.appendChild(field('Nome', nameIn));
+    const kwIn = h('input', { value: (current.trigger_keywords || []).join(', ') });
+    kwIn.addEventListener('input', () => {
+      current.trigger_keywords = kwIn.value.split(',').map((s) => s.trim()).filter(Boolean);
+    });
+    editorPanel.appendChild(field('Palavras-gatilho (vírgula)', kwIn));
+    const activeCb = h('input', { type: 'checkbox', ...(current.active ? { checked: 'checked' } : {}) });
+    activeCb.addEventListener('change', () => { current.active = activeCb.checked; });
+    editorPanel.appendChild(h('div', { class: 'field' }, [h('label', {}, [activeCb, ' Fluxo ativo'])]));
+
+    // Paleta de nós.
+    editorPanel.appendChild(h('h3', { class: 'card__title' }, 'Adicionar nó'));
+    const palette = h('div', { style: 'display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px' });
+    for (const [type, meta] of Object.entries(NODE_META)) {
+      if (type === 'start' && current.nodes.some((n) => n.type === 'start')) continue;
+      palette.appendChild(h('button', {
+        class: 'btn',
+        style: 'font-size:11px;padding:4px 8px',
+        onclick: () => {
+          const n = { id: newId(), type, data: meta.data(), x: 80 + Math.random() * 200, y: 80 + Math.random() * 200 };
+          current.nodes.push(n);
+          selectedId = n.id;
+          renderEditor();
+          renderCanvas();
+        },
+      }, meta.label));
+    }
+    editorPanel.appendChild(palette);
+
+    // Editor do nó selecionado.
+    const node = current.nodes.find((n) => n.id === selectedId);
+    if (node) {
+      editorPanel.appendChild(h('h3', { class: 'card__title' }, 'Nó: ' + (NODE_META[node.type]?.label || node.type)));
+      for (const p of nodeEditor(node)) editorPanel.appendChild(p);
+
+      // Arestas saindo do nó (remoção explícita).
+      const myEdges = current.edges.filter((e) => e.source === node.id || e.target === node.id);
+      if (myEdges.length) {
+        editorPanel.appendChild(h('h3', { class: 'card__title' }, 'Conexões'));
+        for (const e of myEdges) {
+          editorPanel.appendChild(h('div', { class: 'field', style: 'display:flex;gap:6px;align-items:center' }, [
+            h('span', { class: 'muted', style: 'flex:1;font-size:11px' },
+              e.source + (e.sourceHandle ? '[' + e.sourceHandle + ']' : '') + ' → ' + e.target),
+            h('button', {
+              class: 'btn', style: 'padding:2px 8px',
+              onclick: () => {
+                current.edges = current.edges.filter((x) => x !== e);
+                renderEditor(); renderCanvas();
+              },
+            }, '✕'),
+          ]));
+        }
+      }
+
+      // Excluir nó — PROTEÇÃO DA LIÇÃO 4.
+      if (node.type !== 'start') {
+        editorPanel.appendChild(h('button', {
+          class: 'btn',
+          style: 'margin-top:8px;color:#991b1b',
+          onclick: async () => {
+            let extra = '';
+            if (current.id) {
+              const act = await api
+                .get(api.forInstance('/flows/' + current.id + '/executions/active'))
+                .catch(() => null);
+              const here = act && act.by_node ? (act.by_node[node.id] || 0) : 0;
+              if (act && act.total > 0) {
+                extra = `\n\nATENÇÃO: ${act.total} execução(ões) ativa(s) neste fluxo` +
+                  (here ? `, ${here} parada(s) NESTE nó` : '') +
+                  '. Apagar o nó muda o id e essas execuções serão canceladas COM aviso ' +
+                  'na retomada. Prefira EDITAR o conteúdo do nó.';
+              }
+            }
+            if (!confirm('Apagar o nó "' + node.id + '"? Prefira editar o conteúdo — apagar+recriar muda o id.' + extra)) return;
+            current.nodes = current.nodes.filter((n) => n.id !== node.id);
+            current.edges = current.edges.filter((e) => e.source !== node.id && e.target !== node.id);
+            selectedId = null;
+            renderEditor(); renderCanvas();
+          },
+        }, 'Excluir nó'));
+      }
+    } else {
+      editorPanel.appendChild(h('div', { class: 'muted' }, 'Clique num nó para editar. Para conectar: clique na bolinha de uma saída e depois na bolinha de entrada (esquerda) do nó destino.'));
+    }
+
+    // Salvar.
+    editorPanel.appendChild(h('button', {
+      class: 'btn btn--primary',
+      style: 'width:100%;margin-top:12px',
+      onclick: async () => {
+        const warnings = validateFlowLocal(current.nodes, current.edges);
+        if (warnings.length) {
+          setWarnings(warnings);
+          if (!confirm('O fluxo tem avisos:\n\n- ' + warnings.join('\n- ') + '\n\nSalvar mesmo assim?')) return;
+        } else {
+          setWarnings([]);
+        }
+        const payload = {
+          name: current.name,
+          trigger_keywords: current.trigger_keywords,
+          nodes: current.nodes,
+          edges: current.edges,
+          active: current.active,
+        };
+        try {
+          const res = current.id
+            ? await api.raw('PATCH', api.forInstance('/flows/' + current.id), payload)
+            : await api.post(api.forInstance('/flows'), payload);
+          current.id = res.flow.id;
+          setWarnings(res.warnings || []);
+          loadFlows();
+          alert('Fluxo salvo.');
+        } catch (e) {
+          alert('Erro ao salvar: ' + e.message);
+        }
+      },
+    }, 'Salvar fluxo'));
+  }
+
+  function renderAll() {
+    setWarnings([]);
+    renderCanvas();
+    renderEditor();
+  }
+
+  loadFlows();
+  renderAll();
+  return root;
+}
+
+// ---------------------------------------------------------------- CRM (P6.4)
+function crmScreen() {
+  const listCard = h('div', { class: 'card' });
+  const editCard = h('div', { class: 'card' });
+  const root = h('div', {}, [
+    pageHeader('CRM', 'Funil e estágios dos leads da instância.'),
+    h('div', { class: 'dash-grid' }, [listCard, editCard]),
+  ]);
+
+  let selected = null; // contato selecionado
+
+  async function loadList() {
+    listCard.innerHTML = '';
+    listCard.appendChild(h('h3', { class: 'card__title' }, 'Contatos'));
+    const search = h('input', { class: 'select', placeholder: 'Buscar…', style: 'width:100%;margin-bottom:10px' });
+    listCard.appendChild(search);
+    const tableWrap = h('div', {});
+    listCard.appendChild(tableWrap);
+
+    const contacts = await api.get(api.forInstance('/contacts')).catch(() => []);
+    const crmAll = await api.get(api.forInstance('/crm')).catch(() => []);
+    const crmByContact = Object.fromEntries(crmAll.map((r) => [r.contact_id, r]));
+
+    function draw(filter) {
+      tableWrap.innerHTML = '';
+      const term = (filter || '').toLowerCase();
+      const rows = contacts
+        .filter((c) => !term || (c.name || '').toLowerCase().includes(term) || c.phone.includes(term))
+        .map((c) => {
+          const crm = crmByContact[c.id];
+          return h('tr', {
+            style: 'cursor:pointer',
+            onclick: () => { selected = c; renderEditor(); },
+          }, [
+            h('td', {}, [
+              h('div', {}, c.name || c.phone),
+              h('div', { class: 'muted', style: 'font-size:11px' }, c.phone),
+            ]),
+            h('td', {}, [h('span', { class: 'badge ' + (crm?.stage === 'cliente' ? 'badge--ok' : '') }, crm?.stage || 'sem CRM')]),
+            h('td', {}, crm?.score != null ? String(crm.score) : '—'),
+          ]);
+        });
+      if (!rows.length) {
+        tableWrap.appendChild(h('div', { class: 'muted' }, 'Nenhum contato.'));
+        return;
+      }
+      tableWrap.appendChild(
+        h('table', { class: 'table' }, [
+          h('thead', {}, [h('tr', {}, [h('th', {}, 'Contato'), h('th', {}, 'Estágio'), h('th', {}, 'Score')])]),
+          h('tbody', {}, rows),
+        ]),
+      );
+    }
+    search.addEventListener('input', () => draw(search.value));
+    draw('');
+  }
+
+  async function renderEditor() {
+    editCard.innerHTML = '';
+    if (!selected) {
+      editCard.appendChild(h('div', { class: 'placeholder' }, 'Selecione um contato.'));
+      return;
+    }
+    editCard.appendChild(h('h3', { class: 'card__title' }, selected.name || selected.phone));
+    const crm = await api.get(api.forInstance('/crm/' + selected.id)).catch(() => null);
+
+    const stage = h('input', { class: 'select', placeholder: 'Estágio (lead, qualificado, cliente…)', style: 'width:100%;margin-bottom:8px', value: crm?.stage || 'lead' });
+    const score = h('input', { class: 'select', type: 'number', placeholder: 'Score', style: 'width:100%;margin-bottom:8px', value: crm?.score != null ? String(crm.score) : '0' });
+    const notes = h('textarea', { class: 'select', rows: '4', placeholder: 'Notas…', style: 'width:100%;margin-bottom:8px' });
+    notes.value = crm?.notes || '';
+    const custom = h('textarea', { class: 'select', rows: '4', placeholder: '{ "campo": "valor" }', style: 'width:100%;margin-bottom:8px;font-family:monospace;font-size:12px' });
+    custom.value = JSON.stringify(crm?.custom_fields || {}, null, 2);
+    const msg = h('div', { class: 'muted', style: 'min-height:18px;margin-bottom:8px' });
+
+    const field2 = (label, node) => h('div', { style: 'margin-bottom:4px' }, [
+      h('div', { class: 'muted', style: 'font-size:12px;margin-bottom:2px' }, label), node,
+    ]);
+    editCard.appendChild(field2('Estágio', stage));
+    editCard.appendChild(field2('Score', score));
+    editCard.appendChild(field2('Notas', notes));
+    editCard.appendChild(field2('Campos customizados (JSON)', custom));
+    editCard.appendChild(msg);
+    editCard.appendChild(
+      h('button', {
+        class: 'btn btn--primary',
+        onclick: async () => {
+          msg.textContent = '';
+          let customFields;
+          try {
+            customFields = JSON.parse(custom.value || '{}');
+          } catch {
+            msg.textContent = 'JSON inválido nos campos customizados.';
+            return;
+          }
+          try {
+            await api.raw('PUT', api.forInstance('/crm/' + selected.id), {
+              stage: stage.value.trim() || null,
+              score: Number(score.value) || 0,
+              notes: notes.value || null,
+              custom_fields: customFields,
+            });
+            msg.textContent = 'Salvo.';
+            loadList();
+          } catch (e) {
+            msg.textContent = 'Erro: ' + e.message;
+          }
+        },
+      }, 'Salvar CRM'),
+    );
+  }
+
+  loadList();
+  renderEditor();
+  return root;
+}
+
+// -------------------------------------------------- Disparar Mensagem (P6.3)
+function dispararScreen() {
+  const formCard = h('div', { class: 'card' });
+  const resultCard = h('div', { class: 'card' });
+  const root = h('div', {}, [
+    pageHeader('Disparar Mensagem', 'Envio avulso pela instância selecionada no topo.'),
+    h('div', { class: 'dash-grid' }, [formCard, resultCard]),
+  ]);
+
+  let type = 'text';
+  const history = [];
+
+  function renderResult() {
+    resultCard.innerHTML = '';
+    resultCard.appendChild(h('h3', { class: 'card__title' }, 'Últimos envios (esta sessão)'));
+    if (!history.length) {
+      resultCard.appendChild(h('div', { class: 'muted' }, 'Nada enviado ainda.'));
+      return;
+    }
+    resultCard.appendChild(
+      h('table', { class: 'table' }, [
+        h('thead', {}, [h('tr', {}, [h('th', {}, 'Para'), h('th', {}, 'Tipo'), h('th', {}, 'Resultado')])]),
+        h('tbody', {}, history.map((hh) =>
+          h('tr', {}, [
+            h('td', {}, hh.to),
+            h('td', {}, hh.type),
+            h('td', {}, [h('span', { class: 'badge ' + (hh.ok ? 'badge--ok' : 'badge--off') }, hh.result)]),
+          ]),
+        )),
+      ]),
+    );
+  }
+
+  async function renderForm() {
+    formCard.innerHTML = '';
+    formCard.appendChild(h('h3', { class: 'card__title' }, 'Nova mensagem'));
+
+    const to = h('input', { class: 'select', placeholder: 'Telefone (ex.: 5511999998888)', style: 'width:100%;margin-bottom:8px' });
+    const typeSel = h('select', { class: 'select', style: 'width:100%;margin-bottom:8px' }, [
+      h('option', { value: 'text' }, 'Texto'),
+      h('option', { value: 'media' }, 'Mídia (URL)'),
+      h('option', { value: 'template' }, 'Template (Meta)'),
+    ]);
+    typeSel.value = type;
+    typeSel.addEventListener('change', () => { type = typeSel.value; renderForm(); });
+
+    const fields = h('div', {});
+    const msg = h('div', { class: 'muted', style: 'min-height:18px;margin:8px 0' });
+    formCard.appendChild(to);
+    formCard.appendChild(typeSel);
+    formCard.appendChild(fields);
+    formCard.appendChild(msg);
+
+    let getBody = () => null;
+    if (type === 'text') {
+      const text = h('textarea', { class: 'select', rows: '4', placeholder: 'Mensagem…', style: 'width:100%' });
+      fields.appendChild(text);
+      getBody = () => ({ type: 'text', to: to.value.trim(), text: text.value });
+    } else if (type === 'media') {
+      const kind = h('select', { class: 'select', style: 'width:100%;margin-bottom:8px' },
+        ['image', 'video', 'audio', 'document'].map((k) => h('option', { value: k }, k)));
+      const url = h('input', { class: 'select', placeholder: 'URL pública do arquivo', style: 'width:100%;margin-bottom:8px' });
+      const caption = h('input', { class: 'select', placeholder: 'Legenda (opcional)', style: 'width:100%' });
+      fields.appendChild(kind);
+      fields.appendChild(url);
+      fields.appendChild(caption);
+      getBody = () => ({
+        type: 'media', to: to.value.trim(),
+        media: { kind: kind.value, url: url.value.trim(), ...(caption.value ? { caption: caption.value } : {}) },
+      });
+    } else {
+      // Template: escolhe entre os SINCRONIZADOS (idioma vem do registro da
+      // Meta — nunca default). Variáveis {{1}}..{{n}} em campos livres.
+      const templates = await api.get(api.forInstance('/templates')).catch(() => []);
+      if (!templates.length) {
+        fields.appendChild(h('div', { class: 'builder-warnings' },
+          'Nenhum template sincronizado. Vá em Templates → Sincronizar da Meta.'));
+        getBody = () => null;
+      } else {
+        const tplSel = h('select', { class: 'select', style: 'width:100%;margin-bottom:8px' },
+          templates.map((t) => h('option', { value: t.name + '||' + t.language }, `${t.name} (${t.language})`)));
+        const varsWrap = h('div', {});
+        const varInputs = [];
+        const addVar = () => {
+          const input = h('input', { class: 'select', placeholder: '{{' + (varInputs.length + 1) + '}}', style: 'width:100%;margin-bottom:6px' });
+          varInputs.push(input);
+          varsWrap.appendChild(input);
+        };
+        addVar();
+        fields.appendChild(tplSel);
+        fields.appendChild(h('div', { class: 'muted', style: 'margin-bottom:4px' }, 'Variáveis do corpo:'));
+        fields.appendChild(varsWrap);
+        fields.appendChild(h('button', { class: 'btn', onclick: addVar }, '+ variável'));
+        getBody = () => {
+          const [name, language] = tplSel.value.split('||');
+          const vars = {};
+          varInputs.forEach((inp, i) => { if (inp.value.trim()) vars[String(i + 1)] = inp.value.trim(); });
+          return { type: 'template', to: to.value.trim(), template: { name, language }, vars };
+        };
+      }
+    }
+
+    formCard.appendChild(
+      h('button', {
+        class: 'btn btn--primary', style: 'margin-top:8px',
+        onclick: async () => {
+          msg.textContent = '';
+          const body = getBody();
+          if (!body || !body.to) { msg.textContent = 'Preencha o telefone.'; return; }
+          try {
+            const res = await api.post(api.forInstance('/messages'), body);
+            history.unshift({ to: body.to, type: body.type, ok: true, result: res.status + (res.wa_message_id ? '' : ' (fila)') });
+            msg.textContent = 'Enviado.';
+          } catch (e) {
+            history.unshift({ to: body.to, type: body.type, ok: false, result: e.message });
+            msg.textContent = 'Falha: ' + e.message;
+          }
+          renderResult();
+        },
+      }, 'Enviar'),
+    );
+  }
+
+  renderForm();
+  renderResult();
+  return root;
+}
+
+// --------------------------------------------------------- Templates (P6.3)
+function templatesScreen() {
+  const card = h('div', { class: 'card' });
+  const root = h('div', {}, [
+    pageHeader('Templates', 'Templates aprovados na Meta (o idioma cadastrado lá é a fonte da verdade).'),
+    card,
+  ]);
+
+  async function load() {
+    card.innerHTML = '';
+    const syncBtn = h('button', {
+      class: 'btn btn--primary', style: 'margin-bottom:12px',
+      onclick: async () => {
+        syncBtn.disabled = true;
+        syncBtn.textContent = 'Sincronizando…';
+        try {
+          const res = await api.post(api.forInstance('/templates/sync'));
+          alert('Sincronizados: ' + res.synced + ' template(s).');
+        } catch (e) {
+          alert('Falha no sync: ' + e.message);
+        }
+        load();
+      },
+    }, 'Sincronizar da Meta');
+    card.appendChild(syncBtn);
+
+    const list = await api.get(api.forInstance('/templates')).catch(() => []);
+    if (!list.length) {
+      card.appendChild(h('div', { class: 'muted' }, 'Nenhum template sincronizado ainda.'));
+      return;
+    }
+    card.appendChild(
+      h('table', { class: 'table' }, [
+        h('thead', {}, [h('tr', {}, [
+          h('th', {}, 'Nome'), h('th', {}, 'Idioma'), h('th', {}, 'Categoria'), h('th', {}, 'Status'),
+        ])]),
+        h('tbody', {}, list.map((t) =>
+          h('tr', {}, [
+            h('td', {}, t.name),
+            h('td', {}, [h('span', { class: 'badge' }, t.language)]),
+            h('td', {}, t.category || '—'),
+            h('td', {}, [h('span', { class: 'badge ' + (t.status === 'APPROVED' ? 'badge--ok' : 'badge--warn') }, t.status || '—')]),
+          ]),
+        )),
+      ]),
+    );
+  }
+
+  load();
+  return root;
+}
+
+// ------------------------------------------------------ Instâncias (P6.2/V2)
+function instanciasScreen() {
+  const listCard = h('div', { class: 'card' });
+  const sideCard = h('div', { class: 'card' });
+  const root = h('div', {}, [
+    pageHeader('Instâncias', 'Números conectados (API Oficial ou Baileys).'),
+    h('div', { class: 'dash-grid' }, [listCard, sideCard]),
+  ]);
+
+  let editing = null; // instância em edição (null = criar nova)
+  let qrTimer = null;
+  registerCleanup(() => { if (qrTimer) clearInterval(qrTimer); });
+
+  async function loadList() {
+    listCard.innerHTML = '';
+    listCard.appendChild(h('h3', { class: 'card__title' }, 'Instâncias'));
+    let list = [];
+    try {
+      list = await api.listInstances();
+    } catch (e) {
+      listCard.appendChild(h('div', { class: 'muted' }, 'Erro: ' + e.message));
+      return;
+    }
+    if (!list.length) {
+      listCard.appendChild(h('div', { class: 'muted' }, 'Nenhuma instância. Crie ao lado.'));
+      return;
+    }
+    listCard.appendChild(
+      h('table', { class: 'table' }, [
+        h('thead', {}, [h('tr', {}, [
+          h('th', {}, 'Nome'), h('th', {}, 'Provider'), h('th', {}, 'Conexão'), h('th', {}, ''),
+        ])]),
+        h('tbody', {}, list.map((i) =>
+          h('tr', {}, [
+            h('td', {}, [
+              h('div', {}, i.name),
+              h('div', { class: 'muted', style: 'font-size:11px' }, i.phone_number_id || '—'),
+            ]),
+            h('td', {}, i.provider_type === 'baileys' ? 'Baileys' : 'Meta'),
+            h('td', {}, [h('span', {
+              class: 'badge ' + (i.connection_status === 'connected' ? 'badge--ok'
+                : i.connection_status === 'pending' ? 'badge--warn' : 'badge--off'),
+            }, i.connection_status)]),
+            h('td', { style: 'white-space:nowrap' }, [
+              h('button', { class: 'btn', style: 'padding:3px 8px', onclick: () => { editing = i; renderForm(); } }, 'Editar'),
+              ' ',
+              i.provider_type === 'baileys'
+                ? h('button', { class: 'btn', style: 'padding:3px 8px', onclick: () => showQr(i) }, 'QR')
+                : null,
+              ' ',
+              h('button', {
+                class: 'btn', style: 'padding:3px 8px;color:#991b1b',
+                onclick: async () => {
+                  if (!confirm('Remover a instância "' + i.name + '"? TODOS os dados dela (mensagens, contatos, fluxos) serão apagados.')) return;
+                  await api.raw('DELETE', '/api/instances/' + i.id);
+                  editing = null;
+                  loadList();
+                  renderForm();
+                },
+              }, '✕'),
+            ]),
+          ]),
+        )),
+      ]),
+    );
+  }
+
+  function stopQr() {
+    if (qrTimer) { clearInterval(qrTimer); qrTimer = null; }
+  }
+
+  // QR do Baileys: busca o SVG com o Bearer (img src não manda header) e
+  // repete a cada 3s — o worker troca o QR periodicamente até o pareamento.
+  async function showQr(inst) {
+    stopQr();
+    sideCard.innerHTML = '';
+    sideCard.appendChild(h('h3', { class: 'card__title' }, 'Parear "' + inst.name + '"'));
+    const status = h('div', { class: 'muted', style: 'margin-bottom:8px' }, 'Aguardando QR do worker…');
+    const qrBox = h('div', { style: 'display:grid;place-items:center;min-height:280px' });
+    sideCard.appendChild(status);
+    sideCard.appendChild(qrBox);
+    sideCard.appendChild(h('div', { class: 'muted', style: 'font-size:12px;margin-top:8px' },
+      'O worker precisa estar rodando (npm run worker). Abra o WhatsApp no celular → Aparelhos conectados → Conectar aparelho.'));
+    sideCard.appendChild(h('button', { class: 'btn', style: 'margin-top:10px', onclick: () => { stopQr(); renderForm(); } }, 'Fechar'));
+
+    async function poll() {
+      try {
+        const info = await api.get('/api/instances/' + inst.id + '/qr');
+        status.textContent = 'Status: ' + info.connection_status;
+        if (info.connection_status === 'connected') {
+          qrBox.innerHTML = '';
+          qrBox.appendChild(h('div', { class: 'placeholder__emoji' }, '✅'));
+          stopQr();
+          loadList();
+          return;
+        }
+        if (info.qr) {
+          const res = await fetch('/api/instances/' + inst.id + '/qr.svg', {
+            headers: auth.token ? { Authorization: 'Bearer ' + auth.token } : {},
+          });
+          if (res.ok) qrBox.innerHTML = await res.text();
+        }
+      } catch (e) {
+        status.textContent = 'Erro: ' + e.message;
+      }
+    }
+    poll();
+    qrTimer = setInterval(poll, 3000);
+  }
+
+  function renderForm() {
+    stopQr();
+    sideCard.innerHTML = '';
+    sideCard.appendChild(h('h3', { class: 'card__title' }, editing ? 'Editar "' + editing.name + '"' : 'Nova instância'));
+
+    const name = h('input', { class: 'select', placeholder: 'Nome', style: 'width:100%;margin-bottom:8px', value: editing?.name || '' });
+    const provider = h('select', { class: 'select', style: 'width:100%;margin-bottom:8px' }, [
+      h('option', { value: 'meta', ...(editing?.provider_type !== 'baileys' ? { selected: 'selected' } : {}) }, 'API Oficial (Meta)'),
+      h('option', { value: 'baileys', ...(editing?.provider_type === 'baileys' ? { selected: 'selected' } : {}) }, 'Baileys (QR code)'),
+    ]);
+    const pnid = h('input', { class: 'select', placeholder: 'phone_number_id (Meta)', style: 'width:100%;margin-bottom:8px', value: editing?.phone_number_id || '' });
+    const waba = h('input', { class: 'select', placeholder: 'waba_id (Meta)', style: 'width:100%;margin-bottom:8px', value: editing?.waba_id || '' });
+    // Segredos: sempre vazios no form (a API só devolve mascarado). Preencher = substituir.
+    const token = h('input', { class: 'select', placeholder: editing?.has_token ? 'Token (definido — preencha p/ trocar)' : 'Token (Meta)', style: 'width:100%;margin-bottom:8px' });
+    const verify = h('input', { class: 'select', placeholder: editing?.has_verify_token ? 'Verify token (definido — preencha p/ trocar)' : 'Verify token (webhook)', style: 'width:100%;margin-bottom:8px' });
+    const activeCb = h('input', { type: 'checkbox', ...((editing ? editing.active : true) ? { checked: 'checked' } : {}) });
+    const msg = h('div', { class: 'muted', style: 'min-height:18px;margin:8px 0' });
+
+    function syncProviderFields() {
+      const isMeta = provider.value === 'meta';
+      for (const el of [pnid, waba, token, verify]) el.style.display = isMeta ? '' : 'none';
+    }
+    provider.addEventListener('change', syncProviderFields);
+    syncProviderFields();
+
+    sideCard.appendChild(name);
+    sideCard.appendChild(provider);
+    sideCard.appendChild(pnid);
+    sideCard.appendChild(waba);
+    sideCard.appendChild(token);
+    sideCard.appendChild(verify);
+    sideCard.appendChild(h('label', { style: 'display:block;margin-bottom:4px' }, [activeCb, ' Ativa']));
+    sideCard.appendChild(msg);
+    sideCard.appendChild(
+      h('button', {
+        class: 'btn btn--primary',
+        onclick: async () => {
+          msg.textContent = '';
+          const body = {
+            name: name.value.trim(),
+            provider_type: provider.value,
+            phone_number_id: pnid.value.trim() || null,
+            waba_id: waba.value.trim() || null,
+            active: activeCb.checked,
+          };
+          if (token.value.trim()) body.token = token.value.trim();
+          if (verify.value.trim()) body.verify_token = verify.value.trim();
+          try {
+            if (editing) await api.raw('PATCH', '/api/instances/' + editing.id, body);
+            else await api.post('/api/instances', body);
+            editing = null;
+            msg.textContent = 'Salvo.';
+            loadList();
+            renderForm();
+            state.instances = await api.listInstances(); // atualiza o seletor do topo
+          } catch (e) {
+            msg.textContent = 'Erro: ' + e.message;
+          }
+        },
+      }, editing ? 'Salvar alterações' : 'Criar instância'),
+    );
+    if (editing) {
+      sideCard.appendChild(h('button', {
+        class: 'btn', style: 'margin-left:8px',
+        onclick: () => { editing = null; renderForm(); },
+      }, 'Cancelar'));
+    }
+  }
+
+  loadList();
+  renderForm();
+  return root;
+}
+
+// ------------------------------------------------------------ Login (P6.1/V2)
+function renderLoginScreen() {
+  const app = document.getElementById('app');
+  app.innerHTML = '';
+
+  let mode = 'login'; // 'login' | 'register'
+  const wrap = h('div', {
+    style: 'min-height:100vh;display:grid;place-items:center;background:var(--bg);padding:20px',
+  });
+  app.appendChild(wrap);
+
+  function draw() {
+    wrap.innerHTML = '';
+    const errEl = h('div', { class: 'muted', style: 'color:#991b1b;min-height:18px;margin-bottom:8px' });
+    const email = h('input', { class: 'select', placeholder: 'E-mail', type: 'email', style: 'width:100%;margin-bottom:10px' });
+    const pass = h('input', { class: 'select', placeholder: 'Senha (mín. 8)', type: 'password', style: 'width:100%;margin-bottom:10px' });
+    const orgName = h('input', { class: 'select', placeholder: 'Nome da organização', style: 'width:100%;margin-bottom:10px' });
+
+    async function submit() {
+      errEl.textContent = '';
+      try {
+        const payload = mode === 'login'
+          ? { email: email.value.trim(), password: pass.value }
+          : { org_name: orgName.value.trim(), email: email.value.trim(), password: pass.value };
+        const res = await api.raw('POST', '/api/auth/' + (mode === 'login' ? 'login' : 'register'), payload);
+        auth.set(res.token, res.user);
+        location.reload();
+      } catch (e) {
+        errEl.textContent = e.message;
+      }
+    }
+    [email, pass, orgName].forEach((el) =>
+      el.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') submit(); }),
+    );
+
+    wrap.appendChild(
+      h('div', { class: 'card', style: 'width:360px;max-width:100%' }, [
+        h('div', { style: 'display:flex;align-items:center;gap:10px;margin-bottom:16px' }, [
+          h('div', { class: 'sidebar__logo' }, 'WA'),
+          h('div', {}, [
+            h('div', { style: 'font-weight:700' }, 'WA Manager'),
+            h('div', { class: 'muted', style: 'font-size:12px' },
+              mode === 'login' ? 'Entre na sua conta' : 'Crie sua organização'),
+          ]),
+        ]),
+        mode === 'register' ? orgName : null,
+        email,
+        pass,
+        errEl,
+        h('button', { class: 'btn btn--primary', style: 'width:100%', onclick: submit },
+          mode === 'login' ? 'Entrar' : 'Criar conta'),
+        h('button', {
+          class: 'btn', style: 'width:100%;margin-top:8px;border:none',
+          onclick: () => { mode = mode === 'login' ? 'register' : 'login'; draw(); },
+        }, mode === 'login' ? 'Não tem conta? Criar organização' : 'Já tem conta? Entrar'),
+      ]),
+    );
+  }
+  draw();
+}
+
+// --------------------------------------------------------- Usuários (P6.1/V2)
+function usuariosScreen() {
+  const listCard = h('div', { class: 'card' });
+  const formCard = h('div', { class: 'card' });
+  const root = h('div', {}, [
+    pageHeader('Usuários', 'Contas da sua organização (owner gerencia; agent só atende).'),
+    h('div', { class: 'dash-grid' }, [listCard, formCard]),
+  ]);
+
+  async function loadUsers() {
+    listCard.innerHTML = '';
+    listCard.appendChild(h('h3', { class: 'card__title' }, 'Usuários da organização'));
+    let users = [];
+    try {
+      users = await api.get('/api/users');
+    } catch (e) {
+      listCard.appendChild(h('div', { class: 'muted' }, 'Erro: ' + e.message));
+      return;
+    }
+    if (!users.length) {
+      listCard.appendChild(h('div', { class: 'builder-warnings' },
+        'Modo inicial: nenhum usuário cadastrado — o painel está aberto sem login. ' +
+        'Crie a primeira conta ao lado para ativar a autenticação.'));
+      return;
+    }
+    listCard.appendChild(
+      h('table', { class: 'table' }, [
+        h('thead', {}, [h('tr', {}, [h('th', {}, 'E-mail'), h('th', {}, 'Papel')])]),
+        h('tbody', {}, users.map((u) =>
+          h('tr', {}, [
+            h('td', {}, u.email),
+            h('td', {}, [h('span', { class: 'badge ' + (u.role === 'owner' ? 'badge--ok' : '') }, u.role)]),
+          ]),
+        )),
+      ]),
+    );
+  }
+
+  function renderForm() {
+    formCard.innerHTML = '';
+    formCard.appendChild(h('h3', { class: 'card__title' }, 'Novo usuário'));
+    const email = h('input', { class: 'select', placeholder: 'E-mail', style: 'width:100%;margin-bottom:8px' });
+    const pass = h('input', { class: 'select', placeholder: 'Senha (mín. 8)', type: 'password', style: 'width:100%;margin-bottom:8px' });
+    const role = h('select', { class: 'select', style: 'width:100%;margin-bottom:8px' }, [
+      h('option', { value: 'agent' }, 'agent — só Live Chat'),
+      h('option', { value: 'owner' }, 'owner — administra tudo'),
+    ]);
+    const msg = h('div', { class: 'muted', style: 'min-height:18px;margin-bottom:8px' });
+    formCard.appendChild(email);
+    formCard.appendChild(pass);
+    formCard.appendChild(role);
+    formCard.appendChild(msg);
+    formCard.appendChild(
+      h('button', {
+        class: 'btn btn--primary',
+        onclick: async () => {
+          msg.textContent = '';
+          try {
+            await api.post('/api/users', { email: email.value.trim(), password: pass.value, role: role.value });
+            email.value = '';
+            pass.value = '';
+            msg.textContent = 'Usuário criado.';
+            loadUsers();
+          } catch (e) {
+            msg.textContent = 'Erro: ' + e.message;
+          }
+        },
+      }, 'Criar usuário'),
+    );
+  }
+
+  loadUsers();
+  renderForm();
+  return root;
+}
+
+// ---------------------------------------------------------------- render shell
+function renderSidebar() {
+  const brand = h('div', { class: 'sidebar__brand' }, [
+    h('div', { class: 'sidebar__logo' }, 'WA'),
+    h('div', {}, [
+      h('div', { class: 'sidebar__title' }, 'WA Manager'),
+      h('div', { class: 'sidebar__subtitle' }, 'API Oficial Meta'),
+    ]),
+  ]);
+
+  const groups = visibleNav().map((group) =>
+    h('div', {}, [
+      h('div', { class: 'sidebar__section' }, group.section),
+      ...group.items.map((item) => {
+        const badgeVal = item.badgeKey ? BADGES[item.badgeKey] : 0;
+        return h(
+          'a',
+          {
+            class: 'nav-item' + (state.route === item.path ? ' active' : ''),
+            href: item.path,
+            onclick: (e) => {
+              e.preventDefault();
+              navigate(item.path);
+            },
+          },
+          [
+            h('span', { class: 'nav-item__icon' }, item.icon),
+            h('span', {}, item.label),
+            badgeVal ? h('span', { class: 'nav-item__badge' }, String(badgeVal)) : null,
+          ],
+        );
+      }),
+    ]),
+  );
+
+  return h('aside', { class: 'sidebar' }, [brand, ...groups]);
+}
+
+function renderTopbar() {
+  const selector = h(
+    'select',
+    {
+      class: 'select',
+      onchange: (e) => {
+        api.currentInstanceId = e.target.value;
+        localStorage.setItem('wa.instanceId', e.target.value);
+        renderCurrentScreen(); // troca de instância muda o contexto das telas
+      },
+    },
+    state.instances.map((i) =>
+      h('option', { value: i.id, ...(i.id === api.currentInstanceId ? { selected: 'selected' } : {}) }, i.name),
+    ),
+  );
+  if (!state.instances.length) {
+    selector.appendChild(h('option', { value: '' }, 'Nenhuma instância'));
+  }
+
+  return h('header', { class: 'topbar' }, [
+    selector,
+    h('div', { class: 'topbar__spacer' }),
+    auth.user ? h('span', { class: 'muted', style: 'font-size:12px' }, auth.user.email) : null,
+    h('span', { class: 'status' }, [h('span', { class: 'status__dot' }), 'Online']),
+    h('button', {
+      class: 'btn',
+      onclick: () => {
+        if (auth.token) {
+          auth.clear();
+          location.reload();
+        } else {
+          alert('Você está no modo inicial (sem usuários). Crie uma conta em Usuários para ativar o login.');
+        }
+      },
+    }, 'Sair'),
+  ]);
+}
+
+// Limpeza da tela atual (ex.: parar o polling do Live Chat ao navegar).
+let screenCleanup = null;
+function registerCleanup(fn) {
+  screenCleanup = fn;
+}
+function refreshSidebar() {
+  document.getElementById('sidebar-mount').replaceWith(withId(renderSidebar(), 'sidebar-mount'));
+}
+
+async function renderCurrentScreen() {
+  if (screenCleanup) {
+    screenCleanup();
+    screenCleanup = null;
+  }
+  refreshSidebar();
+  document.getElementById('topbar-mount').replaceWith(withId(renderTopbar(), 'topbar-mount'));
+  const content = document.getElementById('content-mount');
+  content.innerHTML = '';
+  const render = screens[state.route] || screens['/dashboard'];
+  const node = await render();
+  content.appendChild(node);
+}
+
+function withId(node, id) {
+  node.id = id;
+  return node;
+}
+
+function navigate(path) {
+  state.route = path;
+  history.pushState({}, '', path);
+  renderCurrentScreen();
+}
+
+// ------------------------------------------------------------------ bootstrap
+async function boot() {
+  // Sessão primeiro: 401 aqui = sistema trancado sem token válido → o handler
+  // do api.raw renderiza a tela de login e abortamos a montagem do shell.
+  try {
+    state.instances = await api.listInstances();
+  } catch (e) {
+    if (e.message === 'Não autenticado') return; // login já renderizado
+    state.instances = [];
+  }
+
+  const app = document.getElementById('app');
+  app.innerHTML = '';
+  app.appendChild(
+    h('div', { class: 'app-shell' }, [
+      withId(h('div', {}, []), 'sidebar-mount'),
+      h('div', { class: 'main' }, [
+        withId(h('div', {}, []), 'topbar-mount'),
+        withId(h('div', { class: 'content' }, []), 'content-mount'),
+      ]),
+    ]),
+  );
+
+  // Rota inicial a partir da URL (agent cai direto no Live Chat).
+  const home = auth.role() === 'agent' ? '/livechat' : '/dashboard';
+  state.route = location.pathname === '/' ? home : location.pathname;
+  const saved = localStorage.getItem('wa.instanceId');
+  const exists = state.instances.find((i) => i.id === saved);
+  api.currentInstanceId = exists ? saved : state.instances[0]?.id || null;
+
+  window.addEventListener('popstate', () => {
+    state.route = location.pathname === '/' ? '/dashboard' : location.pathname;
+    renderCurrentScreen();
+  });
+
+  await renderCurrentScreen();
+}
+
+boot();

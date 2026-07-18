@@ -1,0 +1,11 @@
+node_modules/
+dist/
+public/
+*.log
+.env
+.env.local
+*.sqlite
+*.sqlite3
+*.db
+.DS_Store
+coverage/

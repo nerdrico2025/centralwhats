@@ -1,0 +1,17 @@
+{
+  "expo": {
+    "name": "WA Manager",
+    "slug": "wa-manager-mobile",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "backgroundColor": "#f1f5f9",
+    "android": {
+      "package": "br.com.clickhero.wamanager",
+      "versionCode": 1
+    },
+    "extra": {
+      "apiUrl": "https://SEU-DEPLOY.vercel.app"
+    }
+  }
+}
