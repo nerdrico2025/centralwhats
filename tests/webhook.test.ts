@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import request from 'supertest';
 import { createSqliteAdapter } from '../src/repo/adapters/SqliteAdapter';
 import { createApp } from '../src/http/app';
@@ -121,6 +121,109 @@ describe('GET /webhook — verificação do desafio', () => {
       .query({ 'hub.mode': 'subscribe', 'hub.verify_token': 'errado', 'hub.challenge': 'X' })
       .expect(403);
   });
+
+  // Regressão: falha de conexão com o banco travava a request até o
+  // FUNCTION_INVOCATION_TIMEOUT da Vercel (promise sem .catch → Unhandled
+  // Rejection, nenhuma resposta enviada). Agora vira 500 + log legível.
+  it('falha de banco → 500 explícito (não fica pendurado) e loga a mensagem', async () => {
+    const boom = new Error('connect ECONNREFUSED 10.0.0.1:5432');
+    const brokenRepo = {
+      ...repo,
+      instances: {
+        ...repo.instances,
+        list: () => Promise.reject(boom),
+      },
+    } as unknown as Repo;
+
+    const errors: unknown[] = [];
+    const spy = vi.spyOn(console, 'error').mockImplementation((...args) => {
+      errors.push(args[0]);
+    });
+
+    try {
+      const res = await request(createApp(brokenRepo))
+        .get('/webhook')
+        .query({ 'hub.mode': 'subscribe', 'hub.verify_token': VERIFY, 'hub.challenge': 'ABC123' })
+        .expect(500);
+      expect(res.body.error).toMatch(/banco/i);
+      expect(
+        errors.some(
+          (e) =>
+            typeof e === 'string' &&
+            e.includes('Erro ao conectar no banco durante verificação do webhook') &&
+            e.includes('ECONNREFUSED'),
+        ),
+      ).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+describe('GET /webhook — motivo do 403 fica logado (nunca silencioso)', () => {
+  /** Captura os console.warn emitidos durante a request. */
+  async function get403(app: ReturnType<typeof createApp>, token: string) {
+    const warns: string[] = [];
+    const spy = vi.spyOn(console, 'warn').mockImplementation((...args) => {
+      warns.push(args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '));
+    });
+    try {
+      await request(app)
+        .get('/webhook')
+        .query({ 'hub.mode': 'subscribe', 'hub.verify_token': token, 'hub.challenge': '123456' })
+        .expect(403);
+    } finally {
+      spy.mockRestore();
+    }
+    return warns.join('\n');
+  }
+
+  it('banco SEM instâncias → 403 e log diz "NENHUMA instância cadastrada"', async () => {
+    // Reproduz a produção: tabela existe (sem erro de banco), porém vazia.
+    const emptyRepo = {
+      ...repo,
+      instances: { ...repo.instances, list: () => Promise.resolve([]) },
+    } as unknown as Repo;
+
+    const log = await get403(createApp(emptyRepo), VERIFY);
+    expect(log).toContain('Verificação recusada (403)');
+    expect(log).toContain('NENHUMA instância cadastrada');
+  });
+
+  it('verify_token salvo com espaço sobrando → 403 e log aponta o trim', async () => {
+    await repo.instances.update(instance.id, { verify_token: `${VERIFY} ` });
+    const log = await get403(createApp(repo), VERIFY);
+    expect(log).toContain('bate APÓS trim');
+    // Segurança inalterada: espaço sobrando continua sendo 403.
+  });
+
+  it('diferença só de maiúsc/minúsc → 403 e log aponta o case', async () => {
+    const log = await get403(createApp(repo), VERIFY.toLowerCase());
+    expect(log).toContain('ignorando maiúsc/minúsc');
+  });
+
+  it('hub.mode inválido → 403 e log distingue do token errado', async () => {
+    const warns: string[] = [];
+    const spy = vi.spyOn(console, 'warn').mockImplementation((...args) => {
+      warns.push(String(args[0]));
+    });
+    try {
+      await request(createApp(repo))
+        .get('/webhook')
+        .query({ 'hub.mode': 'unsubscribe', 'hub.verify_token': VERIFY, 'hub.challenge': '1' })
+        .expect(403);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(warns.join('\n')).toContain('hub.mode inválido');
+  });
+
+  it('o token recebido NUNCA sai inteiro no log (é segredo)', async () => {
+    const segredo = 'xbZWGsrEifU10HTWLCUwrH8DHyMLsayEZpooVGYH0hl3lutva6CzSPpSjv2iG1Iy';
+    const log = await get403(createApp(repo), segredo);
+    expect(log).not.toContain(segredo);
+    expect(log).toContain('64 chars'); // comprimento ajuda a diagnosticar
+  });
 });
 
 describe('POST /webhook — não bloqueia na resposta', () => {
@@ -192,6 +295,76 @@ describe('processInboundPayload — gravação e dedupe', () => {
     });
     expect(r.skippedNoInstance).toBe(1);
     expect(r.processedInbound).toBe(0);
+  });
+});
+
+describe('processInboundPayload — isolamento por change', () => {
+  /** Uma change de texto (uma por mensagem), no formato Meta. */
+  function change(waId: string, from: string) {
+    return {
+      field: 'messages',
+      value: {
+        messaging_product: 'whatsapp',
+        metadata: { display_phone_number: '15550001111', phone_number_id: PNID },
+        contacts: [{ profile: { name: `Cliente ${waId}` }, wa_id: from }],
+        messages: [
+          { from, id: waId, timestamp: '1700000000', type: 'text', text: { body: `msg ${waId}` } },
+        ],
+      },
+    };
+  }
+
+  it('change que falha no meio NÃO aborta as demais (loga e contabiliza)', async () => {
+    const boom = new Error('connect ECONNREFUSED 10.0.0.1:5432');
+    // Falha transitória de banco só na change do meio.
+    const flakyRepo = {
+      ...repo,
+      messages: {
+        ...repo.messages,
+        getByWaMessageId: (instanceId: string, waId: string) => {
+          if (waId === 'wamid.boom') return Promise.reject(boom);
+          return repo.messages.getByWaMessageId(instanceId, waId);
+        },
+      },
+    } as unknown as Repo;
+
+    const payload = {
+      object: 'whatsapp_business_account',
+      entry: [
+        { id: 'WABA1', changes: [change('wamid.ok1', '5511900000001'), change('wamid.boom', '5511900000002')] },
+        { id: 'WABA1', changes: [change('wamid.ok2', '5511900000003')] },
+      ],
+    };
+
+    const errors: unknown[] = [];
+    const spy = vi.spyOn(console, 'error').mockImplementation((...args) => {
+      errors.push(args[0]);
+    });
+
+    try {
+      const r = await processInboundPayload(flakyRepo, payload);
+
+      // As duas changes válidas foram processadas — antes E depois da que falhou.
+      expect(r.processedInbound).toBe(2);
+      expect(r.failedChanges).toBe(1);
+
+      expect(await repo.messages.getByWaMessageId(instance.id, 'wamid.ok1')).not.toBeNull();
+      expect(await repo.messages.getByWaMessageId(instance.id, 'wamid.boom')).toBeNull();
+      // A change DEPOIS da falha é a prova de que o loop não abortou.
+      expect(await repo.messages.getByWaMessageId(instance.id, 'wamid.ok2')).not.toBeNull();
+
+      // Falha logada individualmente, com posição e mensagem legível.
+      expect(
+        errors.some(
+          (e) =>
+            typeof e === 'string' &&
+            e.includes('Falha ao processar change (entry 0, change 1)') &&
+            e.includes('ECONNREFUSED'),
+        ),
+      ).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

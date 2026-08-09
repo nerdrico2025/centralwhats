@@ -25,11 +25,19 @@ import type { MessagingDeps } from './messaging';
 
 type AnyObj = Record<string, unknown>;
 
+/** Mensagem legível de um erro desconhecido (para os logs da Vercel). */
+function errMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
 export interface WebhookResult {
   processedInbound: number;
   dedupedInbound: number;
   processedStatuses: number;
   skippedNoInstance: number;
+  /** Changes que lançaram erro e foram puladas (cada uma logada individualmente). */
+  failedChanges: number;
 }
 
 /** Mapeia o status textual da Meta para o enum interno. */
@@ -221,39 +229,67 @@ export async function processInboundPayload(
     dedupedInbound: 0,
     processedStatuses: 0,
     skippedNoInstance: 0,
+    failedChanges: 0,
   };
   const body = (payload as AnyObj) ?? {};
   const instancesWithInbound = new Set<string>();
 
-  for (const entry of (body.entry as AnyObj[]) ?? []) {
-    for (const change of (entry.changes as AnyObj[]) ?? []) {
-      const value = (change.value as AnyObj) ?? {};
-      const metadata = (value.metadata as AnyObj) ?? {};
-      const phoneNumberId = metadata.phone_number_id
-        ? String(metadata.phone_number_id)
-        : '';
+  const entries = (body.entry as AnyObj[]) ?? [];
+  for (let ei = 0; ei < entries.length; ei++) {
+    const entry = entries[ei];
+    const changes = (entry.changes as AnyObj[]) ?? [];
+    for (let ci = 0; ci < changes.length; ci++) {
+      const change = changes[ci];
+      // Cada change é isolada: uma falha (banco fora, payload torto, erro de
+      // provider) NUNCA aborta as demais changes do mesmo payload. Mesma lógica
+      // do disparo em massa (CLAUDE.md): logue TODA falha, nunca descarte em
+      // silêncio. A Meta reenvia o payload e o dedupe por wa_message_id garante
+      // que as changes que já passaram não sejam reprocessadas.
+      try {
+        const value = (change.value as AnyObj) ?? {};
+        const metadata = (value.metadata as AnyObj) ?? {};
+        const phoneNumberId = metadata.phone_number_id
+          ? String(metadata.phone_number_id)
+          : '';
 
-      const instance = await resolveInstanceByPhoneNumberId(repo, phoneNumberId);
-      if (!instance) {
-        // Instância desconhecida — não descarta em silêncio total: contabiliza.
+        const instance = await resolveInstanceByPhoneNumberId(repo, phoneNumberId);
+        if (!instance) {
+          // Instância desconhecida — não descarta em silêncio total: contabiliza.
+          // eslint-disable-next-line no-console
+          console.warn(`[webhook] phone_number_id sem instância: ${phoneNumberId}`);
+          result.skippedNoInstance++;
+          continue;
+        }
+
+        const r = await processChangeValue(repo, instance, value, deps);
+        result.processedInbound += r.inbound;
+        result.dedupedInbound += r.deduped;
+        result.processedStatuses += r.statuses;
+        if (r.hadInbound) instancesWithInbound.add(instance.id);
+      } catch (err) {
+        result.failedChanges++;
         // eslint-disable-next-line no-console
-        console.warn(`[webhook] phone_number_id sem instância: ${phoneNumberId}`);
-        result.skippedNoInstance++;
-        continue;
+        console.error(
+          `[webhook] Falha ao processar change (entry ${ei}, change ${ci}): ${errMessage(err)}`,
+          err,
+        );
       }
-
-      const r = await processChangeValue(repo, instance, value, deps);
-      result.processedInbound += r.inbound;
-      result.dedupedInbound += r.deduped;
-      result.processedStatuses += r.statuses;
-      if (r.hadInbound) instancesWithInbound.add(instance.id);
     }
   }
 
   // §5: ao fim de QUALQUER inbound, dispara a varredura de retomada de fluxos
-  // (por instância) — motor real desde P4.1.
+  // (por instância) — motor real desde P4.1. Também isolada por instância: uma
+  // varredura que falha não pode impedir a das outras instâncias do payload.
   for (const instanceId of instancesWithInbound) {
-    await processPendingExecutions(repo, instanceId, deps);
+    try {
+      await processPendingExecutions(repo, instanceId, deps);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[webhook] Falha na varredura de retomada de fluxos da instância ${instanceId}: ${errMessage(err)}`,
+        err,
+      );
+    }
   }
 
   return result;
@@ -269,7 +305,80 @@ export async function isValidVerifyChallenge(
   mode: string | undefined,
   verifyToken: string | undefined,
 ): Promise<boolean> {
-  if (mode !== 'subscribe' || !verifyToken) return false;
+  return (await verifyChallenge(repo, mode, verifyToken)).ok;
+}
+
+/** Motivo específico da recusa — vira log legível no handler HTTP. */
+export type VerifyFailureReason =
+  | 'mode_invalido'
+  | 'token_ausente'
+  | 'nenhuma_instancia'
+  | 'nenhuma_instancia_com_verify_token'
+  | 'token_nao_confere';
+
+export interface VerifyChallengeResult {
+  ok: boolean;
+  reason?: VerifyFailureReason;
+  /** Diagnóstico para o log (nunca exposto na resposta HTTP). */
+  diag?: {
+    mode?: string;
+    totalInstances?: number;
+    withVerifyToken?: number;
+    receivedLength?: number;
+    /** Bateria se ambos os lados fossem trimados → há espaço/quebra de linha. */
+    matchesAfterTrim?: boolean;
+    /** Bateria ignorando maiúsc/minúsc → diferença só de case. */
+    matchesIgnoringCase?: boolean;
+  };
+}
+
+/**
+ * Mesma decisão de `isValidVerifyChallenge`, mas devolvendo o MOTIVO da recusa.
+ *
+ * A decisão de segurança NÃO muda: só há `ok: true` na comparação exata
+ * (case-sensitive, sem trim) contra o verify_token salvo. Os campos
+ * `matchesAfterTrim` / `matchesIgnoringCase` existem apenas para o log dizer
+ * *por que* não bateu — jamais para aceitar o token.
+ */
+export async function verifyChallenge(
+  repo: Repo,
+  mode: string | undefined,
+  verifyToken: string | undefined,
+): Promise<VerifyChallengeResult> {
+  if (mode !== 'subscribe') {
+    return { ok: false, reason: 'mode_invalido', diag: { mode: mode ?? '(ausente)' } };
+  }
+  if (!verifyToken) return { ok: false, reason: 'token_ausente' };
+
   const instances = await repo.instances.list();
-  return instances.some((i) => i.verify_token != null && i.verify_token === verifyToken);
+  if (instances.length === 0) {
+    return { ok: false, reason: 'nenhuma_instancia', diag: { totalInstances: 0 } };
+  }
+
+  const withToken = instances.filter((i) => i.verify_token != null && i.verify_token !== '');
+  const diag = {
+    totalInstances: instances.length,
+    withVerifyToken: withToken.length,
+    receivedLength: verifyToken.length,
+  };
+  if (withToken.length === 0) {
+    return { ok: false, reason: 'nenhuma_instancia_com_verify_token', diag };
+  }
+
+  // Comparação EXATA — a única que autoriza.
+  if (withToken.some((i) => i.verify_token === verifyToken)) return { ok: true };
+
+  // Não bateu: descobre a causa provável para o log (sem afrouxar nada).
+  const received = verifyToken.trim();
+  return {
+    ok: false,
+    reason: 'token_nao_confere',
+    diag: {
+      ...diag,
+      matchesAfterTrim: withToken.some((i) => (i.verify_token ?? '').trim() === received),
+      matchesIgnoringCase: withToken.some(
+        (i) => (i.verify_token ?? '').toLowerCase() === verifyToken.toLowerCase(),
+      ),
+    },
+  };
 }
