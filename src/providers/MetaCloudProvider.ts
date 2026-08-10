@@ -1,7 +1,11 @@
 import type { Instance } from '../repo/types';
 import { normalizePhone } from '../util/phone';
 import { MetaApiError } from './errors';
-import { buildButtonComponents, splitTemplateVars } from './templateComponents';
+import {
+  buildButtonComponents,
+  buildHeaderComponent,
+  splitTemplateVars,
+} from './templateComponents';
 import type {
   ListSection,
   MediaPayload,
@@ -119,7 +123,11 @@ export class MetaCloudProvider implements Provider {
     // REGRA: usar o idioma EXATO recebido (vem do template sincronizado na Meta,
     // P1.4). Nunca assumir pt_BR. Aqui `template.language` é a fonte da verdade.
     const components: Record<string, unknown>[] = [];
-    const { bodyVars, buttonVars } = splitTemplateVars(vars);
+    const { bodyVars, buttonVars, headerVars } = splitTemplateVars(vars);
+
+    // Header dinâmico (TEXT com {{1}} ou mídia) exige component próprio — mesma
+    // classe de falha do botão: sem ele, 132000.
+    components.push(...buildHeaderComponent(template.components, headerVars, template.name));
 
     if (Object.keys(bodyVars).length > 0) {
       // Variáveis posicionais {{1}}, {{2}}... → ordena por chave numérica.

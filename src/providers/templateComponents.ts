@@ -7,12 +7,18 @@ import { TemplateParamsError } from './errors';
  *
  * Convenção de chaves em `vars` (uma única flat map em toda a stack — rota
  * avulsa, campanhas e fluxos usam o mesmo formato, sem migração de schema):
- *   "1", "2", "3"  → parâmetros posicionais do BODY ({{1}}, {{2}}, ...)
- *   "button0"      → parâmetro do botão de índice 0 (sufixo da URL dinâmica)
- *   "button1"      → idem para o botão de índice 1, e assim por diante
+ *   "1", "2", "3"          → parâmetros posicionais do BODY ({{1}}, {{2}}, ...)
+ *   "button0"              → parâmetro do botão de índice 0 (sufixo da URL)
+ *   "button1"              → idem para o botão de índice 1, e assim por diante
+ *   "header"               → valor do header TEXT dinâmico
+ *   "headerMedia"          → URL pública da mídia do header
+ *   "headerMediaId"        → alternativa: id de mídia já subida à Meta
+ *   "headerMediaType"      → image|video|document (só se não sincronizado)
+ *   "headerMediaFilename"  → nome do arquivo, só para header DOCUMENT
  *
  * O índice do botão é a POSIÇÃO dele na lista de botões do template (0-2),
- * exatamente como a Graph API exige.
+ * exatamente como a Graph API exige. Header é único por template, por isso não
+ * tem índice.
  */
 
 /** Chave de variável de botão: button0, button1, ... (case-insensitive). */
@@ -21,27 +27,58 @@ const BUTTON_VAR_KEY = /^button(\d+)$/i;
 /** Placeholder de variável da Meta: {{1}}, {{ 2 }}, ... */
 const PLACEHOLDER = /\{\{\s*\d+\s*\}\}/;
 
+/** Variáveis do HEADER, já normalizadas a partir das chaves reservadas. */
+export interface HeaderVars {
+  /** Header TEXT dinâmico ({{1}} no header). Chave `header`. */
+  text?: string;
+  /** URL pública da mídia do header. Chave `headerMedia`. */
+  mediaLink?: string;
+  /** Id de mídia já subida à Meta. Chave `headerMediaId`. */
+  mediaId?: string;
+  /** image|video|document — só necessário se o template não foi sincronizado. */
+  mediaType?: string;
+  /** Nome do arquivo, só para header DOCUMENT. Chave `headerMediaFilename`. */
+  filename?: string;
+}
+
 export interface SplitVars {
   /** Variáveis posicionais do BODY. */
   bodyVars: Record<string, string>;
   /** Variáveis de botão, indexadas pela posição do botão ("0", "1", ...). */
   buttonVars: Record<string, string>;
+  /** Variáveis do header (só existe um header por template). */
+  headerVars: HeaderVars;
 }
 
+/** Chaves reservadas do header → campo em HeaderVars (comparação lowercase). */
+const HEADER_VAR_KEYS: Record<string, keyof HeaderVars> = {
+  header: 'text',
+  headermedia: 'mediaLink',
+  headermediaid: 'mediaId',
+  headermediatype: 'mediaType',
+  headermediafilename: 'filename',
+};
+
 /**
- * Separa as variáveis de BODY das de botão. Sem isso, uma chave "button0"
- * entraria como parâmetro do body (ordenação numérica viraria NaN) e a Meta
- * rejeitaria o envio por contagem de parâmetros.
+ * Separa as variáveis de BODY das de botão e de header. Sem isso, uma chave
+ * "button0"/"header" entraria como parâmetro do body (a ordenação numérica
+ * viraria NaN) e a Meta rejeitaria o envio por contagem de parâmetros.
  */
 export function splitTemplateVars(vars?: Record<string, string>): SplitVars {
   const bodyVars: Record<string, string> = {};
   const buttonVars: Record<string, string> = {};
+  const headerVars: HeaderVars = {};
   for (const [key, value] of Object.entries(vars ?? {})) {
+    const headerField = HEADER_VAR_KEYS[key.toLowerCase()];
+    if (headerField) {
+      headerVars[headerField] = value;
+      continue;
+    }
     const match = BUTTON_VAR_KEY.exec(key);
     if (match) buttonVars[match[1]] = value;
     else bodyVars[key] = value;
   }
-  return { bodyVars, buttonVars };
+  return { bodyVars, buttonVars, headerVars };
 }
 
 interface RawButton {
@@ -130,4 +167,133 @@ export function buildButtonComponents(
   }
 
   return out;
+}
+
+// --------------------------------------------------------------------- HEADER
+
+const MEDIA_FORMATS = new Set(['IMAGE', 'VIDEO', 'DOCUMENT']);
+
+interface RawHeader {
+  format?: unknown;
+  text?: unknown;
+}
+
+/** Localiza o component HEADER nos components sincronizados. */
+function findHeader(components: unknown): RawHeader | null {
+  if (!Array.isArray(components)) return null;
+  for (const comp of components) {
+    if (!comp || typeof comp !== 'object') continue;
+    const c = comp as { type?: unknown };
+    if (String(c.type).toUpperCase() === 'HEADER') return comp as RawHeader;
+  }
+  return null;
+}
+
+function hasHeaderVar(v: HeaderVars): boolean {
+  return Boolean(v.text || v.mediaLink || v.mediaId);
+}
+
+/** Component de header de mídia: {type:'header', parameters:[{type:'image', image:{...}}]}. */
+function mediaHeaderComponent(
+  kind: string,
+  vars: HeaderVars,
+  templateName: string,
+): Record<string, unknown> {
+  if (vars.mediaLink && vars.mediaId) {
+    throw new TemplateParamsError(
+      `Template "${templateName}": informe "headerMedia" (URL) OU "headerMediaId" ` +
+        `(mídia já subida à Meta), nunca os dois — não dá para saber qual vale.`,
+    );
+  }
+  // A Meta aceita `id` (mídia já subida) ou `link` (URL pública) — mesmo media
+  // object usado em sendMedia.
+  const media: Record<string, unknown> = vars.mediaId
+    ? { id: vars.mediaId }
+    : { link: vars.mediaLink };
+  if (kind === 'document' && vars.filename) media.filename = vars.filename;
+  return { type: 'header', parameters: [{ type: kind, [kind]: media }] };
+}
+
+/**
+ * Monta o component de HEADER do payload de envio (0 ou 1 component).
+ *
+ * - Header estático (TEXT sem placeholder) ou template sem header → NENHUM
+ *   component (mandar um sobrando também dá 132000).
+ * - Header TEXT com {{1}} → exige a variável `header`.
+ * - Header IMAGE/VIDEO/DOCUMENT → exige `headerMedia` (URL) ou `headerMediaId`,
+ *   mesmo quando o template foi aprovado com mídia de exemplo.
+ * - Faltando a variável → TemplateParamsError, antes de tocar na Graph API.
+ * - Template não sincronizado: confia no informado (mesmo critério do botão e
+ *   do idioma); aí `headerMediaType` é obrigatório para mídia, porque sem os
+ *   components não há como saber se é image/video/document.
+ */
+export function buildHeaderComponent(
+  components: unknown,
+  headerVars: HeaderVars,
+  templateName: string,
+): Record<string, unknown>[] {
+  const header = findHeader(components);
+
+  if (!header) {
+    if (!hasHeaderVar(headerVars)) return [];
+    // Components sincronizados existem e não têm HEADER: variável sobrando.
+    if (Array.isArray(components)) {
+      throw new TemplateParamsError(
+        `Template "${templateName}": foram informadas variáveis de header, mas o ` +
+          `template não tem header.`,
+      );
+    }
+    // Não sincronizado: confia no chamador.
+    if (headerVars.text) {
+      return [{ type: 'header', parameters: [{ type: 'text', text: headerVars.text }] }];
+    }
+    const kind = String(headerVars.mediaType ?? '').toLowerCase();
+    if (!MEDIA_FORMATS.has(kind.toUpperCase())) {
+      throw new TemplateParamsError(
+        `Template "${templateName}" não sincronizado: informe "headerMediaType" ` +
+          `(image, video ou document) para montar o header de mídia, ou rode o sync.`,
+      );
+    }
+    return [mediaHeaderComponent(kind, headerVars, templateName)];
+  }
+
+  const format = String(header.format ?? 'TEXT').toUpperCase();
+
+  if (MEDIA_FORMATS.has(format)) {
+    if (headerVars.text) {
+      throw new TemplateParamsError(
+        `Template "${templateName}": o header é de mídia (${format}); use ` +
+          `"headerMedia"/"headerMediaId", não "header".`,
+      );
+    }
+    if (!headerVars.mediaLink && !headerVars.mediaId) {
+      throw new TemplateParamsError(
+        `Template "${templateName}": o header é de mídia (${format}) e exige ` +
+          `"headerMedia" (URL pública) ou "headerMediaId", que não foi informado.`,
+      );
+    }
+    return [mediaHeaderComponent(format.toLowerCase(), headerVars, templateName)];
+  }
+
+  // Header TEXT: só precisa de parâmetro se tiver placeholder.
+  if (!PLACEHOLDER.test(String(header.text ?? ''))) {
+    if (hasHeaderVar(headerVars)) {
+      throw new TemplateParamsError(
+        `Template "${templateName}": o header é estático e não aceita variável.`,
+      );
+    }
+    return [];
+  }
+  if (headerVars.mediaLink || headerVars.mediaId) {
+    throw new TemplateParamsError(
+      `Template "${templateName}": o header é TEXT; use "header", não "headerMedia".`,
+    );
+  }
+  if (!headerVars.text) {
+    throw new TemplateParamsError(
+      `Template "${templateName}": o header tem variável e exige a variável "header", ` +
+        `que não foi informada.`,
+    );
+  }
+  return [{ type: 'header', parameters: [{ type: 'text', text: headerVars.text }] }];
 }

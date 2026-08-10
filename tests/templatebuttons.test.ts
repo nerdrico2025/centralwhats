@@ -82,7 +82,11 @@ describe('splitTemplateVars — separa vars de body das de botão', () => {
   });
 
   it('sem vars não quebra', () => {
-    expect(splitTemplateVars(undefined)).toEqual({ bodyVars: {}, buttonVars: {} });
+    expect(splitTemplateVars(undefined)).toEqual({
+      bodyVars: {},
+      buttonVars: {},
+      headerVars: {},
+    });
   });
 });
 
