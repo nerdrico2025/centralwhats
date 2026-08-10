@@ -345,6 +345,10 @@ function livechatScreen() {
 
   let selected = null;
   let convs = [];
+  // Erro da última carga da lista. Sem isso, QUALQUER falha (rede, 401, 500,
+  // instância não selecionada) vira "Sem conversas ainda" — que foi exatamente
+  // o que mascarou o diagnóstico do Live Chat. CLAUDE.md: nada de erro engolido.
+  let listError = null;
 
   function previewOf(c) {
     const prefix = c.last_message_direction === 'out' ? 'Você: ' : '';
@@ -353,6 +357,15 @@ function livechatScreen() {
 
   function renderList() {
     listEl.innerHTML = '';
+    if (listError) {
+      listEl.appendChild(
+        h('div', { class: 'placeholder placeholder--error' }, [
+          h('strong', {}, 'Não foi possível carregar as conversas.'),
+          h('div', { class: 'muted' }, listError),
+        ]),
+      );
+      return;
+    }
     if (!convs.length) {
       listEl.appendChild(h('div', { class: 'placeholder' }, 'Sem conversas ainda.'));
       return;
@@ -380,8 +393,11 @@ function livechatScreen() {
   async function loadConversations() {
     try {
       convs = await api.get(api.forInstance('/conversations'));
-    } catch {
+      listError = null;
+    } catch (e) {
       convs = [];
+      listError = e.message;
+      console.error('[livechat] falha ao carregar conversas:', e);
     }
     renderList();
     // Atualiza o badge de não-lidas do menu (soma das conversas).
@@ -392,13 +408,26 @@ function livechatScreen() {
     }
   }
 
-  function renderConversation(msgs) {
+  function renderConversation(msgs, error) {
     const conv = convs.find((c) => c.phone === selected);
     const header = h('div', { class: 'conversation__header' }, [
       h('strong', {}, (conv && conv.name) || selected),
       ' ',
       h('span', { class: 'muted' }, selected),
     ]);
+    if (error) {
+      rightEl.innerHTML = '';
+      rightEl.appendChild(
+        h('div', { class: 'conversation' }, [
+          header,
+          h('div', { class: 'placeholder placeholder--error' }, [
+            h('strong', {}, 'Não foi possível carregar o histórico.'),
+            h('div', { class: 'muted' }, error),
+          ]),
+        ]),
+      );
+      return;
+    }
     const msgsEl = h('div', { class: 'conversation__messages' }, msgs.map((mm) =>
       h('div', { class: 'bubble bubble--' + (mm.direction === 'in' ? 'in' : 'out') }, [
         h('div', {}, messageText(mm.type, mm.content)),
@@ -433,8 +462,10 @@ function livechatScreen() {
       msgs = await api.get(
         api.forInstance(`/conversations/${encodeURIComponent(selected)}/messages?limit=200`),
       );
-    } catch {
-      msgs = [];
+    } catch (e) {
+      console.error('[livechat] falha ao carregar mensagens:', e);
+      renderConversation([], e.message);
+      return;
     }
     renderConversation(msgs.slice().reverse()); // repo retorna DESC; exibe ASC
   }

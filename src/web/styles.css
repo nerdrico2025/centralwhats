@@ -266,6 +266,10 @@ body {
   padding: 60px 20px;
   text-align: center;
 }
+/* Falha de carga: precisa se distinguir do vazio legítimo ("Sem conversas"). */
+.placeholder--error {
+  color: var(--danger, #d64541);
+}
 .placeholder__emoji {
   font-size: 34px;
 }
