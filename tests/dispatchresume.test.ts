@@ -262,6 +262,59 @@ describe('retomada por TRÁFEGO de webhook (mesmo mecanismo dos fluxos)', () => 
   });
 });
 
+describe('falha assíncrona da Meta volta para campaign_sends', () => {
+  it('status=failed no webhook vira failed na auditoria e corrige os contadores', async () => {
+    const camp = await seedCampaign(2);
+    await startCampaign(repo, inst, camp.id);
+    const { provider } = makeProvider();
+    await processCampaignTick(repo, inst, camp.id, { providerFor: () => provider });
+
+    const enviados = await repo.campaigns.listSendsByStatus(camp.id, 'sent');
+    expect(enviados).toHaveLength(2);
+    const alvo = enviados[0];
+
+    // A Meta aceitou (200 + wamid) e só agora reporta a falha real.
+    await processInboundPayload(repo, {
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          changes: [
+            {
+              value: {
+                metadata: { phone_number_id: '109999888777' },
+                statuses: [
+                  {
+                    id: alvo.wa_message_id,
+                    status: 'failed',
+                    errors: [{ code: 131026, message: 'Message undeliverable' }],
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const depois = await repo.campaigns.listSends(camp.id);
+    const linha = depois.find((s) => s.id === alvo.id)!;
+    expect(linha.status).toBe('failed');
+    expect(linha.error_code).toBe('131026');
+    expect(linha.error_message).toMatch(/undeliverable/i);
+
+    // Contadores da campanha corrigidos: não pode seguir dizendo "2 enviados".
+    const c = await repo.campaigns.getById(inst.id, camp.id);
+    expect(c!.sent_count).toBe(1);
+    expect(c!.failed_count).toBe(1);
+  });
+
+  it('wamid que não é de campanha não afeta nada', async () => {
+    expect(
+      await repo.campaigns.markSendFailedByWaMessageId(inst.id, 'wamid.desconhecido', '1', 'x'),
+    ).toBeNull();
+  });
+});
+
 describe('multi-tenancy da campanha', () => {
   it('campanha e sends de uma instância não vazam para outra', async () => {
     const camp = await seedCampaign(2);

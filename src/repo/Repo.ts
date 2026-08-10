@@ -259,6 +259,18 @@ export interface CampaignsRepo {
       >
     >,
   ): Promise<void>;
+  /**
+   * A Meta aceita o envio (200 + wamid) e só depois reporta a falha real via
+   * webhook de status. Sem isto, campaign_sends ficaria 'sent' para sempre e a
+   * campanha diria "3 enviados" com 2 nunca entregues. Devolve o campaign_id
+   * afetado (null se o wamid não é de campanha), para recalcular contadores.
+   */
+  markSendFailedByWaMessageId(
+    instanceId: string,
+    waMessageId: string,
+    errorCode: string | null,
+    errorMessage: string | null,
+  ): Promise<string | null>;
   /** `pending` inclui os 'sending' em voo — são trabalho ainda não concluído. */
   countSendsByStatus(
     campaignId: string,

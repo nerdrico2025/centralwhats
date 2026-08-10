@@ -641,6 +641,18 @@ export function createPostgresAdapter(opts: { connectionString: string }): Repo 
         vals.push(id);
         await run(`UPDATE campaign_sends SET ${cols.join(',')} WHERE id=$${vals.length}`, vals);
       },
+      async markSendFailedByWaMessageId(instanceId, waMessageId, errorCode, errorMessage) {
+        // Escopado pela instância da campanha (multi-tenancy) mesmo o wamid
+        // sendo único na Meta. Só afeta linhas ainda tidas como 'sent'.
+        const rows = await all(
+          `UPDATE campaign_sends SET status='failed', error_code=$1, error_message=$2
+             WHERE wa_message_id=$3 AND status='sent'
+               AND campaign_id IN (SELECT id FROM campaigns WHERE instance_id=$4)
+             RETURNING campaign_id`,
+          [errorCode, errorMessage, waMessageId, instanceId],
+        );
+        return rows.length ? String(rows[0].campaign_id) : null;
+      },
       async countSendsByStatus(campaignId) {
         const rows = await all(
           `SELECT status, COUNT(*) c FROM campaign_sends WHERE campaign_id=$1 GROUP BY status`,

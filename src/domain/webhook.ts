@@ -209,6 +209,25 @@ async function processChangeValue(
       error_code: errorCode,
       error_message: errorMessage,
     });
+
+    // A Meta aceita o envio com 200 + wamid e só reporta a falha REAL aqui.
+    // Sem propagar, campaign_sends ficaria 'sent' e a campanha reportaria
+    // sucesso para quem nunca recebeu.
+    if (status === 'failed') {
+      const campaignId = await repo.campaigns.markSendFailedByWaMessageId(
+        instance.id,
+        waMessageId,
+        errorCode,
+        errorMessage,
+      );
+      if (campaignId) {
+        const counts = await repo.campaigns.countSendsByStatus(campaignId);
+        await repo.campaigns.update(instance.id, campaignId, {
+          sent_count: counts.sent,
+          failed_count: counts.failed,
+        });
+      }
+    }
     statuses++;
   }
 
