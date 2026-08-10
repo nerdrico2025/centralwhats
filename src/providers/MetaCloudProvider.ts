@@ -1,6 +1,7 @@
 import type { Instance } from '../repo/types';
 import { normalizePhone } from '../util/phone';
 import { MetaApiError } from './errors';
+import { buildButtonComponents, splitTemplateVars } from './templateComponents';
 import type {
   ListSection,
   MediaPayload,
@@ -112,19 +113,25 @@ export class MetaCloudProvider implements Provider {
   sendTemplate(
     instance: Instance,
     to: string,
-    template: { name: string; language: string },
+    template: { name: string; language: string; components?: unknown },
     vars?: Record<string, string>,
   ): Promise<SendResult> {
     // REGRA: usar o idioma EXATO recebido (vem do template sincronizado na Meta,
     // P1.4). Nunca assumir pt_BR. Aqui `template.language` é a fonte da verdade.
     const components: Record<string, unknown>[] = [];
-    if (vars && Object.keys(vars).length > 0) {
+    const { bodyVars, buttonVars } = splitTemplateVars(vars);
+
+    if (Object.keys(bodyVars).length > 0) {
       // Variáveis posicionais {{1}}, {{2}}... → ordena por chave numérica.
-      const parameters = Object.keys(vars)
+      const parameters = Object.keys(bodyVars)
         .sort((a, b) => Number(a) - Number(b))
-        .map((k) => ({ type: 'text', text: vars[k] }));
+        .map((k) => ({ type: 'text', text: bodyVars[k] }));
       components.push({ type: 'body', parameters });
     }
+
+    // Botões de URL dinâmica exigem um component próprio por botão; sem ele a
+    // Meta rejeita com 132000 (contagem de parâmetros).
+    components.push(...buildButtonComponents(template.components, buttonVars, template.name));
     return this.post(instance, {
       to: normalizePhone(to),
       type: 'template',

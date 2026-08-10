@@ -108,6 +108,11 @@ export function createMessagesRouter(repo: Repo, deps: MessagingDeps = {}): Rout
           throw new HttpError(400, err.message);
         }
         if (err instanceof SendFailedError) {
+          // Variáveis erradas são culpa do client (400), não da Meta (502) —
+          // mas a falha já está logada em messages nos dois casos.
+          if (err.code === 'TEMPLATE_PARAMS') {
+            throw new HttpError(400, err.message, { logged_message_id: err.loggedMessageId });
+          }
           // Erro da Meta já gravado em messages; devolve estruturado ao client.
           throw new HttpError(502, 'Falha no envio pela Meta', {
             code: err.code,

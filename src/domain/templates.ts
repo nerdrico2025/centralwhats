@@ -57,6 +57,26 @@ export async function resolveTemplateLanguage(
   name: string,
   language?: string,
 ): Promise<string> {
+  return (await resolveTemplate(repo, instance, name, language)).language;
+}
+
+/** Idioma + estrutura (components) do template resolvido. */
+export interface ResolvedTemplate {
+  language: string;
+  /** components sincronizados da Meta; null se o template não foi sincronizado. */
+  components: unknown;
+}
+
+/**
+ * Igual ao resolveTemplateLanguage, mas devolve também os `components`
+ * sincronizados — necessários para montar parâmetros de botão no envio.
+ */
+export async function resolveTemplate(
+  repo: Repo,
+  instance: Instance,
+  name: string,
+  language?: string,
+): Promise<ResolvedTemplate> {
   const all = (await repo.templates.list(instance.id)).filter((t) => t.name === name);
 
   if (language) {
@@ -67,7 +87,8 @@ export async function resolveTemplateLanguage(
           `(disponíveis: ${disponiveis}).`,
       );
     }
-    return language;
+    const match = all.find((t) => t.language === language);
+    return { language, components: match?.components ?? null };
   }
 
   if (all.length === 0) {
@@ -76,7 +97,7 @@ export async function resolveTemplateLanguage(
     );
   }
   if (all.length === 1) {
-    return all[0].language;
+    return { language: all[0].language, components: all[0].components };
   }
   const disponiveis = all.map((t) => t.language).join(', ');
   throw new TemplateResolutionError(

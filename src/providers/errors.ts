@@ -15,6 +15,18 @@ export class MetaApiError extends Error {
   }
 }
 
+/**
+ * Variáveis do template incompatíveis com a estrutura cadastrada na Meta (ex.:
+ * botão de URL dinâmica sem a variável correspondente). Erro do CHAMADOR, pego
+ * antes de tocar na Graph API — evita o 132000 opaco e o payload malformado.
+ */
+export class TemplateParamsError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TemplateParamsError';
+  }
+}
+
 /** Recurso pedido não é suportado pelo provider da instância (ex.: template no Baileys). */
 export class UnsupportedByProviderError extends Error {
   constructor(

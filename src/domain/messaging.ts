@@ -1,7 +1,11 @@
 import type { Repo } from '../repo';
 import type { Instance, Message } from '../repo/types';
 import { getProvider, makeOutboxSender } from '../providers';
-import { MetaApiError, UnsupportedByProviderError } from '../providers/errors';
+import {
+  MetaApiError,
+  TemplateParamsError,
+  UnsupportedByProviderError,
+} from '../providers/errors';
 import type {
   ListSection,
   MediaPayload,
@@ -11,7 +15,7 @@ import type {
   SendResult,
 } from '../providers/types';
 import { normalizePhone } from '../util/phone';
-import { resolveTemplateLanguage } from './templates';
+import { resolveTemplate } from './templates';
 
 /** Entrada de envio avulso — união discriminada por `type`. */
 export type SendInput =
@@ -85,6 +89,7 @@ function callProvider(
   instance: Instance,
   input: SendInput,
   resolvedTemplateLanguage?: string,
+  templateComponents?: unknown,
 ): Promise<SendResult> {
   switch (input.type) {
     case 'text':
@@ -95,7 +100,11 @@ function callProvider(
       return provider.sendTemplate(
         instance,
         input.to,
-        { name: input.template.name, language: resolvedTemplateLanguage ?? '' },
+        {
+          name: input.template.name,
+          language: resolvedTemplateLanguage ?? '',
+          components: templateComponents,
+        },
         input.vars,
       );
     case 'buttons':
@@ -142,14 +151,17 @@ export async function sendViaProvider(
   // Template: resolve o idioma pelo registro SINCRONIZADO (fonte da verdade).
   // Nunca há default pt_BR — resolveTemplateLanguage lança se for ambíguo.
   let resolvedTemplateLanguage: string | undefined;
+  let templateComponents: unknown;
   let contentInput: SendInput = input;
   if (input.type === 'template') {
-    resolvedTemplateLanguage = await resolveTemplateLanguage(
+    const resolved = await resolveTemplate(
       repo,
       instance,
       input.template.name,
       input.template.language,
     );
+    resolvedTemplateLanguage = resolved.language;
+    templateComponents = resolved.components;
     contentInput = {
       ...input,
       template: { name: input.template.name, language: resolvedTemplateLanguage },
@@ -162,7 +174,13 @@ export async function sendViaProvider(
   const content = messageContent(contentInput);
 
   try {
-    const result = await callProvider(provider, instance, input, resolvedTemplateLanguage);
+    const result = await callProvider(
+      provider,
+      instance,
+      input,
+      resolvedTemplateLanguage,
+      templateComponents,
+    );
     const message = await repo.messages.create({
       instance_id: instance.id,
       direction: 'out',
@@ -183,6 +201,24 @@ export async function sendViaProvider(
     }
     return { message, result };
   } catch (err) {
+    // Parâmetros de template inválidos: barrado ANTES da Graph API, mas ainda é
+    // um envio que aconteceu do ponto de vista do usuário — loga igual.
+    if (err instanceof TemplateParamsError) {
+      const logged = await repo.messages.create({
+        instance_id: instance.id,
+        direction: 'out',
+        from_number: from,
+        to_number: to,
+        type,
+        content,
+        status: 'failed',
+        error_code: 'TEMPLATE_PARAMS',
+        error_message: err.message,
+        wa_message_id: null,
+        campaign_id: campaignId,
+      });
+      throw new SendFailedError('TEMPLATE_PARAMS', err.message, 400, logged.id);
+    }
     if (err instanceof MetaApiError) {
       // Loga a FALHA (nunca "só grava se deu certo").
       const logged = await repo.messages.create({

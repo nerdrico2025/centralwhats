@@ -71,11 +71,15 @@ export interface Provider {
     media: MediaPayload,
   ): Promise<SendResult>;
 
-  /** Só faz sentido na oficial (HSM). language = idioma exato cadastrado na Meta. */
+  /**
+   * Só faz sentido na oficial (HSM). language = idioma exato cadastrado na Meta.
+   * `components` são os do template SINCRONIZADO (fonte da verdade), usados para
+   * montar os parâmetros de botão de URL dinâmica.
+   */
   sendTemplate(
     instance: Instance,
     to: string,
-    template: { name: string; language: string },
+    template: { name: string; language: string; components?: unknown },
     vars?: Record<string, string>,
   ): Promise<SendResult>;
 
