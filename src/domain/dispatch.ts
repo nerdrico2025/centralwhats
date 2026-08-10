@@ -16,6 +16,10 @@ export class DispatchError extends Error {
 const RATE_LIMIT_CODES = new Set(['130429', '131056']);
 const MAX_ATTEMPTS = 5;
 const DEFAULT_BUDGET_MS = 8000;
+/** Claim mais velho que isto = tick que morreu; a linha volta para a fila. */
+const STALE_CLAIM_MS = 5 * 60 * 1000;
+/** Orçamento menor na retomada por tráfego (divide a invocação com o inbound). */
+const TRAFFIC_BUDGET_MS = 3000;
 
 const sleep = (ms: number): Promise<void> =>
   ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve();
@@ -61,11 +65,14 @@ export async function startCampaign(
     for (const r of recipients) {
       await repo.campaigns.recordSend({
         campaign_id: campaignId,
+        contact_id: r.contact_id,
         contact_phone: r.phone,
         status: 'pending',
+        wa_message_id: null,
         error_code: null,
         error_message: null,
         sent_at: null,
+        claimed_at: null,
         vars: r.vars,
         attempts: 0,
       });
@@ -92,7 +99,7 @@ async function processOne(
   const nowIso = new Date().toISOString();
   const attempts = send.attempts + 1;
   try {
-    await sendViaProvider(
+    const { result } = await sendViaProvider(
       repo,
       instance,
       {
@@ -108,6 +115,7 @@ async function processOne(
     await repo.campaigns.updateSend(send.id, {
       status: 'sent',
       sent_at: nowIso,
+      wa_message_id: result.waMessageId,
       error_code: null,
       error_message: null,
       attempts,
@@ -118,6 +126,7 @@ async function processOne(
       if (RATE_LIMIT_CODES.has(err.code ?? '') && attempts < MAX_ATTEMPTS) {
         await repo.campaigns.updateSend(send.id, {
           status: 'pending', // continua na fila; espera natural até o próximo tick
+          claimed_at: null, // libera o claim para o próximo tick pegar
           attempts,
           error_code: err.code,
           error_message: 'rate-limit; será retentado',
@@ -178,7 +187,19 @@ export async function processCampaignTick(
     opts.batchSize ??
     (interval > 0 ? Math.max(1, Math.min(50, Math.floor(budget / interval))) : 50);
 
-  const batch = await repo.campaigns.listPendingSends(campaignId, batchSize);
+  // Tick que morreu no meio (timeout serverless) deixa linhas presas em
+  // 'sending'. Devolve à fila antes de reivindicar o próximo lote.
+  const staleBefore = new Date(Date.now() - STALE_CLAIM_MS).toISOString();
+  await repo.campaigns.reclaimStaleSends(campaignId, staleBefore);
+
+  // Claim ATÔMICO: pending → sending numa instrução só. Sem isso, o polling da
+  // UI e a retomada por webhook poderiam pegar o mesmo destinatário e o contato
+  // receberia a mensagem duas vezes.
+  const batch = await repo.campaigns.claimPendingSends(
+    campaignId,
+    batchSize,
+    new Date().toISOString(),
+  );
   if (batch.length === 0) {
     const counts = await repo.campaigns.countSendsByStatus(campaignId);
     await repo.campaigns.update(instance.id, campaignId, {
@@ -204,6 +225,42 @@ export async function processCampaignTick(
     failed_count: counts.failed,
   });
   return { status: done ? 'completed' : 'running', processed: batch.length, ...counts };
+}
+
+/**
+ * Retoma as campanhas 'running' da instância — MESMO mecanismo dos fluxos:
+ * disparado pelo tráfego de webhook, em background, depois do 200 (ver
+ * domain/webhook.ts, que já chama processPendingExecutions no mesmo ponto).
+ *
+ * Sem isso a campanha só avançava enquanto a UI estivesse aberta fazendo
+ * polling do /tick. Cada campanha processa UM lote com orçamento curto — nada
+ * de segurar a invocação; o que sobra fica em campaign_sends para o próximo
+ * tick (da UI ou do próximo webhook).
+ *
+ * Nunca lança: a retomada é oportunista e não pode derrubar o processamento do
+ * inbound. Falha vira log, nunca silêncio.
+ */
+export async function processPendingCampaigns(
+  repo: Repo,
+  instance: Instance,
+  deps: MessagingDeps = {},
+): Promise<void> {
+  let campaigns;
+  try {
+    campaigns = (await repo.campaigns.list(instance.id)).filter((c) => c.status === 'running');
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[campanha] falha ao listar campanhas em execução:', err);
+    return;
+  }
+  for (const c of campaigns) {
+    try {
+      await processCampaignTick(repo, instance, c.id, deps, { budgetMs: TRAFFIC_BUDGET_MS });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(`[campanha ${c.id}] falha ao retomar por tráfego:`, err);
+    }
+  }
 }
 
 /** Pausa uma campanha em andamento (os ticks param de processar). */

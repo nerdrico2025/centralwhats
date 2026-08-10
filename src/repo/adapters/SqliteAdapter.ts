@@ -567,15 +567,18 @@ export function createSqliteAdapter(opts: { path: string }): Repo {
       async recordSend(data) {
         const id = uid();
         const r = get(
-          `INSERT INTO campaign_sends (id,campaign_id,contact_phone,status,error_code,error_message,sent_at,vars,attempts)
-             VALUES (?,?,?,?,?,?,?,?,?) RETURNING *`,
+          `INSERT INTO campaign_sends (id,campaign_id,contact_id,contact_phone,status,wa_message_id,error_code,error_message,sent_at,claimed_at,vars,attempts)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?) RETURNING *`,
           id,
           data.campaign_id,
+          data.contact_id,
           normalizePhone(data.contact_phone),
           data.status,
+          data.wa_message_id ?? null,
           data.error_code,
           data.error_message,
           data.sent_at,
+          data.claimed_at ?? null,
           m.stringifyJson(data.vars ?? {}),
           data.attempts ?? 0,
         );
@@ -602,6 +605,32 @@ export function createSqliteAdapter(opts: { path: string }): Repo {
           status,
         ).map(m.mapCampaignSend);
       },
+      async claimPendingSends(campaignId, limit, claimedAt) {
+        // UMA instrução: seleciona e marca no mesmo UPDATE. Dois ticks
+        // concorrentes nunca levam o mesmo destinatário (sem envio duplicado).
+        return all(
+          `UPDATE campaign_sends SET status='sending', claimed_at=?
+             WHERE id IN (
+               SELECT id FROM campaign_sends
+                 WHERE campaign_id=? AND status='pending'
+                 ORDER BY id ASC LIMIT ?
+             )
+             RETURNING *`,
+          claimedAt,
+          campaignId,
+          limit,
+        ).map(m.mapCampaignSend);
+      },
+      async reclaimStaleSends(campaignId, olderThan) {
+        const rows = all(
+          `UPDATE campaign_sends SET status='pending', claimed_at=NULL
+             WHERE campaign_id=? AND status='sending' AND claimed_at < ?
+             RETURNING id`,
+          campaignId,
+          olderThan,
+        );
+        return rows.length;
+      },
       async updateSend(id, patch) {
         const cols: string[] = [];
         const vals: unknown[] = [];
@@ -614,6 +643,8 @@ export function createSqliteAdapter(opts: { path: string }): Repo {
         if (patch.error_message !== undefined) set('error_message', patch.error_message);
         if (patch.sent_at !== undefined) set('sent_at', patch.sent_at);
         if (patch.attempts !== undefined) set('attempts', patch.attempts);
+        if (patch.wa_message_id !== undefined) set('wa_message_id', patch.wa_message_id);
+        if (patch.claimed_at !== undefined) set('claimed_at', patch.claimed_at);
         if (!cols.length) return;
         vals.push(id);
         run(`UPDATE campaign_sends SET ${cols.join(',')} WHERE id=?`, ...vals);
@@ -624,7 +655,13 @@ export function createSqliteAdapter(opts: { path: string }): Repo {
           campaignId,
         );
         const get2 = (s: string): number => Number(rows.find((r) => r.status === s)?.c ?? 0);
-        return { sent: get2('sent'), failed: get2('failed'), pending: get2('pending') };
+        // 'sending' (em voo) conta como pendente: senão a campanha seria dada
+        // como concluída com envios ainda acontecendo.
+        return {
+          sent: get2('sent'),
+          failed: get2('failed'),
+          pending: get2('pending') + get2('sending'),
+        };
       },
     },
 

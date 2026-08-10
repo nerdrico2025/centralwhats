@@ -553,16 +553,19 @@ export function createPostgresAdapter(opts: { connectionString: string }): Repo 
       },
       async recordSend(data) {
         const r = await get(
-          `INSERT INTO campaign_sends (id,campaign_id,contact_phone,status,error_code,error_message,sent_at,vars,attempts)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+          `INSERT INTO campaign_sends (id,campaign_id,contact_id,contact_phone,status,wa_message_id,error_code,error_message,sent_at,claimed_at,vars,attempts)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
           [
             uid(),
             data.campaign_id,
+            data.contact_id,
             normalizePhone(data.contact_phone),
             data.status,
+            data.wa_message_id ?? null,
             data.error_code,
             data.error_message,
             data.sent_at,
+            data.claimed_at ?? null,
             m.stringifyJson(data.vars ?? {}),
             data.attempts ?? 0,
           ],
@@ -593,6 +596,33 @@ export function createPostgresAdapter(opts: { connectionString: string }): Repo 
           )
         ).map(m.mapCampaignSend);
       },
+      async claimPendingSends(campaignId, limit, claimedAt) {
+        // UMA instrução: seleciona e marca no mesmo UPDATE, com SKIP LOCKED
+        // para que dois ticks concorrentes (polling da UI + retomada por
+        // webhook) nunca peguem o mesmo destinatário — nada de envio duplicado.
+        return (
+          await all(
+            `UPDATE campaign_sends SET status='sending', claimed_at=$3
+               WHERE id IN (
+                 SELECT id FROM campaign_sends
+                   WHERE campaign_id=$1 AND status='pending'
+                   ORDER BY id ASC LIMIT $2
+                   FOR UPDATE SKIP LOCKED
+               )
+               RETURNING *`,
+            [campaignId, limit, claimedAt],
+          )
+        ).map(m.mapCampaignSend);
+      },
+      async reclaimStaleSends(campaignId, olderThan) {
+        const rows = await all(
+          `UPDATE campaign_sends SET status='pending', claimed_at=NULL
+             WHERE campaign_id=$1 AND status='sending' AND claimed_at < $2
+             RETURNING id`,
+          [campaignId, olderThan],
+        );
+        return rows.length;
+      },
       async updateSend(id, patch) {
         const cols: string[] = [];
         const vals: unknown[] = [];
@@ -605,6 +635,8 @@ export function createPostgresAdapter(opts: { connectionString: string }): Repo 
         if (patch.error_message !== undefined) set('error_message', patch.error_message);
         if (patch.sent_at !== undefined) set('sent_at', patch.sent_at);
         if (patch.attempts !== undefined) set('attempts', patch.attempts);
+        if (patch.wa_message_id !== undefined) set('wa_message_id', patch.wa_message_id);
+        if (patch.claimed_at !== undefined) set('claimed_at', patch.claimed_at);
         if (!cols.length) return;
         vals.push(id);
         await run(`UPDATE campaign_sends SET ${cols.join(',')} WHERE id=$${vals.length}`, vals);
@@ -615,7 +647,9 @@ export function createPostgresAdapter(opts: { connectionString: string }): Repo 
           [campaignId],
         );
         const g = (s: string): number => Number(rows.find((r) => r.status === s)?.c ?? 0);
-        return { sent: g('sent'), failed: g('failed'), pending: g('pending') };
+        // 'sending' (em voo) conta como pendente: senão a campanha seria dada
+        // como concluída com envios ainda acontecendo.
+        return { sent: g('sent'), failed: g('failed'), pending: g('pending') + g('sending') };
       },
     },
 

@@ -219,21 +219,38 @@ describe('crm / lists / campaigns / flows', () => {
       interval_ms: 500,
       status: 'draft',
     });
-    await repo.campaigns.recordSend({
-      campaign_id: camp.id,
-      contact_phone: '5511111111111',
-      status: 'sent',
-      error_code: null,
-      error_message: null,
-      sent_at: new Date().toISOString(),
+    // contact_id é NOT NULL: toda linha da auditoria nasce de um contato real.
+    const c1 = await repo.contacts.upsert({
+      instance_id: inst.id, phone: '5511111111111', name: 'C1', last_seen: null,
+    });
+    const c2 = await repo.contacts.upsert({
+      instance_id: inst.id, phone: '5522222222222', name: 'C2', last_seen: null,
     });
     await repo.campaigns.recordSend({
       campaign_id: camp.id,
+      contact_id: c1.id,
+      contact_phone: '5511111111111',
+      status: 'sent',
+      wa_message_id: 'wamid.ok',
+      error_code: null,
+      error_message: null,
+      sent_at: new Date().toISOString(),
+      claimed_at: null,
+      vars: {},
+      attempts: 1,
+    });
+    await repo.campaigns.recordSend({
+      campaign_id: camp.id,
+      contact_id: c2.id,
       contact_phone: '5522222222222',
       status: 'failed',
+      wa_message_id: null,
       error_code: '131026',
       error_message: 'número inválido',
       sent_at: new Date().toISOString(),
+      claimed_at: null,
+      vars: {},
+      attempts: 1,
     });
     const sends = await repo.campaigns.listSends(camp.id);
     expect(sends.length).toBe(2);

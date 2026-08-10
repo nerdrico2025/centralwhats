@@ -164,11 +164,17 @@ export interface Campaign {
 export interface CampaignSend {
   id: string;
   campaign_id: string;
+  /** Contato de origem. NOT NULL no banco: a fila nasce de contatos resolvidos. */
+  contact_id: string;
   contact_phone: string;
-  status: string; // pending | sent | failed
+  status: string; // pending | sending | sent | failed
+  /** wamid do envio bem-sucedido — correlaciona a auditoria com a mensagem. */
+  wa_message_id: string | null;
   error_code: string | null;
   error_message: string | null;
   sent_at: string | null;
+  /** Quando o lote reivindicou a linha (recupera tick morto). */
+  claimed_at: string | null;
   vars: Record<string, string>;
   attempts: number;
 }

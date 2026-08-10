@@ -209,11 +209,14 @@ export function mapCampaignSend(r: Row): CampaignSend {
   return {
     id: str(r.id),
     campaign_id: str(r.campaign_id),
+    contact_id: str(r.contact_id),
     contact_phone: str(r.contact_phone),
     status: str(r.status),
+    wa_message_id: strOrNull(r.wa_message_id),
     error_code: strOrNull(r.error_code),
     error_message: strOrNull(r.error_message),
     sent_at: strOrNull(r.sent_at),
+    claimed_at: strOrNull(r.claimed_at),
     vars: parseJson<Record<string, string>>(r.vars, {}),
     attempts: num(r.attempts ?? 0),
   };

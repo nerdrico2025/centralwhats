@@ -226,6 +226,22 @@ export interface CampaignsRepo {
   listSends(campaignId: string): Promise<CampaignSend[]>;
   /** Lote de envios pendentes (a fila do disparo retomável). */
   listPendingSends(campaignId: string, limit: number): Promise<CampaignSend[]>;
+  /**
+   * Reivindica ATOMICAMENTE um lote de pendentes (pending → sending) e devolve
+   * as linhas travadas. É UMA instrução SQL (CLAUDE.md §contadores atômicos):
+   * dois ticks concorrentes — polling da UI + retomada por webhook — nunca
+   * pegam o mesmo destinatário, senão o contato receberia a mensagem 2x.
+   */
+  claimPendingSends(
+    campaignId: string,
+    limit: number,
+    claimedAt: string,
+  ): Promise<CampaignSend[]>;
+  /**
+   * Devolve à fila envios travados em 'sending' antes de `olderThan` (tick que
+   * morreu no meio). Sem isso a campanha ficaria pendurada para sempre.
+   */
+  reclaimStaleSends(campaignId: string, olderThan: string): Promise<number>;
   /** Lista envios por status (auditoria — ex.: falhas com motivo). */
   listSendsByStatus(campaignId: string, status: string): Promise<CampaignSend[]>;
   updateSend(
@@ -233,10 +249,17 @@ export interface CampaignsRepo {
     patch: Partial<
       Pick<
         CampaignSend,
-        'status' | 'error_code' | 'error_message' | 'sent_at' | 'attempts'
+        | 'status'
+        | 'error_code'
+        | 'error_message'
+        | 'sent_at'
+        | 'attempts'
+        | 'wa_message_id'
+        | 'claimed_at'
       >
     >,
   ): Promise<void>;
+  /** `pending` inclui os 'sending' em voo — são trabalho ainda não concluído. */
   countSendsByStatus(
     campaignId: string,
   ): Promise<{ sent: number; failed: number; pending: number }>;

@@ -4,6 +4,7 @@ import { normalizePhone } from '../util/phone';
 import { resolveInstanceByPhoneNumberId } from './instances';
 import { processPendingExecutions, type FlowInput } from './flows';
 import { recordInbound } from './inbound';
+import { processPendingCampaigns } from './dispatch';
 import type { MessagingDeps } from './messaging';
 
 /**
@@ -287,6 +288,18 @@ export async function processInboundPayload(
       // eslint-disable-next-line no-console
       console.error(
         `[webhook] Falha na varredura de retomada de fluxos da instância ${instanceId}: ${errMessage(err)}`,
+        err,
+      );
+    }
+    // Campanhas usam a MESMA retomada por tráfego dos fluxos: sem isso o
+    // disparo só andava enquanto a UI estivesse aberta em polling.
+    try {
+      const inst = await repo.instances.getById(instanceId);
+      if (inst) await processPendingCampaigns(repo, inst, deps);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[webhook] Falha na retomada de campanhas da instância ${instanceId}: ${errMessage(err)}`,
         err,
       );
     }
