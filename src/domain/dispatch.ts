@@ -202,6 +202,13 @@ export async function processCampaignTick(
   );
   if (batch.length === 0) {
     const counts = await repo.campaigns.countSendsByStatus(campaignId);
+    // Lote vazio NÃO significa campanha concluída: outro tick concorrente pode
+    // estar segurando as linhas ('sending' conta como pendente). Marcar
+    // 'completed' aqui deixaria destinatários pendentes para sempre, sem
+    // ninguém para retomá-los — falha silenciosa, o pior caso possível.
+    if (counts.pending > 0) {
+      return { status: 'running', processed: 0, ...counts };
+    }
     await repo.campaigns.update(instance.id, campaignId, {
       status: 'completed',
       sent_count: counts.sent,

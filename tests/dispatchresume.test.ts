@@ -165,6 +165,14 @@ describe('claim atômico — dois ticks concorrentes não duplicam envio', () =>
     // mas os 2 continuam em voo, logo NÃO pode virar 'completed'.
     const counts = await repo.campaigns.countSendsByStatus(camp.id);
     expect(counts.pending).toBe(2);
+
+    // REGRESSÃO (visto em produção): o tick que perde a corrida do claim volta
+    // de mãos vazias e marcava a campanha como 'completed', deixando os
+    // pendentes órfãos — ninguém os retomaria depois.
+    const { provider } = makeProvider();
+    const r = await processCampaignTick(repo, inst, camp.id, { providerFor: () => provider });
+    expect(r.status).toBe('running');
+    expect((await repo.campaigns.getById(inst.id, camp.id))!.status).toBe('running');
   });
 });
 
