@@ -73,6 +73,11 @@ export function createApp(repo: Repo = getRepo(), deps: AppDeps = {}): Express {
   app.use('/webhook', createWebhookRouter(repo, deps.scheduleWebhook, { providerFor: deps.providerFor }));
 
   // === Frontend estático (SPA) — servido de /public quando existir (build:web) ===
+  // ATENÇÃO: na Vercel este bloco NÃO roda — `public/` é servido pela CDN e não
+  // entra no bundle da function, então fs.existsSync() é false lá. O fallback de
+  // SPA em produção é o rewrite `/(.*) → /index.html` do vercel.json; sem ele,
+  // refresh em /livechat cai aqui e vira 404 do Express. Isto aqui serve o
+  // `npm start` local, onde public/ existe de verdade.
   const webDir = path.join(findProjectRoot(), 'public');
   if (fs.existsSync(webDir)) {
     app.use(express.static(webDir));
