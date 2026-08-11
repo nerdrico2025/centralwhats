@@ -222,6 +222,13 @@ export interface CampaignsRepo {
     id: string,
     patch: Partial<Campaign>,
   ): Promise<Campaign | null>;
+  /**
+   * Remove a campanha e, por ON DELETE CASCADE, suas linhas em campaign_sends.
+   * Escopada por instance_id: campanha de outra instância não é encontrada nem
+   * apagada. Devolve `false` quando nada foi removido, para a rota responder
+   * 404 em vez de fingir sucesso (CLAUDE.md §nunca falhar em silêncio).
+   */
+  delete(instanceId: string, id: string): Promise<boolean>;
   recordSend(data: Omit<CampaignSend, 'id'>): Promise<CampaignSend>;
   listSends(campaignId: string): Promise<CampaignSend[]>;
   /** Lote de envios pendentes (a fila do disparo retomável). */

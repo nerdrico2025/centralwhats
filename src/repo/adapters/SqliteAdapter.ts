@@ -564,6 +564,12 @@ export function createSqliteAdapter(opts: { path: string }): Repo {
         }
         return this.getById(instanceId, id) as Promise<Campaign | null>;
       },
+      async delete(instanceId, id) {
+        // campaign_sends cai junto via ON DELETE CASCADE — o PRAGMA
+        // foreign_keys=ON no boot do adapter é o que faz a cascata valer.
+        const r = run(`DELETE FROM campaigns WHERE instance_id=? AND id=?`, instanceId, id);
+        return Number(r.changes) > 0;
+      },
       async recordSend(data) {
         const id = uid();
         const r = get(

@@ -72,6 +72,32 @@ export function createCampaignsRouter(repo: Repo, deps: MessagingDeps = {}): Rou
     }),
   );
 
+  // Remove a campanha e sua auditoria (campaign_sends via CASCADE).
+  // Campanha 'running' é intocável: apagá-la no meio do disparo deixaria o
+  // motor tentando avançar uma campanha que sumiu. Pause antes.
+  router.delete(
+    '/:campaignId',
+    asyncHandler(async (req, res) => {
+      const inst = await requireInstance(repo, req.params.id, getAuth(req).orgId);
+      // getById já é escopado por instance_id — campanha de outra instância
+      // vira 404 (não 403): não vazamos nem a existência dela.
+      const campaign = await repo.campaigns.getById(inst.id, req.params.campaignId);
+      if (!campaign) throw new HttpError(404, 'Campanha não encontrada');
+      if (campaign.status === 'running') {
+        throw new HttpError(
+          409,
+          'Campanha em andamento não pode ser excluída. Pause o disparo (ou espere concluir) e tente de novo.',
+        );
+      }
+
+      const deleted = await repo.campaigns.delete(inst.id, req.params.campaignId);
+      // Corrida: alguém apagou entre o getById e o delete. Erro claro, nunca
+      // um 204 mentindo que esta requisição removeu algo.
+      if (!deleted) throw new HttpError(404, 'Campanha não encontrada');
+      res.sendStatus(204);
+    }),
+  );
+
   // Pré-visualização dos destinatários resolvidos (com variáveis). Sem envio.
   router.get(
     '/:campaignId/recipients',

@@ -551,6 +551,14 @@ export function createPostgresAdapter(opts: { connectionString: string }): Repo 
         }
         return this.getById(instanceId, id) as Promise<Campaign | null>;
       },
+      async delete(instanceId, id) {
+        // campaign_sends cai junto via ON DELETE CASCADE (001_init.sql).
+        const n = await run(`DELETE FROM campaigns WHERE instance_id=$1 AND id=$2`, [
+          instanceId,
+          id,
+        ]);
+        return n > 0;
+      },
       async recordSend(data) {
         const r = await get(
           `INSERT INTO campaign_sends (id,campaign_id,contact_id,contact_phone,status,wa_message_id,error_code,error_message,sent_at,claimed_at,vars,attempts)

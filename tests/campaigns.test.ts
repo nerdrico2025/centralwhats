@@ -127,3 +127,77 @@ describe('Campanha — criação + preview de destinatários (SEM envio)', () =>
       .expect(400);
   });
 });
+
+describe('Campanha — exclusão (DELETE)', () => {
+  /** Campanha com 2 linhas de auditoria, para provar a cascata. */
+  const comSends = async (status: string) => {
+    const c = await repo.contacts.upsert({
+      instance_id: inst.id, phone: '5511999990000', name: 'Zé', last_seen: null,
+    });
+    const camp = await repo.campaigns.create({
+      instance_id: inst.id, name: `Camp ${status}`, template_id: null,
+      total_recipients: 2, interval_ms: 1000, status,
+      config: { list_ids: [], variables: {} },
+    });
+    for (const st of ['sent', 'failed']) {
+      await repo.campaigns.recordSend({
+        campaign_id: camp.id, contact_id: c.id, contact_phone: c.phone, status: st,
+        wa_message_id: null, error_code: null, error_message: null,
+        sent_at: null, claimed_at: null, vars: {}, attempts: 1,
+      });
+    }
+    return camp;
+  };
+
+  it('draft e completed são removidas — e levam campaign_sends junto (CASCADE)', async () => {
+    for (const status of ['draft', 'completed']) {
+      const camp = await comSends(status);
+      expect((await repo.campaigns.listSends(camp.id)).length).toBe(2);
+
+      await request(app)
+        .delete(`/api/instances/${inst.id}/campaigns/${camp.id}`)
+        .expect(204);
+
+      expect(await repo.campaigns.getById(inst.id, camp.id)).toBeNull();
+      // A auditoria não pode sobreviver órfã à campanha que a gerou.
+      expect((await repo.campaigns.listSends(camp.id)).length).toBe(0);
+    }
+  });
+
+  it('campanha running é recusada com 409 e motivo — e continua intacta', async () => {
+    const camp = await comSends('running');
+
+    const res = await request(app)
+      .delete(`/api/instances/${inst.id}/campaigns/${camp.id}`)
+      .expect(409);
+    expect(res.body.error).toMatch(/andamento/i);
+    expect(res.body.error).toMatch(/[Pp]ause/);
+
+    // Nada foi apagado: nem a campanha, nem a auditoria dela.
+    expect(await repo.campaigns.getById(inst.id, camp.id)).not.toBeNull();
+    expect((await repo.campaigns.listSends(camp.id)).length).toBe(2);
+  });
+
+  it('campanha de OUTRA instância → 404 (não vaza existência) e não é apagada', async () => {
+    const camp = await comSends('draft');
+    const outra = await repo.instances.create({
+      name: 'Outra', provider_type: 'meta', phone_number_id: '10777666555',
+      waba_id: null, token: 't', verify_token: 'v', active: true,
+      connection_status: 'connected',
+    });
+
+    await request(app)
+      .delete(`/api/instances/${outra.id}/campaigns/${camp.id}`)
+      .expect(404);
+
+    // Continua viva na instância dona — o escopo segurou.
+    expect(await repo.campaigns.getById(inst.id, camp.id)).not.toBeNull();
+    expect((await repo.campaigns.listSends(camp.id)).length).toBe(2);
+  });
+
+  it('campanha inexistente → 404', async () => {
+    await request(app)
+      .delete(`/api/instances/${inst.id}/campaigns/nao-existe`)
+      .expect(404);
+  });
+});
