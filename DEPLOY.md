@@ -103,22 +103,40 @@ definida a rota responde 503 e não processa nada** — de propósito: esta rota
 dispara envio real, e um deploy sem o segredo não pode virar um endpoint
 público de disparo em massa.
 
-⚠️ **Limite do plano Hobby**: cron só roda **1x por dia** (por isso o schedule
-commitado é `0 3 * * *`). Um deploy com frequência maior **falha o build
-inteiro**. Para o disparo autônomo valer de verdade, escolha uma das opções:
+⚠️ **Limite do plano Hobby**: o cron da Vercel só roda **1x por dia**, e um
+deploy com frequência maior **falha o build inteiro** (aconteceu em `c0f6ec7`).
+Por isso o schedule commitado é `0 3 * * *` — rede de segurança diária, só.
 
-- **Vercel Pro** — troque o schedule para `*/2 * * * *` (o motor foi
-  dimensionado para isso: orçamento de 20s por varredura, `maxDuration` 30s).
-- **Agendador externo** (mantém o Hobby) — GitHub Actions, cron-job.org etc.
-  chamando a mesma rota na frequência que quiser:
+**Quem dá o ritmo de verdade é o GitHub Actions**:
+`.github/workflows/tick-campaigns.yml` chama a mesma rota a cada 5 minutos
+(mínimo do Actions; é best-effort, atrasa alguns minutos sob carga — sem
+problema, a campanha é retomável).
+
+Configuração (uma vez):
 
 ```bash
+# 1. Gere o segredo
+openssl rand -hex 32
+
+# 2. MESMO valor nos dois lados:
+#    - Vercel → Settings → Environment Variables → CRON_SECRET
+#    - GitHub:
+gh secret set CRON_SECRET
+
+# 3. Teste na mão (Actions → "Tick de campanhas" → Run workflow), ou:
 curl -X POST https://SEU-APP.vercel.app/api/cron/tick-campaigns \
   -H "Authorization: Bearer $CRON_SECRET"
 ```
 
-Enquanto isso não estiver decidido, campanhas continuam avançando por tráfego
-de webhook e pelo polling da UI (como no P3.1) — só não avançam sozinhas.
+O workflow **falha alto** se o segredo estiver ausente (503) ou divergente
+entre GitHub e Vercel (401) — nunca fica passando em verde sem disparar nada.
+
+Se um dia migrar para o **Vercel Pro**, dá para trocar o schedule do
+`vercel.json` para `*/2 * * * *` e desligar o workflow: o motor foi
+dimensionado para isso (orçamento de 20s por varredura, `maxDuration` 30s).
+
+Sem nada disso configurado, campanhas ainda avançam por tráfego de webhook e
+pelo polling da UI aberta (como no P3.1) — só não avançam sozinhas.
 
 **Fumaça**:
 ```bash

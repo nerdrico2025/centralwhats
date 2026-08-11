@@ -1,0 +1,73 @@
+# Disparo autônomo de campanhas (P3.2).
+#
+# Por que aqui e não no cron da Vercel: no plano Hobby o cron da Vercel só roda
+# 1x por dia — inútil para dar ritmo a uma campanha. Este workflow chama a MESMA
+# rota protegida, na frequência que a gente escolher, sem custo de plano.
+# O cron diário do vercel.json fica como rede de segurança.
+#
+# Pré-requisitos (uma vez):
+#   gh secret set CRON_SECRET      # MESMO valor da env var CRON_SECRET na Vercel
+#   gh variable set APP_URL --body "https://centralwhats-eta.vercel.app"  # opcional
+name: Tick de campanhas
+
+on:
+  schedule:
+    # A cada 5 min (mínimo do GitHub Actions). O agendador é best-effort: sob
+    # carga o disparo atrasa alguns minutos. Não é problema — a campanha é
+    # retomável e o estado vive em campaign_sends, nunca em memória.
+    - cron: '*/5 * * * *'
+  # Permite rodar na mão pelo painel do GitHub (útil para testar o segredo).
+  workflow_dispatch:
+
+# Duas varreduras simultâneas não quebrariam nada (o claim é atômico), mas não
+# há motivo para gastar invocação à toa.
+concurrency:
+  group: tick-campanhas
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Varredura de campanhas em andamento
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          APP_URL: ${{ vars.APP_URL || 'https://centralwhats-eta.vercel.app' }}
+        run: |
+          set -euo pipefail
+
+          # Segredo ausente é erro ALTO: sem isto o job "passaria" tomando 503 a
+          # cada 5 min e ninguém perceberia que campanha nenhuma está avançando.
+          if [ -z "${CRON_SECRET}" ]; then
+            echo "::error::secret CRON_SECRET não configurado no repositório."
+            echo "Rode: gh secret set CRON_SECRET  (mesmo valor da env var na Vercel)"
+            exit 1
+          fi
+
+          code=$(curl -sS --max-time 60 -o /tmp/tick.json -w '%{http_code}' \
+            -X POST "${APP_URL}/api/cron/tick-campaigns" \
+            -H "Authorization: Bearer ${CRON_SECRET}")
+
+          echo "HTTP ${code}"
+          cat /tmp/tick.json || true
+          echo
+
+          if [ "${code}" != "200" ]; then
+            case "${code}" in
+              401) echo "::error::segredo recusado — CRON_SECRET do GitHub != o da Vercel." ;;
+              503) echo "::error::CRON_SECRET não definido na Vercel (rota desabilitada)." ;;
+              *)   echo "::error::varredura falhou (HTTP ${code})." ;;
+            esac
+            exit 1
+          fi
+
+          # Resumo legível na aba Actions, sem precisar abrir o log.
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d = json.load(open('/tmp/tick.json'))
+          print('| métrica | valor |')
+          print('|---|---|')
+          for k in ('instances', 'campaigns', 'processed', 'rounds', 'budgetExhausted'):
+              print(f'| {k} | {d.get(k)} |')
+          PY
