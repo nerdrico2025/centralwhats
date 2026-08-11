@@ -25,6 +25,17 @@ export function createTagsRouter(repo: Repo): Router {
     }),
   );
 
+  // Tags de TODOS os contatos da instância, agrupadas por contact_id. Serve a
+  // lista de contatos da UI sem um request por linha.
+  // Declarada antes de '/:tagId/...' não conflita (path fixo distinto).
+  router.get(
+    '/by-contact',
+    asyncHandler(async (req, res) => {
+      const inst = await requireInstance(repo, req.params.id, getAuth(req).orgId);
+      res.json(await repo.tags.listGroupedByContact(inst.id));
+    }),
+  );
+
   router.post(
     '/',
     asyncHandler(async (req, res) => {

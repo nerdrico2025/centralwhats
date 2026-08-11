@@ -6,7 +6,7 @@ import { normalizePhone } from '../../util/phone';
 import { listMigrations } from '../../util/paths';
 import { buildVolumeSeries } from '../../util/metrics';
 import type { Repo } from '../Repo';
-import type { Campaign, Flow, FlowExecution, Instance } from '../types';
+import type { Campaign, Flow, FlowExecution, Instance, Tag } from '../types';
 import * as m from './mappers';
 
 // node:sqlite é um builtin novo, ainda ausente de module.builtinModules; por
@@ -233,20 +233,45 @@ export function createSqliteAdapter(opts: { path: string }): Repo {
       async upsert(data) {
         const phone = normalizePhone(data.phone);
         const id = uid();
+        // Nome escrito à mão pelo operador NÃO é sobrescrito por profile.name
+        // da Meta (plano B do PRD) — só outra edição manual o substitui.
+        // Sem esta trava, o próximo webhook apagaria a correção em silêncio.
         const r = get(
-          `INSERT INTO contacts (id,instance_id,phone,name,last_seen)
-             VALUES (?,?,?,?,?)
+          `INSERT INTO contacts (id,instance_id,phone,name,name_source,last_seen)
+             VALUES (?,?,?,?,?,?)
            ON CONFLICT(instance_id,phone) DO UPDATE SET
-             name = COALESCE(excluded.name, contacts.name),
+             name = CASE
+               WHEN contacts.name_source = 'manual' AND excluded.name_source IS NOT 'manual'
+                 THEN contacts.name
+               ELSE COALESCE(excluded.name, contacts.name)
+             END,
+             name_source = CASE
+               WHEN contacts.name_source = 'manual' AND excluded.name_source IS NOT 'manual'
+                 THEN contacts.name_source
+               WHEN excluded.name IS NULL THEN contacts.name_source
+               ELSE excluded.name_source
+             END,
              last_seen = COALESCE(excluded.last_seen, contacts.last_seen)
            RETURNING *`,
           id,
           data.instance_id,
           phone,
           data.name,
+          data.name_source ?? null,
           data.last_seen,
         );
         return m.mapContact(r!);
+      },
+      async setName(instanceId, contactId, name, source) {
+        const r = get(
+          `UPDATE contacts SET name=?, name_source=?
+            WHERE instance_id=? AND id=? RETURNING *`,
+          name,
+          name === null ? null : source,
+          instanceId,
+          contactId,
+        );
+        return r ? m.mapContact(r) : null;
       },
       async getById(instanceId, id) {
         const r = get(`SELECT * FROM contacts WHERE instance_id=? AND id=?`, instanceId, id);
@@ -397,6 +422,25 @@ export function createSqliteAdapter(opts: { path: string }): Repo {
           instanceId,
           contactId,
         ).map(m.mapTag);
+      },
+      async listGroupedByContact(instanceId) {
+        // Escopo nos DOIS lados (tag e contato): nada de outra instância entra.
+        const rows = all(
+          `SELECT ct.contact_id AS _contact_id, t.*
+             FROM tags t
+             JOIN contact_tags ct ON ct.tag_id = t.id
+             JOIN contacts c ON c.id = ct.contact_id
+            WHERE t.instance_id=? AND c.instance_id=?
+            ORDER BY t.name ASC`,
+          instanceId,
+          instanceId,
+        );
+        const out: Record<string, Tag[]> = {};
+        for (const r of rows) {
+          const cid = String(r._contact_id);
+          (out[cid] ??= []).push(m.mapTag(r));
+        }
+        return out;
       },
     },
 

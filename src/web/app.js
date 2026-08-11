@@ -66,6 +66,9 @@ const api = {
   del(path) {
     return this.raw('DELETE', path);
   },
+  patch(path, body) {
+    return this.raw('PATCH', path, body);
+  },
 
   /** Monta um path escopado na instância atual: injeta o instance_id. */
   forInstance(suffix) {
@@ -111,6 +114,7 @@ const NAV = [
   {
     section: 'MARKETING',
     items: [
+      { path: '/contatos', label: 'Contatos', icon: '👤' },
       { path: '/listas', label: 'Listas', icon: '≣' },
       { path: '/crm', label: 'CRM', icon: '◱' },
       { path: '/campanhas', label: 'Campanhas', icon: '◎' },
@@ -292,6 +296,7 @@ const screens = {
   '/templates': () => templatesScreen(),
   '/livechat': () => livechatScreen(),
   '/chatbot': () => chatbotScreen(),
+  '/contatos': () => contatosScreen(),
   '/listas': () => listasScreen(),
   '/crm': () => crmScreen(),
   '/campanhas': () => campanhasScreen(),
@@ -1878,6 +1883,355 @@ function chatbotScreen() {
 
   loadFlows();
   renderAll();
+  return root;
+}
+
+// ------------------------------------------------------------- Contatos (P1.5)
+/**
+ * Contatos + Tags numa tela só: listar/buscar, corrigir nome (plano B do PRD
+ * quando a Meta não manda profile.name), e criar/aplicar/remover tags —
+ * inclusive EM MASSA sobre os contatos selecionados.
+ */
+function contatosScreen() {
+  const listCard = h('div', { class: 'card' });
+  const sideCard = h('div', { class: 'card' });
+  const root = h('div', {}, [
+    pageHeader('Contatos', 'Contatos da instância, nomes e tags. O nome vem do WhatsApp — quando a Meta não compartilha, você corrige aqui.'),
+    h('div', { class: 'dash-grid' }, [listCard, sideCard]),
+  ]);
+
+  let contacts = [];
+  let tags = [];
+  let tagsByContact = {};
+  let selectedIds = new Set();
+  let detailId = null;
+  let term = '';
+
+  async function loadAll() {
+    try {
+      // Três chamadas, não uma por contato: as tags vêm agrupadas do servidor.
+      const [c, t, byContact] = await Promise.all([
+        api.get(api.forInstance('/contacts')),
+        api.get(api.forInstance('/tags')),
+        api.get(api.forInstance('/tags/by-contact')),
+      ]);
+      contacts = c;
+      tags = t;
+      tagsByContact = byContact;
+    } catch (e) {
+      listCard.innerHTML = '';
+      listCard.appendChild(
+        h('div', { class: 'placeholder placeholder--error' }, 'Erro ao carregar contatos: ' + e.message),
+      );
+      return false;
+    }
+    // Selecionados que sumiram (ex.: filtro/recarga) não podem virar fantasma.
+    selectedIds = new Set([...selectedIds].filter((id) => contacts.some((c) => c.id === id)));
+    return true;
+  }
+
+  function visibleContacts() {
+    const q = term.trim().toLowerCase();
+    if (!q) return contacts;
+    return contacts.filter(
+      (c) => (c.name || '').toLowerCase().includes(q) || c.phone.includes(q),
+    );
+  }
+
+  function tagChip(tag, onRemove) {
+    return h('span', {
+      class: 'badge',
+      style: 'margin-right:4px' + (tag.color ? `;background:${tag.color}22;color:${tag.color}` : ''),
+    }, onRemove ? [tag.name + ' ', h('a', { href: '#', style: 'text-decoration:none', onclick: onRemove }, '×')] : tag.name);
+  }
+
+  // ------------------------------------------------------------------ lista
+  function renderList() {
+    listCard.innerHTML = '';
+    listCard.appendChild(h('h3', { class: 'card__title' }, `Contatos (${contacts.length})`));
+
+    const search = h('input', {
+      class: 'select', placeholder: 'Buscar por nome ou telefone…',
+      style: 'width:100%;margin-bottom:10px', value: term,
+    });
+    search.addEventListener('input', () => {
+      term = search.value;
+      drawRows();
+      // Mantém o foco: redesenhar a tabela não pode roubar o cursor da busca.
+      const pos = search.selectionStart;
+      search.focus();
+      search.setSelectionRange(pos, pos);
+    });
+    listCard.appendChild(search);
+
+    // Barra de ação em massa — só aparece com algo selecionado.
+    const bulkBar = h('div', { style: 'margin-bottom:10px' });
+    listCard.appendChild(bulkBar);
+
+    const tableWrap = h('div', { style: 'max-height:460px;overflow:auto' });
+    listCard.appendChild(tableWrap);
+
+    function renderBulk() {
+      bulkBar.innerHTML = '';
+      if (!selectedIds.size) return;
+      const tagSel = h('select', { class: 'select' },
+        [h('option', { value: '' }, '— escolha a tag —')].concat(
+          tags.map((t) => h('option', { value: t.id }, t.name)),
+        ));
+      const run = async (acao) => {
+        if (!tagSel.value) return alert('Escolha a tag.');
+        try {
+          await api.post(api.forInstance(`/tags/${tagSel.value}/${acao}`), {
+            contactIds: [...selectedIds],
+          });
+          await loadAll();
+          renderList();
+          renderSide();
+        } catch (e) {
+          alert('Erro: ' + e.message);
+        }
+      };
+      bulkBar.appendChild(
+        h('div', { style: 'display:flex;gap:6px;align-items:center;flex-wrap:wrap;background:#f8fafc;border:1px solid var(--border);border-radius:8px;padding:8px' }, [
+          h('span', { class: 'muted', style: 'font-size:12px' }, `${selectedIds.size} selecionado(s)`),
+          tagSel,
+          h('button', { class: 'btn btn--primary', onclick: () => run('apply') }, 'Aplicar tag'),
+          h('button', { class: 'btn', onclick: () => run('remove') }, 'Remover tag'),
+          h('button', {
+            class: 'btn',
+            onclick: () => { selectedIds = new Set(); renderList(); },
+          }, 'Limpar seleção'),
+        ]),
+      );
+    }
+
+    function drawRows() {
+      const rows = visibleContacts();
+      tableWrap.innerHTML = '';
+      if (!rows.length) {
+        tableWrap.appendChild(
+          h('div', { class: 'muted', style: 'padding:12px' },
+            contacts.length ? 'Nenhum contato bate com a busca.' : 'Nenhum contato ainda — eles aparecem quando alguém manda mensagem.'),
+        );
+        return;
+      }
+      const master = h('input', {
+        type: 'checkbox',
+        onchange: (ev) => {
+          for (const c of rows) {
+            if (ev.target.checked) selectedIds.add(c.id);
+            else selectedIds.delete(c.id);
+          }
+          renderList();
+        },
+      });
+      master.checked = rows.length > 0 && rows.every((c) => selectedIds.has(c.id));
+
+      tableWrap.appendChild(
+        h('table', { class: 'table' }, [
+          h('thead', {}, [h('tr', {}, [
+            h('th', { style: 'width:28px' }, [master]),
+            h('th', {}, 'Contato'),
+            h('th', {}, 'Tags'),
+          ])]),
+          h('tbody', {}, rows.map((c) => {
+            const cb = h('input', {
+              type: 'checkbox',
+              onclick: (ev) => ev.stopPropagation(),
+              onchange: (ev) => {
+                if (ev.target.checked) selectedIds.add(c.id);
+                else selectedIds.delete(c.id);
+                renderBulk();
+              },
+            });
+            cb.checked = selectedIds.has(c.id);
+            const semNome = !c.name;
+            return h('tr', {
+              style: 'cursor:pointer' + (detailId === c.id ? ';background:#f8fafc' : ''),
+              onclick: () => { detailId = c.id; renderSide(); },
+            }, [
+              h('td', {}, [cb]),
+              h('td', {}, [
+                h('div', {}, [
+                  semNome
+                    ? h('span', { class: 'muted', style: 'font-style:italic' }, 'sem nome')
+                    : h('span', {}, c.name),
+                  c.name_source === 'manual'
+                    ? h('span', { class: 'muted', style: 'font-size:11px' }, ' (manual)')
+                    : null,
+                ]),
+                h('div', { class: 'muted', style: 'font-size:11px' }, c.phone),
+              ]),
+              h('td', {}, (tagsByContact[c.id] || []).map((t) => tagChip(t))),
+            ]);
+          })),
+        ]),
+      );
+      renderBulk();
+    }
+    drawRows();
+  }
+
+  // ------------------------------------------------- painel lateral (detalhe)
+  function renderSide() {
+    sideCard.innerHTML = '';
+    const contact = contacts.find((c) => c.id === detailId);
+
+    // Gestão das tags da instância vive sempre visível no topo do painel.
+    sideCard.appendChild(h('h3', { class: 'card__title' }, 'Tags da instância'));
+    const novaTag = h('input', { class: 'select', placeholder: 'Nome da nova tag', style: 'flex:1' });
+    const novaCor = h('input', { type: 'color', value: '#25d366', style: 'width:40px;height:34px;padding:2px' });
+    sideCard.appendChild(
+      h('div', { style: 'display:flex;gap:6px;margin-bottom:8px' }, [
+        novaTag, novaCor,
+        h('button', {
+          class: 'btn btn--primary',
+          onclick: async () => {
+            const nome = novaTag.value.trim();
+            if (!nome) return alert('Informe o nome da tag.');
+            try {
+              await api.post(api.forInstance('/tags'), { name: nome, color: novaCor.value });
+              novaTag.value = '';
+              await loadAll();
+              renderList();
+              renderSide();
+            } catch (e) {
+              alert('Erro ao criar tag: ' + e.message);
+            }
+          },
+        }, 'Criar'),
+      ]),
+    );
+    sideCard.appendChild(
+      tags.length
+        ? h('div', { style: 'margin-bottom:14px' }, tags.map((t) =>
+            h('span', { style: 'display:inline-block;margin:0 6px 6px 0' }, [
+              tagChip(t, async (ev) => {
+                ev.preventDefault();
+                if (!confirm(`Excluir a tag "${t.name}"? Ela sai de todos os contatos.`)) return;
+                try {
+                  await api.del(api.forInstance('/tags/' + t.id));
+                  await loadAll();
+                  renderList();
+                  renderSide();
+                } catch (e) {
+                  alert('Erro ao excluir tag: ' + e.message);
+                }
+              }),
+            ]),
+          ))
+        : h('div', { class: 'muted', style: 'margin-bottom:14px' }, 'Nenhuma tag criada ainda.'),
+    );
+
+    if (!contact) {
+      sideCard.appendChild(h('div', { class: 'muted' }, 'Selecione um contato para editar o nome e as tags dele.'));
+      return;
+    }
+
+    sideCard.appendChild(h('h3', { class: 'card__title' }, 'Contato'));
+    sideCard.appendChild(h('div', { class: 'muted', style: 'font-size:12px;margin-bottom:6px' }, contact.phone));
+
+    const nomeInput = h('input', {
+      class: 'select', style: 'width:100%', placeholder: 'Nome do contato',
+      value: contact.name || '',
+    });
+    const nomeMsg = h('div', { class: 'muted', style: 'font-size:12px;min-height:16px;margin:4px 0 8px' },
+      contact.name_source === 'manual'
+        ? 'Nome definido por você — o WhatsApp não sobrescreve mais.'
+        : 'Nome vindo do WhatsApp. Se editar, sua versão passa a valer.');
+
+    sideCard.appendChild(h('div', { class: 'muted', style: 'font-size:12px;margin-bottom:4px' }, 'Nome'));
+    sideCard.appendChild(nomeInput);
+    sideCard.appendChild(nomeMsg);
+    sideCard.appendChild(
+      h('div', { style: 'display:flex;gap:6px;margin-bottom:14px' }, [
+        h('button', {
+          class: 'btn btn--primary',
+          onclick: async () => {
+            try {
+              await api.patch(api.forInstance('/contacts/' + contact.id), {
+                name: nomeInput.value.trim() || null,
+              });
+              await loadAll();
+              renderList();
+              renderSide();
+            } catch (e) {
+              alert('Erro ao salvar nome: ' + e.message);
+            }
+          },
+        }, 'Salvar nome'),
+        contact.name_source === 'manual'
+          ? h('button', {
+              class: 'btn',
+              title: 'Remove seu nome manual e deixa o WhatsApp preencher de novo',
+              onclick: async () => {
+                try {
+                  await api.patch(api.forInstance('/contacts/' + contact.id), { name: null });
+                  await loadAll();
+                  renderList();
+                  renderSide();
+                } catch (e) {
+                  alert('Erro: ' + e.message);
+                }
+              },
+            }, 'Devolver ao WhatsApp')
+          : null,
+      ]),
+    );
+
+    // Tags DESTE contato: aplicar/remover individualmente.
+    const doContato = tagsByContact[contact.id] || [];
+    const idsDoContato = new Set(doContato.map((t) => t.id));
+    sideCard.appendChild(h('div', { class: 'muted', style: 'font-size:12px;margin-bottom:4px' }, 'Tags do contato'));
+    sideCard.appendChild(
+      doContato.length
+        ? h('div', { style: 'margin-bottom:8px' }, doContato.map((t) =>
+            tagChip(t, async (ev) => {
+              ev.preventDefault();
+              try {
+                await api.post(api.forInstance(`/tags/${t.id}/remove`), { contactIds: [contact.id] });
+                await loadAll();
+                renderList();
+                renderSide();
+              } catch (e) {
+                alert('Erro: ' + e.message);
+              }
+            }),
+          ))
+        : h('div', { class: 'muted', style: 'margin-bottom:8px' }, 'Nenhuma tag neste contato.'),
+    );
+
+    const disponiveis = tags.filter((t) => !idsDoContato.has(t.id));
+    if (disponiveis.length) {
+      const sel = h('select', { class: 'select', style: 'flex:1' },
+        disponiveis.map((t) => h('option', { value: t.id }, t.name)));
+      sideCard.appendChild(
+        h('div', { style: 'display:flex;gap:6px' }, [
+          sel,
+          h('button', {
+            class: 'btn',
+            onclick: async () => {
+              try {
+                await api.post(api.forInstance(`/tags/${sel.value}/apply`), { contactIds: [contact.id] });
+                await loadAll();
+                renderList();
+                renderSide();
+              } catch (e) {
+                alert('Erro: ' + e.message);
+              }
+            },
+          }, 'Aplicar'),
+        ]),
+      );
+    }
+  }
+
+  (async () => {
+    if (await loadAll()) {
+      renderList();
+      renderSide();
+    }
+  })();
   return root;
 }
 

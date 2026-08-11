@@ -1,0 +1,14 @@
+-- P1.5: plano B do nome do contato.
+--
+-- A Meta pode não mandar profile.name (privacidade). O operador então corrige
+-- o nome na mão — e, até aqui, o PRÓXIMO webhook com profile.name apagava essa
+-- correção em silêncio (o upsert fazia COALESCE(excluded.name, ...), e um nome
+-- vindo da Meta é não-nulo, logo sempre vencia).
+--
+-- name_source registra quem escreveu o nome:
+--   NULL / 'profile' → veio do profile.name da Meta (ou é desconhecido)
+--   'manual'         → o operador digitou; a Meta não sobrescreve mais
+--
+-- Nulo em linha antiga é tratado como 'profile': nenhum backfill necessário.
+-- Espelho de sqlite/009_contacts_name_source.sql.
+ALTER TABLE contacts ADD COLUMN IF NOT EXISTS name_source TEXT;

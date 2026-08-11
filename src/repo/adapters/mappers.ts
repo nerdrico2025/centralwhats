@@ -107,6 +107,7 @@ export function mapContact(r: Row): Contact {
     instance_id: str(r.instance_id),
     phone: str(r.phone),
     name: strOrNull(r.name),
+    name_source: strOrNull(r.name_source) as Contact['name_source'],
     last_seen: strOrNull(r.last_seen),
     last_read_at: strOrNull(r.last_read_at),
   };

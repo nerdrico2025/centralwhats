@@ -76,6 +76,13 @@ export interface Contact {
   instance_id: string;
   phone: string;
   name: string | null;
+  /**
+   * Quem escreveu `name`: 'manual' (operador) ou 'profile'/null (profile.name
+   * da Meta). Plano B do PRD: a Meta pode não compartilhar o nome; quando o
+   * operador corrige na mão, um profile.name posterior NÃO pode apagar a
+   * correção em silêncio.
+   */
+  name_source: 'manual' | 'profile' | null;
   last_seen: string | null;
   last_read_at: string | null;
 }
@@ -223,7 +230,11 @@ export interface OutboxItem {
 /** Campos de criação (id/timestamps gerados pelo adapter). */
 export type NewInstance = Omit<Instance, 'id' | 'created_at'>;
 // last_read_at é gerido só por markRead (não vem no upsert de contato).
-export type NewContact = Omit<Contact, 'id' | 'last_read_at'>;
+// name_source é opcional: quem não informa está gravando um nome vindo da Meta
+// (o caminho do webhook), e só a edição manual passa 'manual' explicitamente.
+export type NewContact = Omit<Contact, 'id' | 'last_read_at' | 'name_source'> & {
+  name_source?: Contact['name_source'];
+};
 export type NewMessage = Omit<Message, 'id' | 'created_at'> & {
   created_at?: string;
 };

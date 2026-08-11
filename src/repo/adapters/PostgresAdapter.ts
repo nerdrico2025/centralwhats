@@ -4,7 +4,7 @@ import { normalizePhone } from '../../util/phone';
 import { listMigrations } from '../../util/paths';
 import { buildVolumeSeries } from '../../util/metrics';
 import type { Repo } from '../Repo';
-import type { Campaign, Flow, FlowExecution } from '../types';
+import type { Campaign, Flow, FlowExecution, Tag } from '../types';
 import * as m from './mappers';
 
 /**
@@ -220,16 +220,46 @@ export function createPostgresAdapter(opts: { connectionString: string }): Repo 
 
     contacts: {
       async upsert(data) {
+        // Nome escrito à mão pelo operador NÃO é sobrescrito por profile.name
+        // da Meta (plano B do PRD) — só outra edição manual o substitui.
+        // Sem esta trava, o próximo webhook apagaria a correção em silêncio.
         const r = await get(
-          `INSERT INTO contacts (id,instance_id,phone,name,last_seen)
-             VALUES ($1,$2,$3,$4,$5)
+          `INSERT INTO contacts (id,instance_id,phone,name,name_source,last_seen)
+             VALUES ($1,$2,$3,$4,$5,$6)
            ON CONFLICT(instance_id,phone) DO UPDATE SET
-             name = COALESCE(excluded.name, contacts.name),
+             name = CASE
+               WHEN contacts.name_source = 'manual'
+                    AND excluded.name_source IS DISTINCT FROM 'manual'
+                 THEN contacts.name
+               ELSE COALESCE(excluded.name, contacts.name)
+             END,
+             name_source = CASE
+               WHEN contacts.name_source = 'manual'
+                    AND excluded.name_source IS DISTINCT FROM 'manual'
+                 THEN contacts.name_source
+               WHEN excluded.name IS NULL THEN contacts.name_source
+               ELSE excluded.name_source
+             END,
              last_seen = COALESCE(excluded.last_seen, contacts.last_seen)
            RETURNING *`,
-          [uid(), data.instance_id, normalizePhone(data.phone), data.name, data.last_seen],
+          [
+            uid(),
+            data.instance_id,
+            normalizePhone(data.phone),
+            data.name,
+            data.name_source ?? null,
+            data.last_seen,
+          ],
         );
         return m.mapContact(r!);
+      },
+      async setName(instanceId, contactId, name, source) {
+        const r = await get(
+          `UPDATE contacts SET name=$1, name_source=$2
+            WHERE instance_id=$3 AND id=$4 RETURNING *`,
+          [name, name === null ? null : source, instanceId, contactId],
+        );
+        return r ? m.mapContact(r) : null;
       },
       async getById(instanceId, id) {
         const r = await get(`SELECT * FROM contacts WHERE instance_id=$1 AND id=$2`, [
@@ -382,6 +412,24 @@ export function createPostgresAdapter(opts: { connectionString: string }): Repo 
             [instanceId, contactId],
           )
         ).map(m.mapTag);
+      },
+      async listGroupedByContact(instanceId) {
+        // Escopo nos DOIS lados (tag e contato): nada de outra instância entra.
+        const rows = await all(
+          `SELECT ct.contact_id AS _contact_id, t.*
+             FROM tags t
+             JOIN contact_tags ct ON ct.tag_id = t.id
+             JOIN contacts c ON c.id = ct.contact_id
+            WHERE t.instance_id=$1 AND c.instance_id=$1
+            ORDER BY t.name ASC`,
+          [instanceId],
+        );
+        const out: Record<string, Tag[]> = {};
+        for (const r of rows) {
+          const cid = String(r._contact_id);
+          (out[cid] ??= []).push(m.mapTag(r));
+        }
+        return out;
       },
     },
 

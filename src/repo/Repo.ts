@@ -148,6 +148,18 @@ export interface ContactsRepo {
   getById(instanceId: string, id: string): Promise<Contact | null>;
   getByPhone(instanceId: string, phone: string): Promise<Contact | null>;
   list(instanceId: string, opts?: { search?: string }): Promise<Contact[]>;
+  /**
+   * Escreve o nome DIRETO (edição do operador), sem a semântica de merge do
+   * upsert — que é do caminho do webhook. Passar `null` limpa o nome e devolve
+   * o controle à Meta; com 'manual', o profile.name para de sobrescrever.
+   * Devolve null se o contato não é da instância (escopo).
+   */
+  setName(
+    instanceId: string,
+    contactId: string,
+    name: string | null,
+    source: 'manual' | 'profile',
+  ): Promise<Contact | null>;
   touchLastSeen(instanceId: string, phone: string, at: string): Promise<void>;
   /** Marca a conversa como lida até `at` (Live Chat). */
   markRead(instanceId: string, phone: string, at: string): Promise<void>;
@@ -180,6 +192,13 @@ export interface TagsRepo {
   ): Promise<void>;
   /** Tags aplicadas a um contato (usado pelo motor de fluxos e condições). */
   listForContact(instanceId: string, contactId: string): Promise<Tag[]>;
+  /**
+   * Todas as tags da instância agrupadas por contato, em UMA query. É o que
+   * deixa a lista de contatos mostrar as tags sem disparar um request por
+   * linha (N+1) a partir do browser. Contatos sem tag simplesmente não
+   * aparecem no mapa.
+   */
+  listGroupedByContact(instanceId: string): Promise<Record<string, Tag[]>>;
 }
 
 export interface CrmRepo {
