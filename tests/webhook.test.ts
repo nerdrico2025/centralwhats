@@ -1,5 +1,7 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import request from 'supertest';
+import { createHmac } from 'node:crypto';
+import { resetEnvCache } from '../src/config';
 import { createSqliteAdapter } from '../src/repo/adapters/SqliteAdapter';
 import { createApp } from '../src/http/app';
 import { processInboundPayload } from '../src/domain/webhook';
@@ -13,8 +15,34 @@ let instance: Instance;
 // fallback de to_number quando display_phone_number não vem no payload.
 const PNID = '109999888777';
 const VERIFY = 'VT-123';
+/** App Secret fake — a Meta assina o corpo do POST com ele. */
+const APP_SECRET = 'app-secret-de-teste-1234567890';
+let savedAppSecret: string | undefined;
+
+/**
+ * POST /webhook ASSINADO como a Meta assina: HMAC-SHA256 do corpo BRUTO.
+ * Manda a string crua (não o objeto) para os bytes assinados serem exatamente
+ * os bytes enviados — é essa igualdade que a validação verifica.
+ */
+function postAssinado(
+  app: ReturnType<typeof createApp>,
+  payload: unknown,
+  opts: { secret?: string; corpoAdulterado?: string; semHeader?: boolean; header?: string } = {},
+) {
+  const raw = JSON.stringify(payload);
+  const sig =
+    'sha256=' + createHmac('sha256', opts.secret ?? APP_SECRET).update(raw).digest('hex');
+  const req = request(app).post('/webhook').set('Content-Type', 'application/json');
+  if (opts.header !== undefined) req.set('X-Hub-Signature-256', opts.header);
+  else if (!opts.semHeader) req.set('X-Hub-Signature-256', sig);
+  // corpoAdulterado simula alteração em trânsito DEPOIS de assinado.
+  return req.send(opts.corpoAdulterado ?? raw);
+}
 
 beforeEach(async () => {
+  savedAppSecret = process.env.META_APP_SECRET;
+  process.env.META_APP_SECRET = APP_SECRET;
+  resetEnvCache();
   repo = createSqliteAdapter({ path: ':memory:' });
   await repo.migrate();
   instance = await repo.instances.create({
@@ -160,6 +188,12 @@ describe('GET /webhook — verificação do desafio', () => {
   });
 });
 
+afterEach(() => {
+  if (savedAppSecret === undefined) delete process.env.META_APP_SECRET;
+  else process.env.META_APP_SECRET = savedAppSecret;
+  resetEnvCache();
+});
+
 describe('GET /webhook — motivo do 403 fica logado (nunca silencioso)', () => {
   /** Captura os console.warn emitidos durante a request. */
   async function get403(app: ReturnType<typeof createApp>, token: string) {
@@ -231,7 +265,7 @@ describe('POST /webhook — não bloqueia na resposta', () => {
     // Scheduler que NÃO executa a task: se a resposta dependesse do
     // processamento, a mensagem seria gravada. Provamos que não é gravada.
     const app = createApp(repo, { scheduleWebhook: () => {} });
-    await request(app).post('/webhook').send(inboundText()).expect(200);
+    await postAssinado(app, inboundText()).expect(200);
     const msg = await repo.messages.getByWaMessageId(instance.id, 'wamid.in1');
     expect(msg).toBeNull(); // resposta 200 veio sem processar
   });
@@ -243,7 +277,7 @@ describe('POST /webhook — não bloqueia na resposta', () => {
         tasks.push(task());
       },
     });
-    await request(app).post('/webhook').send(inboundText()).expect(200);
+    await postAssinado(app, inboundText()).expect(200);
     await Promise.all(tasks); // aguarda o background só no teste
     const msg = await repo.messages.getByWaMessageId(instance.id, 'wamid.in1');
     expect(msg?.type).toBe('text');
@@ -405,5 +439,94 @@ describe('processInboundPayload — status (delivered / failed)', () => {
     expect(msg?.status).toBe('failed');
     expect(msg?.error_code).toBe('131026');
     expect(msg?.error_message).toBe('Receiver incapable');
+  });
+});
+
+/**
+ * ASSINATURA DA META (X-Hub-Signature-256).
+ *
+ * O buraco que isto fecha: até aqui o POST não checava origem NENHUMA.
+ * Qualquer um com a URL fabricava "mensagem recebida" com remetente e texto
+ * arbitrários — e, com um fluxo de chatbot ativo, provocava ENVIO REAL
+ * (custo na conta Meta) e dado falso em contacts/messages/crm_contacts.
+ */
+describe('POST /webhook — validação da assinatura da Meta', () => {
+  /** App que executa o background na hora, para medir se processou de fato. */
+  function appQueProcessa() {
+    const tasks: Promise<void>[] = [];
+    const app = createApp(repo, { scheduleWebhook: (t) => { tasks.push(t()); } });
+    return { app, tasks };
+  }
+
+  it('assinatura VÁLIDA → 200 e o payload é processado', async () => {
+    const { app, tasks } = appQueProcessa();
+    await postAssinado(app, inboundText()).expect(200);
+    await Promise.all(tasks);
+    const msg = await repo.messages.getByWaMessageId(instance.id, 'wamid.in1');
+    expect(msg).not.toBeNull();
+  });
+
+  it('SEM header de assinatura → 401 e NADA é processado', async () => {
+    const { app, tasks } = appQueProcessa();
+    await postAssinado(app, inboundText(), { semHeader: true }).expect(401);
+    await Promise.all(tasks);
+    expect(await repo.messages.getByWaMessageId(instance.id, 'wamid.in1')).toBeNull();
+  });
+
+  it('assinatura de OUTRO segredo → 401 (App Secret errado não passa)', async () => {
+    const { app, tasks } = appQueProcessa();
+    await postAssinado(app, inboundText(), { secret: 'segredo-do-atacante' }).expect(401);
+    await Promise.all(tasks);
+    expect(await repo.messages.getByWaMessageId(instance.id, 'wamid.in1')).toBeNull();
+  });
+
+  it('CORPO ADULTERADO depois de assinado → 401', async () => {
+    // Assinatura legítima de um payload, corpo trocado em trânsito: é o
+    // ataque que o HMAC existe para pegar.
+    const original = inboundText();
+    const adulterado = JSON.stringify(inboundText()).replace('Olá', 'PAYLOAD TROCADO');
+    const { app, tasks } = appQueProcessa();
+    await postAssinado(app, original, { corpoAdulterado: adulterado }).expect(401);
+    await Promise.all(tasks);
+    expect(await repo.messages.getByWaMessageId(instance.id, 'wamid.in1')).toBeNull();
+  });
+
+  it('header fora do formato "sha256=<hex>" → 401', async () => {
+    const { app } = appQueProcessa();
+    await postAssinado(app, inboundText(), { header: 'md5=abcdef' }).expect(401);
+    await postAssinado(app, inboundText(), { header: 'só-lixo' }).expect(401);
+    await postAssinado(app, inboundText(), { header: 'sha256=' }).expect(401);
+    // Hex do tamanho certo mas inválido não pode explodir o processo.
+    await postAssinado(app, inboundText(), { header: 'sha256=' + 'zz'.repeat(32) }).expect(401);
+  });
+
+  it('FAIL-CLOSED: sem META_APP_SECRET configurado, recusa TUDO', async () => {
+    delete process.env.META_APP_SECRET;
+    resetEnvCache();
+    const { app, tasks } = appQueProcessa();
+    // Nem assinado passa — sem o segredo não há como distinguir a Meta.
+    await postAssinado(app, inboundText()).expect(401);
+    await postAssinado(app, inboundText(), { semHeader: true }).expect(401);
+    await Promise.all(tasks);
+    expect(await repo.messages.getByWaMessageId(instance.id, 'wamid.in1')).toBeNull();
+  });
+
+  it('a recusa é LOGADA com motivo acionável (nunca silenciosa)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { app } = appQueProcessa();
+    await postAssinado(app, inboundText(), { semHeader: true }).expect(401);
+    const log = warn.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(log).toContain('POST RECUSADO');
+    expect(log).toContain('X-Hub-Signature-256');
+    warn.mockRestore();
+  });
+
+  it('o GET de verificação NÃO é afetado (continua no verify_token)', async () => {
+    const app = createApp(repo);
+    // Sem nenhuma assinatura — o GET nunca é assinado pela Meta desse jeito.
+    await request(app)
+      .get(`/webhook?hub.mode=subscribe&hub.verify_token=${VERIFY}&hub.challenge=42`)
+      .expect(200)
+      .expect('42');
   });
 });

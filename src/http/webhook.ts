@@ -6,6 +6,7 @@ import {
   type VerifyChallengeResult,
 } from '../domain/webhook';
 import type { MessagingDeps } from '../domain/messaging';
+import { requireMetaSignature } from './metaSignature';
 
 /**
  * Agendador do processamento em background. Default: fire-and-forget (não
@@ -117,7 +118,9 @@ export function createWebhookRouter(
     })();
   });
 
-  router.post('/', (req, res) => {
+  // ASSINATURA DA META antes de qualquer processamento: só o POST: o GET de
+  // verificação não é assinado assim e segue no verify_token.
+  router.post('/', requireMetaSignature(), (req, res) => {
     const payload = req.body;
     // RESPONDE JÁ. Nada de processamento pesado antes do 200 (regra serverless).
     res.sendStatus(200);

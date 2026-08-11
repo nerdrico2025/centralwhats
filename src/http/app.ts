@@ -16,6 +16,7 @@ import { createDashboardRouter } from './dashboard';
 import { createListsRouter } from './lists';
 import { createCampaignsRouter } from './campaigns';
 import { createCronRouter } from './cron';
+import { captureRawBody } from './metaSignature';
 import { createFlowsRouter } from './flows';
 import { createWebhookRouter, type BackgroundScheduler } from './webhook';
 import { createAuthMiddleware, createAuthRouter, createUsersRouter } from './auth';
@@ -40,7 +41,10 @@ export interface AppDeps {
  */
 export function createApp(repo: Repo = getRepo(), deps: AppDeps = {}): Express {
   const app = express();
-  app.use(express.json({ limit: '2mb' }));
+  // `verify` guarda os bytes ORIGINAIS do corpo: é o que o HMAC do webhook da
+  // Meta assina. Recalcular sobre o objeto já parseado não reproduz os mesmos
+  // bytes (ordem de chaves, escapes) e a assinatura falharia sempre.
+  app.use(express.json({ limit: '2mb', verify: captureRawBody }));
 
   app.get('/health', (_req: Request, res: Response) => {
     res.json({ ok: true, service: 'wa-manager', phase: 'P2.1' });

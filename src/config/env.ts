@@ -28,6 +28,13 @@ const EnvSchema = z
     // deploy sem a variável. A trava vive na rota, que recusa a varredura
     // enquanto o segredo não existir — falha alta, mas só no cron.
     CRON_SECRET: z.string().optional(),
+
+    // App Secret do app da Meta — assina o corpo do POST /webhook
+    // (X-Hub-Signature-256). NÃO é o verify_token nem o token da instância: é
+    // um segredo por App Meta. Opcional no schema pelo mesmo motivo do
+    // CRON_SECRET (exigir aqui derrubaria o app inteiro no boot); a trava
+    // fail-closed vive no middleware, que recusa todo POST sem ele.
+    META_APP_SECRET: z.string().optional(),
   })
   .superRefine((val, ctx) => {
     if (val.DB_DRIVER === 'postgres' && !val.DATABASE_URL) {

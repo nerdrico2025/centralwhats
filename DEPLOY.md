@@ -88,6 +88,28 @@ Passos:
 | `JWT_SECRET` | string longa aleatória (`openssl rand -hex 32`) |
 | `SECRETS_ENCRYPTION_KEY` | idem (validada no boot; reservada p/ criptografia em repouso — os tokens hoje ficam em texto no banco, protegidos pelo acesso ao Postgres) |
 | `CRON_SECRET` | string longa aleatória (`openssl rand -hex 32`) — **obrigatória** para o disparo autônomo de campanhas |
+| `META_APP_SECRET` | App Secret do app da Meta — **obrigatória**: sem ela o webhook recusa todo evento (ver abaixo) |
+
+### Assinatura do webhook (segurança)
+
+O `POST /webhook` valida `X-Hub-Signature-256`: a Meta assina o corpo bruto de
+cada evento com HMAC-SHA256 usando o **App Secret**. Sem isso, qualquer um com
+a URL do webhook fabricaria "mensagem recebida" com remetente e texto
+arbitrários — e, com um fluxo de chatbot ativo, provocaria **envio real** de
+mensagem (custo na conta Meta) além de gravar contato/mensagem/CRM falsos.
+
+Onde pegar: **Meta App Dashboard → Configurações do app → Básico → Chave
+secreta do aplicativo**. Não confundir com:
+- `verify_token` — por instância, só valida o `GET` de verificação inicial;
+- token de acesso — por instância, autentica as chamadas de envio.
+
+⚠️ **É fail-closed**: sem `META_APP_SECRET` definida, **todo POST é recusado
+com 401** e nenhuma mensagem recebida é processada. Defina a variável na Vercel
+**antes** de subir a versão que traz esta validação.
+
+```bash
+curl -sI https://SEU-APP.vercel.app/webhook -X POST   # 401 = sem segredo ou sem assinatura
+```
 
 3. Deploy. A URL final (ex.: `https://wa-manager.vercel.app`) é a base de tudo.
 
