@@ -326,3 +326,52 @@ export async function handleFlowInbound(
   }
   return { routed: false, started: false };
 }
+
+/**
+ * Varredura AUTÔNOMA de execuções vencidas em TODAS as instâncias (cron).
+ *
+ * Fecha a mesma lacuna que o cron de campanhas fechou: até aqui os fluxos só
+ * retomavam por tráfego de webhook (ou pelo worker do Baileys). Numa instância
+ * sem inbound, um "Aguardar" longo ficava parado indefinidamente — a lição nº 1
+ * do PRD reaparecendo em nível de infraestrutura, não de código.
+ *
+ * Reaproveita processPendingExecutions por instância: mesmo claim atômico
+ * (claimDue), mesma limpeza de execuções presas, mesmos efeitos. Nada aqui
+ * duplica o motor.
+ *
+ * Nunca lança: falha de uma instância vira log e a varredura segue.
+ */
+export async function processAllPendingFlows(
+  repo: Repo,
+  deps: FlowDeps = {},
+  opts: { budgetMs?: number } = {},
+): Promise<{ instances: number; resumed: number; cleaned: number; budgetExhausted: boolean }> {
+  const deadline = Date.now() + (opts.budgetMs ?? 8000);
+  const out = { instances: 0, resumed: 0, cleaned: 0, budgetExhausted: false };
+
+  let instances: Instance[];
+  try {
+    instances = await repo.instances.list();
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[cron/flows] falha ao listar instâncias:', err);
+    return out;
+  }
+  out.instances = instances.length;
+
+  for (const instance of instances) {
+    if (Date.now() >= deadline) {
+      out.budgetExhausted = true;
+      break;
+    }
+    try {
+      const r = await processPendingExecutions(repo, instance.id, deps);
+      out.resumed += r.resumed;
+      out.cleaned += r.cleaned;
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(`[cron/flows] instância ${instance.id}: falha na varredura:`, err);
+    }
+  }
+  return out;
+}

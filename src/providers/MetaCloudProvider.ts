@@ -2,6 +2,7 @@ import type { Instance } from '../repo/types';
 import { normalizePhone } from '../util/phone';
 import { MetaApiError } from './errors';
 import {
+  buildBodyComponent,
   buildButtonComponents,
   buildHeaderComponent,
   splitTemplateVars,
@@ -129,13 +130,9 @@ export class MetaCloudProvider implements Provider {
     // classe de falha do botão: sem ele, 132000.
     components.push(...buildHeaderComponent(template.components, headerVars, template.name));
 
-    if (Object.keys(bodyVars).length > 0) {
-      // Variáveis posicionais {{1}}, {{2}}... → ordena por chave numérica.
-      const parameters = Object.keys(bodyVars)
-        .sort((a, b) => Number(a) - Number(b))
-        .map((k) => ({ type: 'text', text: bodyVars[k] }));
-      components.push({ type: 'body', parameters });
-    }
+    // Corpo: valida a CONTAGEM contra os placeholders do template sincronizado
+    // antes de gastar a chamada — mesma classe de falha do botão/header (132000).
+    components.push(...buildBodyComponent(template.components, bodyVars, template.name));
 
     // Botões de URL dinâmica exigem um component próprio por botão; sem ele a
     // Meta rejeita com 132000 (contagem de parâmetros).

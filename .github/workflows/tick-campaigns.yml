@@ -66,8 +66,10 @@ jobs:
           python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import json
           d = json.load(open('/tmp/tick.json'))
-          print('| métrica | valor |')
-          print('|---|---|')
-          for k in ('instances', 'campaigns', 'processed', 'rounds', 'budgetExhausted'):
-              print(f'| {k} | {d.get(k)} |')
+          print('| frente | métrica | valor |')
+          print('|---|---|---|')
+          for rotulo, chave in (('fluxos', 'flows'), ('campanhas', 'campaigns')):
+              bloco = d.get(chave) or {}
+              for k, v in bloco.items():
+                  print(f'| {rotulo} | {k} | {v} |')
           PY

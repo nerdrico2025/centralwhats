@@ -2,9 +2,17 @@ import { Router, type Request } from 'express';
 import { timingSafeEqual } from 'node:crypto';
 import type { Repo } from '../repo';
 import { processAllPendingCampaigns } from '../domain/dispatch';
+import { processAllPendingFlows } from '../domain/flows';
 import type { MessagingDeps } from '../domain/messaging';
 import { loadEnv } from '../config';
 import { asyncHandler, HttpError } from './util';
+
+/**
+ * Fatia dos fluxos dentro da invocação. O orçamento de campanhas (20s) já é
+ * dimensionado para o maxDuration de 30s; os fluxos rodam antes e precisam de
+ * teto próprio para não comerem a invocação inteira numa instância movimentada.
+ */
+const FLOWS_BUDGET_MS = 8000;
 
 /** Compara sem vazar o tamanho do prefixo correto por tempo de resposta. */
 function secretMatches(provided: string, expected: string): boolean {
@@ -64,9 +72,15 @@ export function createCronRouter(repo: Repo, deps: MessagingDeps = {}): Router {
         throw new HttpError(401, 'Não autorizado');
       }
 
-      const result = await processAllPendingCampaigns(repo, deps);
+      // Fluxos primeiro (varredura curta e barata), campanhas depois com o
+      // resto do orçamento: um "Aguardar" vencido é resposta a um lead que já
+      // está conversando, enquanto a campanha tolera esperar o próximo tick.
+      const flows = await processAllPendingFlows(repo, deps, { budgetMs: FLOWS_BUDGET_MS });
+      const campaigns = await processAllPendingCampaigns(repo, deps);
+
+      const result = { flows, campaigns };
       // eslint-disable-next-line no-console
-      console.log('[cron] varredura de campanhas:', JSON.stringify(result));
+      console.log('[cron] varredura:', JSON.stringify(result));
       res.json(result);
     }),
   );

@@ -3,6 +3,7 @@ import request from 'supertest';
 import { createSqliteAdapter } from '../src/repo/adapters/SqliteAdapter';
 import { createApp } from '../src/http/app';
 import { startCampaign, processAllPendingCampaigns } from '../src/domain/dispatch';
+import { processAllPendingFlows } from '../src/domain/flows';
 import { resetEnvCache } from '../src/config';
 import type { Repo } from '../src/repo';
 import type { Instance } from '../src/repo/types';
@@ -35,7 +36,12 @@ function makeProvider() {
       calls.push(to);
       return { waMessageId: 'wamid.' + to + '.' + calls.length, status: 'sent' };
     },
-    sendText: () => { throw new Error('não usado'); },
+    // Nó de mensagem de fluxo sai por sendText — registra no mesmo array para
+    // as asserções de "cada contato recebeu exatamente uma vez".
+    async sendText(_i, to): Promise<SendResult> {
+      calls.push(to);
+      return { waMessageId: 'wamid.' + to + '.' + calls.length, status: 'sent' };
+    },
     sendMedia: () => { throw new Error('não usado'); },
     sendButtons: () => { throw new Error('não usado'); },
     sendList: () => { throw new Error('não usado'); },
@@ -138,7 +144,11 @@ describe('Cron — proteção do endpoint', () => {
       .post('/api/cron/tick-campaigns')
       .set('Authorization', 'Bearer ' + SECRET)
       .expect(200);
-    expect(res.body).toMatchObject({ instances: 0, campaigns: 0, processed: 0 });
+    // A varredura devolve as duas frentes: fluxos e campanhas.
+    expect(res.body).toMatchObject({
+      flows: { instances: 0, resumed: 0, cleaned: 0 },
+      campaigns: { instances: 0, campaigns: 0, processed: 0 },
+    });
   });
 
   it('GET também é aceito — é o método que o agendador da Vercel usa', async () => {
@@ -276,5 +286,101 @@ describe('Cron — não duplica envio (reaproveita o claim atômico)', () => {
     expect(Date.now() - t0).toBeLessThan(2000); // não esperou os 20s de orçamento
     expect(res.processed).toBe(0);
     expect(res.rounds).toBe(1);
+  });
+});
+
+describe('Cron — varredura de FLUXOS (lacuna simétrica à das campanhas)', () => {
+  /** Fluxo mínimo: Início → Mensagem → Fim. */
+  const DEF = {
+    nodes: [
+      { id: 'n1', type: 'start' },
+      { id: 'n2', type: 'message', data: { text: 'Oi {{nome}}' } },
+      { id: 'n3', type: 'end' },
+    ],
+    edges: [
+      { source: 'n1', target: 'n2' },
+      { source: 'n2', target: 'n3' },
+    ],
+  };
+
+  /** Instância + fluxo + N execuções vencidas (delay longo que já estourou). */
+  async function seedExecucoesVencidas(
+    phoneNumberId: string,
+    ddd: string,
+    n: number,
+  ): Promise<{ instance: Instance; flowId: string }> {
+    const instance = await repo.instances.create({
+      name: 'Loja ' + ddd, provider_type: 'meta', phone_number_id: phoneNumberId,
+      waba_id: null, token: 't', verify_token: 'v', active: true, connection_status: 'connected',
+    });
+    const flow = await repo.flows.create({
+      instance_id: instance.id, name: 'boas-vindas', trigger_keywords: ['oi'],
+      nodes: DEF.nodes, edges: DEF.edges, active: true,
+    });
+    for (let i = 0; i < n; i++) {
+      const phone = '55' + ddd + String(900000000 + i);
+      await repo.contacts.upsert({
+        instance_id: instance.id, phone, name: 'C' + i, last_seen: null,
+      });
+      await repo.flowExecutions.create({
+        flow_id: flow.id, instance_id: instance.id, contact_phone: phone,
+        current_node_id: 'n2', status: 'running', variables: {},
+        next_step_at: '2020-01-01T00:00:00.000Z', // já venceu
+      });
+    }
+    return { instance, flowId: flow.id };
+  }
+
+  it('retoma execuções vencidas de VÁRIAS instâncias sem tráfego de webhook', async () => {
+    const { provider, calls } = makeProvider();
+    const deps = { providerFor: () => provider };
+    await seedExecucoesVencidas('10000000101', '11', 3);
+    await seedExecucoesVencidas('10000000102', '21', 2);
+    calls.length = 0;
+
+    const r = await processAllPendingFlows(repo, deps);
+
+    expect(r.instances).toBe(2);
+    expect(r.resumed).toBe(5);
+    expect(calls.length).toBe(5); // cada execução mandou a mensagem do nó atual
+
+    // Nada sobrou: uma segunda varredura não acha mais nada.
+    expect((await processAllPendingFlows(repo, deps)).resumed).toBe(0);
+  });
+
+  it('CENÁRIO DO PRD: 54 execuções presas de uma vez, varridas em concorrência sem duplicar', async () => {
+    const { provider, calls } = makeProvider();
+    const deps = { providerFor: () => provider };
+    await seedExecucoesVencidas('10000000103', '31', 54);
+    calls.length = 0;
+
+    // Três varreduras SIMULTÂNEAS — cron + webhook + worker acontecendo junto.
+    const rs = await Promise.all([
+      processAllPendingFlows(repo, deps),
+      processAllPendingFlows(repo, deps),
+      processAllPendingFlows(repo, deps),
+    ]);
+
+    // Cada execução foi retomada por exatamente UMA varredura (claim atômico).
+    expect(rs.reduce((s, r) => s + r.resumed, 0)).toBe(54);
+    expect(calls.length).toBe(54);
+    // Nenhum contato recebeu duas vezes.
+    expect(new Set(calls).size).toBe(54);
+    // E nenhuma ficou para trás.
+    expect((await processAllPendingFlows(repo, deps)).resumed).toBe(0);
+  });
+
+  it('o endpoint do cron varre fluxos E campanhas na mesma invocação', async () => {
+    const { provider } = makeProvider();
+    const appCron = createApp(repo, { providerFor: () => provider });
+    await seedExecucoesVencidas('10000000104', '41', 2);
+
+    const res = await request(appCron)
+      .post('/api/cron/tick-campaigns')
+      .set('Authorization', 'Bearer ' + SECRET)
+      .expect(200);
+
+    expect(res.body.flows.resumed).toBe(2);
+    expect(res.body.campaigns).toBeDefined();
   });
 });

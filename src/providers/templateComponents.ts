@@ -297,3 +297,103 @@ export function buildHeaderComponent(
   }
   return [{ type: 'header', parameters: [{ type: 'text', text: headerVars.text }] }];
 }
+
+// ----------------------------------------------------------------------- BODY
+
+/** Localiza o component BODY nos components sincronizados. */
+function findBody(components: unknown): { text?: unknown } | null {
+  if (!Array.isArray(components)) return null;
+  for (const comp of components) {
+    if (!comp || typeof comp !== 'object') continue;
+    const c = comp as { type?: unknown };
+    if (String(c.type).toUpperCase() === 'BODY') return comp as { text?: unknown };
+  }
+  return null;
+}
+
+/**
+ * Números DISTINTOS dos placeholders de um texto, em ordem crescente.
+ * "{{1}} fala com {{1}} sobre {{2}}" → ['1','2'] (a Meta conta parâmetros
+ * distintos, não ocorrências).
+ */
+function placeholderNumbers(text: unknown): string[] {
+  const found = String(text ?? '').match(/\{\{\s*(\d+)\s*\}\}/g) ?? [];
+  const nums = new Set(found.map((p) => p.replace(/[^\d]/g, '')));
+  return [...nums].sort((a, b) => Number(a) - Number(b));
+}
+
+/**
+ * Monta o component de BODY do payload de envio, VALIDANDO a contagem antes de
+ * gastar uma chamada na Graph API.
+ *
+ * O 132000 da Meta é erro de *divergência* de contagem — dispara tanto com
+ * variável a menos quanto a mais (é o mesmo critério que este arquivo já aplica
+ * a botão e header). Por isso os dois lados falham aqui, com a mensagem dizendo
+ * exatamente qual placeholder está sobrando ou faltando, em vez do 132000 opaco.
+ *
+ * - Template não sincronizado (sem components): confia nas variáveis
+ *   informadas, mesmo critério do botão, do header e do resolveTemplateLanguage.
+ * - String VAZIA conta como informada. É deliberado: `resolveVarSource` devolve
+ *   '' quando o contato não tem o dado de CRM, e campanhas em produção já
+ *   dependem disso. Validar contagem não pode virar, de contrabando, uma
+ *   validação de conteúdo que quebraria disparo que hoje funciona.
+ */
+export function buildBodyComponent(
+  components: unknown,
+  bodyVars: Record<string, string>,
+  templateName: string,
+): Record<string, unknown>[] {
+  const informadas = Object.keys(bodyVars).sort((a, b) => Number(a) - Number(b));
+  const body = findBody(components);
+
+  // Sem estrutura sincronizada: não dá para validar — usa o que foi informado.
+  if (!body) {
+    if (Array.isArray(components) && informadas.length) {
+      throw new TemplateParamsError(
+        `Template "${templateName}": foram informadas ${informadas.length} variável(is) ` +
+          `de corpo, mas o template não tem component BODY.`,
+      );
+    }
+    if (!informadas.length) return [];
+    return [
+      {
+        type: 'body',
+        parameters: informadas.map((k) => ({ type: 'text', text: bodyVars[k] })),
+      },
+    ];
+  }
+
+  const esperadas = placeholderNumbers(body.text);
+  const esperadasSet = new Set(esperadas);
+
+  const faltando = esperadas.filter((n) => bodyVars[n] === undefined);
+  if (faltando.length) {
+    throw new TemplateParamsError(
+      `Template "${templateName}": o corpo espera ${esperadas.length} variável(is) ` +
+        `(${esperadas.map((n) => `{{${n}}}`).join(', ')}) e faltou ` +
+        `${faltando.map((n) => `"${n}"`).join(', ')}.`,
+    );
+  }
+
+  const sobrando = informadas.filter((n) => !esperadasSet.has(n));
+  if (sobrando.length) {
+    throw new TemplateParamsError(
+      `Template "${templateName}": foi informada a variável ${sobrando
+        .map((n) => `"${n}"`)
+        .join(', ')}, mas o corpo do template ${
+        esperadas.length
+          ? `só tem ${esperadas.map((n) => `{{${n}}}`).join(', ')}`
+          : 'não tem nenhuma variável'
+      }.`,
+    );
+  }
+
+  if (!esperadas.length) return [];
+  // Ordem posicional: a Meta lê os parâmetros por POSIÇÃO, não por nome.
+  return [
+    {
+      type: 'body',
+      parameters: esperadas.map((n) => ({ type: 'text', text: bodyVars[n] })),
+    },
+  ];
+}
