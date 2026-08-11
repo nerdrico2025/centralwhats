@@ -12,5 +12,11 @@
     "api/index.ts": {
       "maxDuration": 30
     }
-  }
+  },
+  "crons": [
+    {
+      "path": "/api/cron/tick-campaigns",
+      "schedule": "*/2 * * * *"
+    }
+  ]
 }

@@ -21,6 +21,13 @@ const EnvSchema = z
 
     // [V2] Segredo do JWT. Obrigatório em produção; default só em dev/test.
     JWT_SECRET: z.string().default('dev-secret-nao-use-em-producao'),
+
+    // Segredo do cron de campanhas (a Vercel injeta como "Authorization:
+    // Bearer <CRON_SECRET>" nas chamadas agendadas). Opcional DE PROPÓSITO no
+    // schema: exigi-lo aqui derrubaria o app inteiro (inclusive o webhook) num
+    // deploy sem a variável. A trava vive na rota, que recusa a varredura
+    // enquanto o segredo não existir — falha alta, mas só no cron.
+    CRON_SECRET: z.string().optional(),
   })
   .superRefine((val, ctx) => {
     if (val.DB_DRIVER === 'postgres' && !val.DATABASE_URL) {

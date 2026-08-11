@@ -15,6 +15,7 @@ import { createLiveChatRouter } from './livechat';
 import { createDashboardRouter } from './dashboard';
 import { createListsRouter } from './lists';
 import { createCampaignsRouter } from './campaigns';
+import { createCronRouter } from './cron';
 import { createFlowsRouter } from './flows';
 import { createWebhookRouter, type BackgroundScheduler } from './webhook';
 import { createAuthMiddleware, createAuthRouter, createUsersRouter } from './auth';
@@ -47,6 +48,10 @@ export function createApp(repo: Repo = getRepo(), deps: AppDeps = {}): Express {
 
   // === Auth pública (V2/P5.1) — ANTES do middleware de autenticação ===
   app.use('/api/auth', createAuthRouter(repo));
+
+  // === Cron da Vercel — ANTES do middleware de autenticação ===
+  // Não é chamado por usuário logado: autentica pelo CRON_SECRET (ver cron.ts).
+  app.use('/api/cron', createCronRouter(repo, { providerFor: deps.providerFor }));
 
   // === API REST (autenticada; modo bootstrap mantém a V1 sem login) ===
   const api = express.Router();

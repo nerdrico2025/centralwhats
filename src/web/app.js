@@ -63,6 +63,9 @@ const api = {
   post(path, body) {
     return this.raw('POST', path, body);
   },
+  del(path) {
+    return this.raw('DELETE', path);
+  },
 
   /** Monta um path escopado na instância atual: injeta o instance_id. */
   forInstance(suffix) {
@@ -724,45 +727,222 @@ function listasScreen() {
   return root;
 }
 
-// ------------------------------------------------------------- Campanhas (P3.1)
+// ------------------------------------------------------------- Campanhas (P3.2)
+
+/** Rótulo + classe de badge por status de envio/campanha. */
+const CAMPAIGN_STATUS = {
+  draft: { label: 'rascunho', badge: 'badge' },
+  running: { label: 'em andamento', badge: 'badge badge--warn' },
+  paused: { label: 'pausada', badge: 'badge' },
+  completed: { label: 'concluída', badge: 'badge badge--ok' },
+};
+const SEND_STATUS = {
+  pending: { label: 'na fila', badge: 'badge' },
+  sending: { label: 'enviando', badge: 'badge badge--warn' },
+  sent: { label: 'enviado', badge: 'badge badge--ok' },
+  failed: { label: 'falhou', badge: 'badge badge--off' },
+};
+function statusBadge(map, status) {
+  const s = map[status] || { label: status, badge: 'badge' };
+  return h('span', { class: s.badge }, s.label);
+}
+
+function fmtDateTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return isNaN(d) ? '—' : d.toLocaleString('pt-BR');
+}
+
+/**
+ * Deriva do template SINCRONIZADO quais variáveis ele espera, para o operador
+ * não ter que adivinhar o número de cada {{n}}. Segue exatamente a convenção
+ * de chaves de providers/templateComponents.ts — se divergir daqui, a Meta
+ * rejeita o envio por contagem de parâmetros.
+ */
+function expectedTemplateVars(template) {
+  const slots = [];
+  const comps = Array.isArray(template && template.components) ? template.components : [];
+  const placeholders = (text) => {
+    const found = String(text || '').match(/\{\{\s*(\d+)\s*\}\}/g) || [];
+    return found.map((p) => p.replace(/[^\d]/g, ''));
+  };
+
+  for (const comp of comps) {
+    const type = String((comp && comp.type) || '').toUpperCase();
+    const example = (comp && comp.example) || {};
+
+    if (type === 'HEADER') {
+      const format = String(comp.format || 'TEXT').toUpperCase();
+      if (format === 'TEXT') {
+        if (placeholders(comp.text).length) {
+          const hint = (example.header_text || [])[0];
+          slots.push({ key: 'header', label: 'Header {{1}}', hint, suggested: 'name' });
+        }
+      } else {
+        // Header de mídia: a Meta espera um link público (ou id já subido).
+        slots.push({
+          key: 'headerMedia',
+          label: `Header ${format} (URL da mídia)`,
+          hint: 'URL pública do arquivo — use lit:https://...',
+          suggested: '',
+        });
+      }
+    }
+
+    if (type === 'BODY') {
+      const hints = (example.body_text || [])[0] || [];
+      for (const n of placeholders(comp.text)) {
+        slots.push({
+          key: n,
+          label: 'Corpo {{' + n + '}}',
+          hint: hints[Number(n) - 1],
+          suggested: n === '1' ? 'name' : '',
+        });
+      }
+    }
+
+    if (type === 'BUTTONS' && Array.isArray(comp.buttons)) {
+      comp.buttons.forEach((btn, idx) => {
+        const btnType = String((btn && btn.type) || '').toUpperCase();
+        if (btnType === 'URL' && placeholders(btn.url).length) {
+          slots.push({
+            key: 'button' + idx,
+            label: `Botão ${idx} "${btn.text || ''}" (sufixo da URL)`,
+            hint: (btn.example || [])[0],
+            suggested: '',
+          });
+        }
+      });
+    }
+  }
+  return slots;
+}
+
+/** Texto do template para o operador conferir o que vai sair. */
+function templateBodyPreview(template) {
+  const comps = Array.isArray(template && template.components) ? template.components : [];
+  const body = comps.find((c) => String((c && c.type) || '').toUpperCase() === 'BODY');
+  return body && body.text ? body.text : '';
+}
+
 function campanhasScreen() {
   const formCard = h('div', { class: 'card' });
   const listCard = h('div', { class: 'card' });
-  const previewCard = h('div', { class: 'card', style: 'margin-top:16px' });
+  const detailCard = h('div', { class: 'card', style: 'margin-top:16px' });
   const root = h('div', {}, [
-    pageHeader('Campanhas', 'Monte uma campanha (sem disparar — o envio é a próxima fase).'),
+    pageHeader(
+      'Campanhas',
+      'Monte, dispare e audite campanhas. O disparo é retomável e continua sozinho — não precisa deixar esta tela aberta.',
+    ),
     h('div', { class: 'dash-grid' }, [formCard, listCard]),
-    previewCard,
+    detailCard,
   ]);
 
-  const varRows = [{ ph: '1', src: 'name' }];
+  let selectedId = null;
 
+  // ------------------------------------------------------------------ lista
   async function loadCampaigns() {
-    const camps = await api.get(api.forInstance('/campaigns')).catch(() => []);
+    let camps;
+    try {
+      camps = await api.get(api.forInstance('/campaigns'));
+    } catch (e) {
+      // Falha de carga NUNCA pode virar "nenhuma campanha" (lição do Live Chat).
+      listCard.innerHTML = '';
+      listCard.appendChild(h('h3', { class: 'card__title' }, 'Campanhas'));
+      listCard.appendChild(
+        h('div', { class: 'placeholder placeholder--error' }, 'Erro ao carregar: ' + e.message),
+      );
+      return;
+    }
+
     listCard.innerHTML = '';
     listCard.appendChild(h('h3', { class: 'card__title' }, 'Campanhas'));
     if (!camps.length) {
       listCard.appendChild(h('div', { class: 'muted' }, 'Nenhuma campanha ainda.'));
       return;
     }
+
     listCard.appendChild(
       h('table', { class: 'table' }, [
         h('thead', {}, [
-          h('tr', {}, [h('th', {}, 'Nome'), h('th', {}, 'Status'), h('th', {}, 'Destinatários')]),
-        ]),
-        h('tbody', {}, camps.map((c) =>
-          h('tr', { style: 'cursor:pointer', onclick: () => preview(c.id) }, [
-            h('td', {}, c.name),
-            h('td', {}, [h('span', { class: 'badge' }, c.status)]),
-            h('td', {}, String(c.total_recipients)),
+          h('tr', {}, [
+            h('th', {}, 'Nome'),
+            h('th', {}, 'Status'),
+            h('th', {}, 'Progresso'),
+            h('th', {}, 'Criada em'),
+            h('th', {}, ''),
           ]),
-        )),
+        ]),
+        h(
+          'tbody',
+          {},
+          camps.map((c) => {
+            const done = (c.sent_count || 0) + (c.failed_count || 0);
+            const progresso = h('div', {}, [
+              h('span', {}, `${done}/${c.total_recipients}`),
+              c.failed_count
+                ? h('span', { class: 'muted' }, ` · ${c.failed_count} falha(s)`)
+                : null,
+            ]);
+
+            // A API recusa deletar campanha 'running' (409). A UI reflete isso
+            // desabilitando o botão em vez de deixar o operador errar.
+            const running = c.status === 'running';
+            const delBtn = h(
+              'button',
+              {
+                class: 'btn',
+                title: running
+                  ? 'Pause a campanha antes de excluir — ela está disparando agora.'
+                  : 'Excluir campanha e toda a auditoria dela',
+                ...(running ? { disabled: 'disabled', style: 'opacity:.45;cursor:not-allowed' } : {}),
+                onclick: async (ev) => {
+                  ev.stopPropagation();
+                  if (running) return;
+                  const msg =
+                    `Excluir a campanha "${c.name}"?\n\n` +
+                    `Isto apaga também os ${done} registro(s) de envio dela (auditoria). ` +
+                    'Não dá para desfazer.';
+                  if (!confirm(msg)) return;
+                  try {
+                    await api.del(api.forInstance('/campaigns/' + c.id));
+                    if (selectedId === c.id) {
+                      selectedId = null;
+                      renderEmptyDetail();
+                    }
+                    await loadCampaigns();
+                  } catch (e) {
+                    alert('Erro ao excluir: ' + e.message);
+                  }
+                },
+              },
+              'Excluir',
+            );
+
+            return h(
+              'tr',
+              {
+                style: 'cursor:pointer' + (selectedId === c.id ? ';background:#f8fafc' : ''),
+                onclick: () => openDetail(c.id),
+              },
+              [
+                h('td', {}, c.name),
+                h('td', {}, [statusBadge(CAMPAIGN_STATUS, c.status)]),
+                h('td', {}, [progresso]),
+                h('td', { class: 'muted' }, fmtDateTime(c.created_at)),
+                h('td', {}, [delBtn]),
+              ],
+            );
+          }),
+        ),
       ]),
     );
   }
 
-  // Polling do disparo (P3.2): enquanto running, cada intervalo chama /tick
-  // (idempotente) — é a UI quem "puxa" os lotes; nada roda preso no servidor.
+  // --------------------------------------------------------------- detalhe
+  // Polling do disparo: enquanto running, a UI chama /tick (idempotente) para
+  // dar ritmo imediato. O cron da Vercel faz o mesmo trabalho sozinho — fechar
+  // a tela não para mais a campanha.
   let dispatchTimer = null;
   function stopDispatchPolling() {
     if (dispatchTimer) {
@@ -772,102 +952,130 @@ function campanhasScreen() {
   }
   registerCleanup(() => stopDispatchPolling());
 
-  async function preview(campaignId) {
+  function renderEmptyDetail() {
+    detailCard.innerHTML = '';
+    detailCard.appendChild(
+      h('div', { class: 'muted' }, 'Crie ou selecione uma campanha para ver os detalhes.'),
+    );
+  }
+
+  async function openDetail(campaignId) {
     stopDispatchPolling();
-    previewCard.innerHTML = '';
-    const campaign = await api
-      .get(api.forInstance('/campaigns/' + campaignId))
-      .catch(() => null);
-    if (!campaign) {
-      previewCard.appendChild(h('div', { class: 'muted' }, 'Campanha não encontrada.'));
+    selectedId = campaignId;
+    detailCard.innerHTML = '';
+
+    let campaign;
+    try {
+      campaign = await api.get(api.forInstance('/campaigns/' + campaignId));
+    } catch (e) {
+      detailCard.appendChild(
+        h('div', { class: 'placeholder placeholder--error' }, 'Erro ao carregar: ' + e.message),
+      );
       return;
     }
 
     const title = h('h3', { class: 'card__title' }, 'Campanha "' + campaign.name + '"');
-    const statusLine = h('div', { class: 'muted', style: 'margin-bottom:8px' });
-    const controls = h('div', { style: 'display:flex;gap:8px;margin-bottom:12px' });
-    const detail = h('div', {});
-    previewCard.appendChild(title);
-    previewCard.appendChild(statusLine);
-    previewCard.appendChild(controls);
-    previewCard.appendChild(detail);
+    const statusLine = h('div', { class: 'muted', style: 'margin-bottom:10px' });
+    const controls = h('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px' });
+    const filterBar = h('div', { style: 'display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px' });
+    // Lista longa: altura própria e rolagem interna. Sem isto a tabela empurra
+    // o resto da página (mesmo bug que já voltou 2x no Live Chat).
+    const sendsWrap = h('div', {
+      style: 'max-height:420px;overflow:auto;border-top:1px solid var(--border)',
+    });
+    detailCard.appendChild(title);
+    detailCard.appendChild(statusLine);
+    detailCard.appendChild(controls);
+    detailCard.appendChild(filterBar);
+    detailCard.appendChild(sendsWrap);
+
+    let filtro = 'todos';
 
     function renderStatus(c, counts) {
       statusLine.innerHTML = '';
       const parts = [
-        'Status: ' + c.status,
         'Total: ' + c.total_recipients,
         'Enviados: ' + c.sent_count,
-        'Falhados: ' + c.failed_count,
+        'Falhas: ' + c.failed_count,
       ];
-      if (counts) parts.push('Pendentes: ' + counts.pending);
-      statusLine.appendChild(h('span', {}, parts.join(' · ')));
+      if (counts) parts.push('Na fila: ' + counts.pending);
+      statusLine.appendChild(statusBadge(CAMPAIGN_STATUS, c.status));
+      statusLine.appendChild(h('span', {}, ' · ' + parts.join(' · ')));
     }
     renderStatus(campaign, null);
 
-    async function showFailures() {
-      const fails = await api
-        .get(api.forInstance('/campaigns/' + campaignId + '/sends?status=failed'))
-        .catch(() => []);
-      detail.innerHTML = '';
-      detail.appendChild(h('h3', { class: 'card__title' }, 'Falhas (' + fails.length + ')'));
-      if (!fails.length) {
-        detail.appendChild(h('div', { class: 'muted' }, 'Nenhuma falha registrada.'));
+    /** Tabela de campaign_sends — a auditoria "logue tudo" virando tela. */
+    async function renderSends() {
+      let sends;
+      try {
+        const suffix = filtro === 'todos' ? '' : '?status=' + filtro;
+        sends = await api.get(api.forInstance('/campaigns/' + campaignId + '/sends' + suffix));
+      } catch (e) {
+        sendsWrap.innerHTML = '';
+        sendsWrap.appendChild(
+          h('div', { class: 'placeholder placeholder--error' }, 'Erro ao carregar envios: ' + e.message),
+        );
         return;
       }
-      detail.appendChild(
+
+      sendsWrap.innerHTML = '';
+      if (!sends.length) {
+        sendsWrap.appendChild(
+          h('div', { class: 'muted', style: 'padding:14px' },
+            filtro === 'todos'
+              ? 'A fila ainda não foi materializada — inicie o disparo.'
+              : 'Nenhum envio com este status.'),
+        );
+        return;
+      }
+      sendsWrap.appendChild(
         h('table', { class: 'table' }, [
-          h('thead', {}, [h('tr', {}, [
-            h('th', {}, 'Telefone'), h('th', {}, 'Código'), h('th', {}, 'Motivo'), h('th', {}, 'Tentativas'),
-          ])]),
-          h('tbody', {}, fails.map((f) =>
+          h('thead', {}, [
             h('tr', {}, [
-              h('td', {}, f.contact_phone),
-              h('td', {}, f.error_code || '—'),
-              h('td', {}, f.error_message || '—'),
-              h('td', {}, String(f.attempts)),
+              h('th', {}, 'Telefone'),
+              h('th', {}, 'Status'),
+              h('th', {}, 'Motivo da falha'),
+              h('th', {}, 'Tentativas'),
+              h('th', {}, 'Enviado em'),
             ]),
-          )),
+          ]),
+          h(
+            'tbody',
+            {},
+            sends.map((s) =>
+              h('tr', {}, [
+                h('td', {}, s.contact_phone),
+                h('td', {}, [statusBadge(SEND_STATUS, s.status)]),
+                // Código + mensagem juntos: é o que identifica o erro na Meta.
+                h('td', { class: s.error_code ? '' : 'muted' },
+                  s.error_code ? `${s.error_code} — ${s.error_message || 'sem descrição'}` : '—'),
+                h('td', {}, String(s.attempts != null ? s.attempts : 0)),
+                h('td', { class: 'muted' }, fmtDateTime(s.sent_at)),
+              ]),
+            ),
+          ),
         ]),
       );
     }
 
-    async function showRecipients() {
-      const data = await api
-        .get(api.forInstance('/campaigns/' + campaignId + '/recipients?limit=50'))
-        .catch((e) => ({ error: e.message }));
-      detail.innerHTML = '';
-      if (data.error) {
-        detail.appendChild(h('div', { class: 'muted' }, 'Erro: ' + data.error));
-        return;
+    /** Filtro por status — é como o operador acha as falhas sem ler o banco. */
+    function renderFilters() {
+      filterBar.innerHTML = '';
+      for (const f of ['todos', 'sent', 'failed', 'pending', 'sending']) {
+        const label = f === 'todos' ? 'Todos' : (SEND_STATUS[f] || {}).label || f;
+        filterBar.appendChild(
+          h('button', {
+            class: 'btn' + (filtro === f ? ' btn--primary' : ''),
+            onclick: () => {
+              filtro = f;
+              renderFilters();
+              renderSends();
+            },
+          }, label),
+        );
       }
-      const tplInfo = data.template
-        ? `Template: ${data.template.name} (${data.template.language})`
-        : 'Sem template';
-      detail.appendChild(
-        h('div', { class: 'muted', style: 'margin-bottom:8px' }, `${tplInfo} · ${data.total} destinatário(s)`),
-      );
-      if (!data.recipients.length) {
-        detail.appendChild(h('div', { class: 'muted' }, 'Nenhum destinatário nas listas escolhidas.'));
-        return;
-      }
-      const varKeys = Object.keys(data.recipients[0].vars);
-      detail.appendChild(
-        h('table', { class: 'table' }, [
-          h('thead', {}, [h('tr', {}, [
-            h('th', {}, 'Telefone'), h('th', {}, 'Nome'),
-            ...varKeys.map((k) => h('th', {}, '{{' + k + '}}')),
-          ])]),
-          h('tbody', {}, data.recipients.map((r) =>
-            h('tr', {}, [
-              h('td', {}, r.phone),
-              h('td', {}, r.name || '—'),
-              ...varKeys.map((k) => h('td', {}, r.vars[k] || '')),
-            ]),
-          )),
-        ]),
-      );
     }
+    renderFilters();
 
     function startPolling() {
       stopDispatchPolling();
@@ -875,13 +1083,18 @@ function campanhasScreen() {
         try {
           const t = await api.post(api.forInstance('/campaigns/' + campaignId + '/tick'));
           renderStatus(
-            { status: t.status, total_recipients: t.sent + t.failed + t.pending, sent_count: t.sent, failed_count: t.failed },
+            {
+              status: t.status,
+              total_recipients: t.sent + t.failed + t.pending,
+              sent_count: t.sent,
+              failed_count: t.failed,
+            },
             t,
           );
+          await renderSends();
           if (t.status !== 'running') {
             stopDispatchPolling();
-            loadCampaigns();
-            showFailures();
+            await loadCampaigns();
           }
         } catch (e) {
           stopDispatchPolling();
@@ -897,6 +1110,8 @@ function campanhasScreen() {
           try {
             const started = await api.post(api.forInstance('/campaigns/' + campaignId + '/start'));
             renderStatus(started, null);
+            await renderSends();
+            await loadCampaigns();
             startPolling();
           } catch (e) {
             alert('Erro ao iniciar: ' + e.message);
@@ -909,100 +1124,187 @@ function campanhasScreen() {
         class: 'btn',
         onclick: async () => {
           stopDispatchPolling();
-          await api.post(api.forInstance('/campaigns/' + campaignId + '/pause')).catch(() => {});
-          preview(campaignId);
+          try {
+            await api.post(api.forInstance('/campaigns/' + campaignId + '/pause'));
+          } catch (e) {
+            alert('Erro ao pausar: ' + e.message);
+          }
+          await loadCampaigns();
+          await openDetail(campaignId);
         },
       }, 'Pausar'),
     );
-    controls.appendChild(h('button', { class: 'btn', onclick: showRecipients }, 'Destinatários'));
-    controls.appendChild(h('button', { class: 'btn', onclick: showFailures }, 'Falhas'));
+    controls.appendChild(
+      h('button', { class: 'btn', onclick: () => renderSends() }, 'Atualizar'),
+    );
 
-    if (campaign.status === 'running') {
-      startPolling();
-      showFailures();
-    } else if (campaign.status === 'completed') {
-      showFailures();
-    } else {
-      showRecipients();
-    }
+    await renderSends();
+    if (campaign.status === 'running') startPolling();
   }
 
+  // ------------------------------------------------------------------ form
   async function renderForm() {
     formCard.innerHTML = '';
     formCard.appendChild(h('h3', { class: 'card__title' }, 'Nova campanha'));
-    const templates = await api.get(api.forInstance('/templates')).catch(() => []);
-    const lists = await api.get(api.forInstance('/lists')).catch(() => []);
+
+    let templates = [];
+    let lists = [];
+    try {
+      templates = await api.get(api.forInstance('/templates'));
+      lists = await api.get(api.forInstance('/lists'));
+    } catch (e) {
+      formCard.appendChild(
+        h('div', { class: 'placeholder placeholder--error' }, 'Erro ao carregar dados: ' + e.message),
+      );
+      return;
+    }
+
+    const field = (label, node, hint) =>
+      h('div', { style: 'margin-bottom:12px' }, [
+        h('div', { class: 'muted', style: 'margin-bottom:4px' }, label),
+        node,
+        hint ? h('div', { class: 'muted', style: 'font-size:12px;margin-top:4px' }, hint) : null,
+      ]);
 
     const nameInput = h('input', { class: 'select', placeholder: 'Nome da campanha', style: 'width:100%' });
     const tplSelect = h(
       'select',
       { class: 'select', style: 'width:100%' },
-      [h('option', { value: '' }, '— sem template —')].concat(
-        templates.map((t) => h('option', { value: t.id }, `${t.name} (${t.language})`)),
+      [h('option', { value: '' }, '— selecione um template —')].concat(
+        templates.map((t) => h('option', { value: t.id }, `${t.name} (${t.language}) · ${t.status}`)),
       ),
     );
-    const intervalInput = h('input', { class: 'select', type: 'number', value: '1000', style: 'width:100%' });
+    // Intervalo é decisão do operador (PRD): nada de valor fixo escondido.
+    const intervalInput = h('input', {
+      class: 'select', type: 'number', min: '0', step: '100', value: '1000', style: 'width:100%',
+    });
     const listChecks = lists.map((l) => {
       const cb = h('input', { type: 'checkbox', value: l.id });
-      return { cb, node: h('label', { style: 'display:block' }, [cb, ' ' + l.name]) };
+      return { cb, node: h('label', { style: 'display:block;margin:3px 0' }, [cb, ' ' + l.name]) };
     });
-    const varsWrap = h('div', {});
-    function renderVars() {
-      varsWrap.innerHTML = '';
-      varRows.forEach((row, idx) => {
-        const ph = h('input', { class: 'select', value: row.ph, placeholder: 'nº', style: 'width:70px' });
-        const src = h('input', { class: 'select', value: row.src, placeholder: 'origem (ex.: name)', style: 'flex:1' });
-        ph.addEventListener('input', () => (varRows[idx].ph = ph.value));
-        src.addEventListener('input', () => (varRows[idx].src = src.value));
-        varsWrap.appendChild(h('div', { style: 'display:flex;gap:6px;margin-bottom:6px' }, [ph, src]));
-      });
-    }
-    renderVars();
 
-    const field = (label, node) => h('div', { style: 'margin-bottom:10px' }, [
-      h('div', { class: 'muted', style: 'margin-bottom:4px' }, label),
-      node,
-    ]);
+    const tplInfo = h('div', {});
+    const varsWrap = h('div', {});
+    /** { key → input } das variáveis derivadas do template selecionado. */
+    let varInputs = [];
+
+    function renderVarsForTemplate() {
+      tplInfo.innerHTML = '';
+      varsWrap.innerHTML = '';
+      varInputs = [];
+
+      const tpl = templates.find((t) => t.id === tplSelect.value);
+      if (!tpl) {
+        varsWrap.appendChild(
+          h('div', { class: 'muted' }, 'Selecione um template para ver as variáveis que ele espera.'),
+        );
+        return;
+      }
+
+      const body = templateBodyPreview(tpl);
+      if (body) {
+        tplInfo.appendChild(
+          h('div', {
+            class: 'muted',
+            style: 'font-size:12px;white-space:pre-wrap;background:#f8fafc;border:1px solid var(--border);border-radius:8px;padding:8px;margin-bottom:10px;max-height:140px;overflow:auto',
+          }, body),
+        );
+      }
+
+      const slots = expectedTemplateVars(tpl);
+      if (!slots.length) {
+        varsWrap.appendChild(
+          h('div', { class: 'muted' }, 'Este template não tem variáveis — nada a preencher.'),
+        );
+        return;
+      }
+
+      for (const slot of slots) {
+        const input = h('input', {
+          class: 'select',
+          value: slot.suggested || '',
+          placeholder: 'name, phone, crm.stage, lit:texto…',
+          style: 'width:100%',
+        });
+        varInputs.push({ key: slot.key, input });
+        varsWrap.appendChild(
+          h('div', { style: 'margin-bottom:8px' }, [
+            h('div', { style: 'font-weight:600;font-size:12px' }, slot.label),
+            slot.hint
+              ? h('div', { class: 'muted', style: 'font-size:12px;margin-bottom:3px' },
+                  'Exemplo da Meta: ' + slot.hint)
+              : null,
+            input,
+          ]),
+        );
+      }
+    }
+    tplSelect.addEventListener('change', renderVarsForTemplate);
+    renderVarsForTemplate();
 
     formCard.appendChild(field('Nome', nameInput));
-    formCard.appendChild(field('Template (idioma da Meta)', tplSelect));
-    formCard.appendChild(field('Listas alvo', h('div', {}, listChecks.map((c) => c.node))));
-    formCard.appendChild(field('Intervalo entre envios (ms)', intervalInput));
+    formCard.appendChild(
+      field('Template', tplSelect, 'O idioma vem do template cadastrado na Meta — nunca é assumido.'),
+    );
+    formCard.appendChild(tplInfo);
     formCard.appendChild(
       field(
-        'Variáveis {{n}} → origem (name, phone, crm.stage, crm.custom_fields.x, lit:texto)',
-        h('div', {}, [
-          varsWrap,
-          h('button', {
-            class: 'btn',
-            onclick: () => {
-              varRows.push({ ph: String(varRows.length + 1), src: '' });
-              renderVars();
-            },
-          }, '+ variável'),
-        ]),
+        'Listas alvo',
+        lists.length
+          ? h('div', {}, listChecks.map((c) => c.node))
+          : h('div', { class: 'muted' }, 'Nenhuma lista criada ainda (vá em Listas).'),
       ),
     );
+    formCard.appendChild(
+      field(
+        'Intervalo entre envios (ms)',
+        intervalInput,
+        'Espaçamento entre cada mensagem. Mais alto = mais devagar e mais seguro contra rate-limit da Meta.',
+      ),
+    );
+    formCard.appendChild(
+      field(
+        'Variáveis do template → origem do valor',
+        h('div', {}, [varsWrap]),
+        'Origens: name, phone, crm.stage, crm.score, crm.custom_fields.<chave> ou lit:<texto fixo>.',
+      ),
+    );
+
     formCard.appendChild(
       h('button', {
         class: 'btn btn--primary',
         onclick: async () => {
           const name = nameInput.value.trim();
-          if (!name) return alert('Informe o nome.');
+          if (!name) return alert('Informe o nome da campanha.');
+          const list_ids = listChecks.filter((c) => c.cb.checked).map((c) => c.cb.value);
+          if (!list_ids.length) return alert('Escolha ao menos uma lista alvo.');
+
           const variables = {};
-          for (const r of varRows) if (r.ph.trim() && r.src.trim()) variables[r.ph.trim()] = r.src.trim();
-          const body = {
-            name,
-            template_id: tplSelect.value || null,
-            list_ids: listChecks.filter((c) => c.cb.checked).map((c) => c.cb.value),
-            variables,
-            interval_ms: Number(intervalInput.value) || 1000,
-          };
+          for (const v of varInputs) {
+            const val = v.input.value.trim();
+            if (val) variables[v.key] = val;
+          }
+          const faltando = varInputs.filter((v) => !v.input.value.trim());
+          if (faltando.length &&
+              !confirm(
+                `${faltando.length} variável(is) sem origem definida. ` +
+                'A Meta pode rejeitar o envio por contagem de parâmetros. Criar mesmo assim?',
+              )) {
+            return;
+          }
+
           try {
-            const created = await api.post(api.forInstance('/campaigns'), body);
+            const created = await api.post(api.forInstance('/campaigns'), {
+              name,
+              template_id: tplSelect.value || null,
+              list_ids,
+              variables,
+              interval_ms: Number(intervalInput.value) || 0,
+            });
             nameInput.value = '';
+            listChecks.forEach((c) => (c.cb.checked = false));
             await loadCampaigns();
-            await preview(created.id); // mostra destinatários resolvidos
+            await openDetail(created.id);
           } catch (e) {
             alert('Erro ao criar: ' + e.message);
           }
@@ -1013,7 +1315,7 @@ function campanhasScreen() {
 
   renderForm();
   loadCampaigns();
-  previewCard.appendChild(h('div', { class: 'muted' }, 'Crie ou selecione uma campanha para ver os destinatários.'));
+  renderEmptyDetail();
   return root;
 }
 

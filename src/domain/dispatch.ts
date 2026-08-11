@@ -20,6 +20,15 @@ const DEFAULT_BUDGET_MS = 8000;
 const STALE_CLAIM_MS = 5 * 60 * 1000;
 /** Orçamento menor na retomada por tráfego (divide a invocação com o inbound). */
 const TRAFFIC_BUDGET_MS = 3000;
+/**
+ * Orçamento TOTAL da varredura do cron. A function tem maxDuration 30s
+ * (vercel.json): 20s de trabalho deixa folga para o cold start, as queries e a
+ * resposta. Estourar isso mataria a invocação no meio e deixaria linhas presas
+ * em 'sending' até o reclaim — funciona, mas atrasa a campanha à toa.
+ */
+const CRON_TOTAL_BUDGET_MS = 20_000;
+/** Fatia por campanha dentro de uma rodada: nenhuma monopoliza a varredura. */
+const CRON_CAMPAIGN_BUDGET_MS = 5000;
 
 const sleep = (ms: number): Promise<void> =>
   ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve();
@@ -268,6 +277,110 @@ export async function processPendingCampaigns(
       console.error(`[campanha ${c.id}] falha ao retomar por tráfego:`, err);
     }
   }
+}
+
+export interface CronSweepResult {
+  /** Instâncias varridas. */
+  instances: number;
+  /** Campanhas 'running' que receberam ao menos um tick. */
+  campaigns: number;
+  /** Destinatários processados na invocação inteira. */
+  processed: number;
+  /** Rodadas completas (a mesma campanha pode receber vários ticks). */
+  rounds: number;
+  /** true = o orçamento acabou com trabalho ainda na fila (o próximo cron segue). */
+  budgetExhausted: boolean;
+}
+
+/**
+ * Varredura AUTÔNOMA de todas as instâncias (o cron da Vercel). Fecha a lacuna
+ * em que a campanha só avançava com tráfego de webhook ou com a UI aberta
+ * fazendo polling: sem inbound e sem ninguém olhando, ela ficava parada.
+ *
+ * Reaproveita processCampaignTick — mesmo claim atômico, mesmo rate-limit,
+ * mesma auditoria. Nada aqui fala com a Meta direto. Como o claim é uma única
+ * instrução SQL (pending → sending), o cron rodando junto com um tick de
+ * webhook ou da UI NÃO duplica envio: quem perde a corrida não vê a linha.
+ *
+ * Trabalha em RODADAS em vez de um tick por campanha: com uma campanha só no
+ * ar, ela usaria uma fatia mínima e o resto do orçamento seria jogado fora.
+ * Cada rodada dá a cada campanha mais um lote até o orçamento total acabar.
+ *
+ * Escopo: `instances.list()` sem orgId devolve todas (uso interno, é o ponto
+ * do cron), mas cada tick continua escopado por instância — nenhuma operação
+ * cruza instâncias.
+ *
+ * Nunca lança: falha de uma instância/campanha vira log e a varredura segue.
+ */
+export async function processAllPendingCampaigns(
+  repo: Repo,
+  deps: MessagingDeps = {},
+  opts: { totalBudgetMs?: number; campaignBudgetMs?: number } = {},
+): Promise<CronSweepResult> {
+  const deadline = Date.now() + (opts.totalBudgetMs ?? CRON_TOTAL_BUDGET_MS);
+  const campaignBudget = opts.campaignBudgetMs ?? CRON_CAMPAIGN_BUDGET_MS;
+  const result: CronSweepResult = {
+    instances: 0,
+    campaigns: 0,
+    processed: 0,
+    rounds: 0,
+    budgetExhausted: false,
+  };
+
+  let instances: Instance[];
+  try {
+    instances = await repo.instances.list();
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[cron] falha ao listar instâncias:', err);
+    return result;
+  }
+  result.instances = instances.length;
+
+  const tocadas = new Set<string>();
+  while (Date.now() < deadline) {
+    let processadoNaRodada = 0;
+
+    for (const instance of instances) {
+      if (Date.now() >= deadline) break;
+
+      let campaigns: Campaign[];
+      try {
+        campaigns = (await repo.campaigns.list(instance.id)).filter(
+          (c) => c.status === 'running',
+        );
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(`[cron] instância ${instance.id}: falha ao listar campanhas:`, err);
+        continue;
+      }
+
+      for (const c of campaigns) {
+        const restante = deadline - Date.now();
+        if (restante <= 0) break;
+        try {
+          const tick = await processCampaignTick(repo, instance, c.id, deps, {
+            budgetMs: Math.min(campaignBudget, restante),
+          });
+          tocadas.add(c.id);
+          processadoNaRodada += tick.processed;
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.error(`[cron] campanha ${c.id}: falha no tick:`, err);
+        }
+      }
+    }
+
+    result.rounds += 1;
+    result.processed += processadoNaRodada;
+    // Nada processado = fila vazia ou tudo em rate-limit: parar já e devolver a
+    // invocação, em vez de girar em falso até o orçamento acabar.
+    if (processadoNaRodada === 0) break;
+    if (Date.now() >= deadline) result.budgetExhausted = true;
+  }
+
+  result.campaigns = tocadas.size;
+  return result;
 }
 
 /** Pausa uma campanha em andamento (os ticks param de processar). */
