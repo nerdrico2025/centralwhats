@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
 import request from 'supertest';
 import { createSqliteAdapter } from '../src/repo/adapters/SqliteAdapter';
 import { createApp } from '../src/http/app';
@@ -215,5 +217,131 @@ describe('CRITÉRIO DE ACEITE P4.5 — fluxo do builder executa ponta a ponta', 
 
     const done = await repo.flowExecutions.getById(active[0].id);
     expect(done?.status).toBe('completed'); // ponta a ponta ✔
+  });
+});
+
+/**
+ * Serialização do canvas → JSON da API.
+ *
+ * nodeOutputs é o CONTRATO entre a UI e o motor: cada saída vira o
+ * `sourceHandle` de uma aresta, e o engine roteia por esse mesmo handle. Se os
+ * dois lados divergirem, o fluxo "some" numa saída que não existe — falha
+ * silenciosa exatamente do tipo que este projeto não aceita.
+ */
+function extractFn(source: string, name: string): string {
+  const start = source.indexOf(`function ${name}(`);
+  if (start < 0) throw new Error(`função ${name} não encontrada em app.js`);
+  let depth = 0;
+  for (let i = source.indexOf('{', start); i < source.length; i++) {
+    if (source[i] === '{') depth++;
+    else if (source[i] === '}') {
+      depth--;
+      if (depth === 0) return source.slice(start, i + 1);
+    }
+  }
+  throw new Error(`fim da função ${name} não encontrado`);
+}
+
+describe('builder (UI) — serialização do grafo', () => {
+  const appJs = fs.readFileSync(path.join(process.cwd(), 'src', 'web', 'app.js'), 'utf8');
+  const nodeOutputs = new Function(
+    `${extractFn(appJs, 'nodeOutputs')}; return nodeOutputs;`,
+  )() as (n: unknown) => { handle: string | null; label: string }[];
+  const validateFlowLocal = new Function(
+    `${extractFn(appJs, 'validateFlowLocal')}; return validateFlowLocal;`,
+  )() as (n: unknown[], e: unknown[]) => string[];
+
+  const handles = (node: unknown) => nodeOutputs(node).map((o) => o.handle);
+
+  it('nó simples tem uma saída sem handle (aresta sem sourceHandle)', () => {
+    expect(handles({ type: 'message', data: { text: 'oi' } })).toEqual([null]);
+    expect(handles({ type: 'delay', data: { seconds: 5 } })).toEqual([null]);
+    expect(handles({ type: 'tag', data: { name: 'VIP' } })).toEqual([null]);
+  });
+
+  it('Fim não tem saída', () => {
+    expect(handles({ type: 'end', data: {} })).toEqual([]);
+  });
+
+  it('Botões: uma saída por botão, com o id do botão como handle', () => {
+    const node = {
+      type: 'buttons',
+      data: { text: 'Escolha', buttons: [{ id: 'b1', title: 'Sim' }, { id: 'b2', title: 'Não' }] },
+    };
+    expect(handles(node)).toEqual(['b1', 'b2']);
+  });
+
+  it('Lista: uma saída por opção da primeira seção', () => {
+    const node = {
+      type: 'list',
+      data: { sections: [{ rows: [{ id: 'r1', title: 'A' }, { id: 'r2', title: 'B' }] }] },
+    };
+    expect(handles(node)).toEqual(['r1', 'r2']);
+  });
+
+  it('Aguardar Resposta: saídas fixas "reply" e "timeout"', () => {
+    // O engine roteia o timeout por 'timeout' na retomada — nomes travados.
+    expect(handles({ type: 'wait_input', data: { variable: 'x' } })).toEqual(['reply', 'timeout']);
+  });
+
+  it('Randomizador: N saídas numeradas de "0" a "N-1"', () => {
+    expect(handles({ type: 'randomizer', data: { outputs: 3 } })).toEqual(['0', '1', '2']);
+    // Default 2 quando não configurado.
+    expect(handles({ type: 'randomizer', data: {} })).toEqual(['0', '1']);
+  });
+
+  it('Condição: uma saída por regra MAIS o "else" no fim', () => {
+    const node = {
+      type: 'condition',
+      data: {
+        rules: [
+          { handle: 'r1', kind: 'text_contains', value: 'oi' },
+          { handle: 'r2', kind: 'has_tag', value: 'VIP' },
+        ],
+      },
+    };
+    expect(handles(node)).toEqual(['r1', 'r2', 'else']);
+  });
+
+  it('os handles do builder são os MESMOS que o motor roteia', async () => {
+    // Grafo montado como a UI monta e salvo pela API: o engine tem de achar o
+    // caminho do botão 'b2' pelo sourceHandle serializado aqui.
+    const nodes = [
+      { id: 'n1', type: 'start', data: {}, x: 0, y: 0 },
+      { id: 'n2', type: 'buttons', data: { text: 'Escolha', buttons: [{ id: 'b1', title: 'A' }, { id: 'b2', title: 'B' }] }, x: 0, y: 0 },
+      { id: 'nA', type: 'message', data: { text: 'foi A' }, x: 0, y: 0 },
+      { id: 'nB', type: 'message', data: { text: 'foi B' }, x: 0, y: 0 },
+    ];
+    const edges = [
+      { source: 'n1', target: 'n2' },
+      { source: 'n2', target: 'nA', sourceHandle: 'b1' },
+      { source: 'n2', target: 'nB', sourceHandle: 'b2' },
+    ];
+    // Todo handle usado nas arestas existe na saída declarada pelo nó.
+    const declarados = new Set(handles(nodes[1]));
+    for (const e of edges.filter((x) => x.source === 'n2')) {
+      expect(declarados.has(e.sourceHandle!)).toBe(true);
+    }
+    // E o grafo é válido para o validador local (sem órfão, sem aresta solta).
+    expect(validateFlowLocal(nodes, edges)).toEqual([]);
+  });
+
+  it('validação local pega os mesmos problemas do validador do backend', () => {
+    // Sem Início.
+    expect(validateFlowLocal([{ id: 'a', type: 'message' }], [])).toContain(
+      'Fluxo sem nó Início — nunca será disparado.',
+    );
+    // Aresta apontando pra nó inexistente.
+    const w = validateFlowLocal(
+      [{ id: 's', type: 'start' }],
+      [{ source: 's', target: 'fantasma' }],
+    );
+    expect(w.some((x) => x.includes('fantasma'))).toBe(true);
+    // Nó inalcançável.
+    const orfao = validateFlowLocal(
+      [{ id: 's', type: 'start' }, { id: 'x', type: 'message' }],
+      [],
+    );
+    expect(orfao.some((x) => x.includes('órfão'))).toBe(true);
   });
 });

@@ -1325,6 +1325,10 @@ function campanhasScreen() {
 }
 
 // ----------------------------------------------------- Builder de fluxos (P4.5)
+/** Área do canvas em coordenadas do GRAFO (o zoom multiplica só na exibição). */
+const CANVAS_W = 2400;
+const CANVAS_H = 1600;
+
 const NODE_META = {
   start: { label: '▶ Início', data: () => ({}) },
   message: { label: '💬 Mensagem', data: () => ({ text: 'Olá {{nome}}!' }) },
@@ -1381,8 +1385,8 @@ function nodeSummary(node) {
     case 'media': return (d.kind || '') + ' ' + (d.url || '');
     case 'buttons': return d.text || '';
     case 'list': return d.text || '';
-    case 'delay': return d.seconds + 's' + (Number(d.seconds) >= 10 ? ' (persistido)' : ' (inline)');
-    case 'tag': return d.name || '';
+    case 'delay': return 'esperar ' + (Number(d.seconds) || 0) + 's';
+    case 'tag': return d.name || '(sem tag)';
     case 'randomizer': return d.mode === 'round_robin' ? 'round-robin' : 'aleatório';
     case 'wait_input': return '→ {{' + (d.variable || 'resposta') + '}}';
     case 'webhook': return (d.method || 'GET') + ' ' + (d.url || '');
@@ -1435,6 +1439,32 @@ function chatbotScreen() {
   let selectedId = null;
   let pendingConnect = null; // { source, handle }
   let nextNum = 1;
+  /** Tags da instância, para o nó Tag escolher em vez de digitar (P1.5). */
+  let tags = [];
+  /** Zoom do canvas. Pan é o scroll do container (arrastar o fundo). */
+  const view = { scale: 1 };
+
+  function setZoom(next) {
+    const antes = view.scale;
+    view.scale = Math.min(1.6, Math.max(0.4, Number(next.toFixed(2))));
+    if (view.scale === antes) return;
+    // Mantém o centro visível ancorado ao ampliar/reduzir.
+    const k = view.scale / antes;
+    const cx = canvasWrap.scrollLeft + canvasWrap.clientWidth / 2;
+    const cy = canvasWrap.scrollTop + canvasWrap.clientHeight / 2;
+    renderCanvas();
+    canvasWrap.scrollLeft = cx * k - canvasWrap.clientWidth / 2;
+    canvasWrap.scrollTop = cy * k - canvasWrap.clientHeight / 2;
+  }
+
+  function zoomControls() {
+    return h('div', { class: 'canvas-zoom' }, [
+      h('button', { title: 'Reduzir', onclick: () => setZoom(view.scale - 0.2) }, '−'),
+      h('span', {}, Math.round(view.scale * 100) + '%'),
+      h('button', { title: 'Ampliar', onclick: () => setZoom(view.scale + 0.2) }, '+'),
+      h('button', { title: 'Voltar a 100%', onclick: () => setZoom(1) }, '⤢'),
+    ]);
+  }
 
   function newId() {
     // Ids únicos e ESTÁVEIS: nunca reaproveitar (lição 4 — recriar muda o id).
@@ -1529,12 +1559,47 @@ function chatbotScreen() {
       canvasWrap.appendChild(h('div', { class: 'placeholder' }, 'Selecione ou crie um fluxo.'));
       return;
     }
-    const inner = h('div', { class: 'canvas-inner' });
+    // Sizer + palco: o palco recebe o transform do zoom; o sizer carrega a
+    // área rolável já escalada, senão as barras de rolagem descolam do
+    // conteúdo assim que o zoom sai de 100%.
+    const inner = h('div', {
+      class: 'canvas-inner',
+      style: `width:${CANVAS_W * view.scale}px;height:${CANVAS_H * view.scale}px`,
+    });
+    const stage = h('div', {
+      class: 'canvas-stage',
+      style: `transform:scale(${view.scale})`,
+    });
+    inner.appendChild(stage);
     canvasWrap.appendChild(inner);
+    canvasWrap.appendChild(zoomControls());
+
+    // Arrastar o FUNDO move a tela (pan). Só no fundo: em cima do nó, o
+    // pointerdown do cabeçalho é que manda.
+    inner.addEventListener('pointerdown', (ev) => {
+      if (ev.target !== inner && ev.target !== stage) return;
+      ev.preventDefault();
+      const sx = ev.clientX;
+      const sy = ev.clientY;
+      const l0 = canvasWrap.scrollLeft;
+      const t0 = canvasWrap.scrollTop;
+      canvasWrap.classList.add('panning');
+      const move = (mv) => {
+        canvasWrap.scrollLeft = l0 - (mv.clientX - sx);
+        canvasWrap.scrollTop = t0 - (mv.clientY - sy);
+      };
+      const up = () => {
+        canvasWrap.classList.remove('panning');
+        document.removeEventListener('pointermove', move);
+        document.removeEventListener('pointerup', up);
+      };
+      document.addEventListener('pointermove', move);
+      document.addEventListener('pointerup', up);
+    });
 
     // Arestas (SVG por baixo dos nós).
     const svgEl = svg('svg', { class: 'edges' });
-    inner.appendChild(svgEl);
+    stage.appendChild(svgEl);
     const byId = Object.fromEntries(current.nodes.map((n) => [n.id, n]));
     for (const e of current.edges) {
       const s = byId[e.source];
@@ -1615,8 +1680,10 @@ function chatbotScreen() {
         const origX = node.x;
         const origY = node.y;
         function move(mv) {
-          node.x = Math.max(0, origX + (mv.clientX - startX));
-          node.y = Math.max(0, origY + (mv.clientY - startY));
+          // Divide pela escala: com zoom em 50%, 100px de mouse são 200px de
+          // canvas — sem isto o nó "foge" do cursor fora do zoom 100%.
+          node.x = Math.max(0, origX + (mv.clientX - startX) / view.scale);
+          node.y = Math.max(0, origY + (mv.clientY - startY) / view.scale);
           renderCanvas();
         }
         function up() {
@@ -1627,7 +1694,7 @@ function chatbotScreen() {
         document.addEventListener('pointerup', up);
       });
 
-      inner.appendChild(el);
+      stage.appendChild(el);
     }
   }
 
@@ -1696,11 +1763,34 @@ function chatbotScreen() {
         break;
       }
       case 'delay':
-        parts.push(field('Segundos (≥10 persiste e retoma sozinho)', boundInput(d, 'seconds', { type: 'number' })));
+        // Só a duração. Se o delay dorme inline ou persiste e retoma é
+        // IMPLEMENTAÇÃO do motor — virar campo/rótulo de UI só confundiria
+        // quem monta o fluxo, sem nenhuma decisão a tomar a respeito.
+        parts.push(field('Segundos de espera', boundInput(d, 'seconds', { type: 'number', min: '0' })));
         break;
-      case 'tag':
-        parts.push(field('Nome da tag', boundInput(d, 'name')));
+      case 'tag': {
+        // Escolhe entre as tags que existem (P1.5) em vez de digitar o nome:
+        // um typo aqui viraria tag nova e silenciosa no meio do fluxo.
+        const atual = d.name || '';
+        const conhecidas = tags.map((t) => t.name);
+        const opts = conhecidas.map((n) =>
+          h('option', { value: n, ...(n === atual ? { selected: 'selected' } : {}) }, n));
+        if (!conhecidas.length) {
+          parts.push(field('Tag', h('div', { class: 'muted' },
+            'Nenhuma tag criada ainda — crie em Contatos.')));
+          break;
+        }
+        // Fluxo salvo com tag que foi apagada depois: mantém a opção visível e
+        // MARCADA, em vez de trocar em silêncio pela primeira da lista.
+        if (atual && !conhecidas.includes(atual)) {
+          opts.unshift(h('option', { value: atual, selected: 'selected' }, atual + ' (não existe mais)'));
+        }
+        if (!atual) opts.unshift(h('option', { value: '', selected: 'selected' }, '— escolha a tag —'));
+        const sel = h('select', {}, opts);
+        sel.addEventListener('change', () => { d.name = sel.value; renderCanvas(); });
+        parts.push(field('Aplicar a tag', sel));
         break;
+      }
       case 'randomizer': {
         const sel = h('select', {}, [
           h('option', { value: 'round_robin', ...(d.mode === 'round_robin' ? { selected: 'selected' } : {}) }, 'round-robin (equilibrado)'),
@@ -1880,6 +1970,19 @@ function chatbotScreen() {
     renderCanvas();
     renderEditor();
   }
+
+  // Tags carregadas uma vez: o nó Tag escolhe entre elas em vez de digitar.
+  api
+    .get(api.forInstance('/tags'))
+    .then((t) => {
+      tags = t;
+      if (current) renderEditor();
+    })
+    .catch(() => {
+      // Falha de carga não pode passar por "não há tags": o nó Tag cairia num
+      // select vazio e o operador acharia que precisa criar tag de novo.
+      setWarnings(['Não foi possível carregar as tags — o nó Tag pode aparecer vazio.']);
+    });
 
   loadFlows();
   renderAll();
