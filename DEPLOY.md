@@ -87,8 +87,38 @@ Passos:
 | `DATABASE_URL` | connection do **pooler (6543)** |
 | `JWT_SECRET` | string longa aleatória (`openssl rand -hex 32`) |
 | `SECRETS_ENCRYPTION_KEY` | idem (validada no boot; reservada p/ criptografia em repouso — os tokens hoje ficam em texto no banco, protegidos pelo acesso ao Postgres) |
+| `CRON_SECRET` | string longa aleatória (`openssl rand -hex 32`) — **obrigatória** para o disparo autônomo de campanhas |
 
 3. Deploy. A URL final (ex.: `https://wa-manager.vercel.app`) é a base de tudo.
+
+### Cron de campanhas (P3.2)
+
+`vercel.json` §`crons` agenda `GET /api/cron/tick-campaigns`, que avança as
+campanhas `running` de todas as instâncias sem depender de tráfego de webhook
+nem da UI aberta.
+
+A rota é protegida por `CRON_SECRET`: a Vercel injeta
+`Authorization: Bearer $CRON_SECRET` nas chamadas agendadas. **Sem a variável
+definida a rota responde 503 e não processa nada** — de propósito: esta rota
+dispara envio real, e um deploy sem o segredo não pode virar um endpoint
+público de disparo em massa.
+
+⚠️ **Limite do plano Hobby**: cron só roda **1x por dia** (por isso o schedule
+commitado é `0 3 * * *`). Um deploy com frequência maior **falha o build
+inteiro**. Para o disparo autônomo valer de verdade, escolha uma das opções:
+
+- **Vercel Pro** — troque o schedule para `*/2 * * * *` (o motor foi
+  dimensionado para isso: orçamento de 20s por varredura, `maxDuration` 30s).
+- **Agendador externo** (mantém o Hobby) — GitHub Actions, cron-job.org etc.
+  chamando a mesma rota na frequência que quiser:
+
+```bash
+curl -X POST https://SEU-APP.vercel.app/api/cron/tick-campaigns \
+  -H "Authorization: Bearer $CRON_SECRET"
+```
+
+Enquanto isso não estiver decidido, campanhas continuam avançando por tráfego
+de webhook e pelo polling da UI (como no P3.1) — só não avançam sozinhas.
 
 **Fumaça**:
 ```bash
