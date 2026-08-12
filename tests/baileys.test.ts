@@ -5,12 +5,14 @@ import { createApp } from '../src/http/app';
 import { sendViaProvider } from '../src/domain/messaging';
 import {
   BaileysWorker,
+  describeDisconnect,
   extractBaileysInbound,
   shouldReconnect,
   toJid,
   toSocketContent,
   type BaileysSocketLike,
 } from '../src/worker/baileysWorker';
+import { resolveWaVersion } from '../src/worker/realSocket';
 import { makeDbAuthState } from '../src/worker/dbAuthState';
 import type { Repo } from '../src/repo';
 import type { Instance } from '../src/repo/types';
@@ -239,6 +241,41 @@ describe('worker — QR, status e reconexão', () => {
     expect(await repo.baileysAuth.get(inst.id, 'creds')).toBeNull();
   });
 
+  it('close limpa o QR persistido (QR morto não pode continuar no painel)', async () => {
+    const fake = makeFakeSocket();
+    const worker = new BaileysWorker(repo, {
+      socketFactory: async () => fake.socket,
+      maxReconnectDelayMs: 1,
+    });
+    await worker.connectInstance(inst);
+
+    await worker.handleConnectionUpdate(inst, { qr: 'QR-QUE-VAI-MORRER' });
+    expect(await repo.baileysAuth.get(inst.id, 'qr')).toBe('QR-QUE-VAI-MORRER');
+
+    // 405: handshake rejeitado ANTES de parear — o QR daquele socket morreu.
+    await worker.handleConnectionUpdate(inst, {
+      connection: 'close',
+      lastDisconnect: {
+        error: { message: 'Connection Failure', output: { statusCode: 405 }, data: { reason: '405' } },
+      },
+    });
+    expect(await repo.baileysAuth.get(inst.id, 'qr')).toBeNull();
+    await worker.stop();
+  });
+
+  it('describeDisconnect extrai statusCode/reason do Boom (não o texto genérico)', () => {
+    expect(
+      describeDisconnect({
+        error: { message: 'Connection Failure', output: { statusCode: 405 }, data: { reason: '405' } },
+      }),
+    ).toEqual({ statusCode: 405, reason: '405', message: 'Connection Failure' });
+    expect(describeDisconnect(undefined)).toEqual({
+      statusCode: null,
+      reason: null,
+      message: null,
+    });
+  });
+
   it('queda comum reconecta sozinho (nova chamada à factory)', async () => {
     let connects = 0;
     const worker = new BaileysWorker(repo, {
@@ -259,6 +296,51 @@ describe('worker — QR, status e reconexão', () => {
     await new Promise((r) => setTimeout(r, 30));
     expect(connects).toBe(2);
     await worker.stop();
+  });
+});
+
+describe('versão do protocolo WA (fix do 405)', () => {
+  const LIB_DEFAULT: [number, number, number] = [2, 3000, 1035194821];
+
+  it('usa a versão buscada quando o fetch responde', async () => {
+    const info = await resolveWaVersion({
+      fetchLatest: async () => ({ version: [2, 3000, 1043857760] }),
+      fallback: () => LIB_DEFAULT,
+    });
+    expect(info).toEqual({ version: [2, 3000, 1043857760], source: 'fetch' });
+  });
+
+  it('fetch fora do ar → fallback no default da lib, sem lançar', async () => {
+    const info = await resolveWaVersion({
+      fetchLatest: async () => {
+        throw new Error('getaddrinfo ENOTFOUND');
+      },
+      fallback: () => LIB_DEFAULT,
+    });
+    expect(info.version).toEqual(LIB_DEFAULT);
+    expect(info.source).toBe('fallback');
+    expect(info.error).toContain('ENOTFOUND');
+  });
+
+  it('resposta malformada também cai no fallback', async () => {
+    const info = await resolveWaVersion({
+      fetchLatest: async () => ({ version: undefined as never }),
+      fallback: () => LIB_DEFAULT,
+    });
+    expect(info.version).toEqual(LIB_DEFAULT);
+    expect(info.source).toBe('fallback');
+  });
+
+  it('sem fetch E sem default legível: version null (lib decide), nunca lança', async () => {
+    const info = await resolveWaVersion({
+      fetchLatest: async () => {
+        throw new Error('rede fora');
+      },
+      fallback: () => {
+        throw new Error('pacote ilegível');
+      },
+    });
+    expect(info).toEqual({ version: null, source: 'fallback', error: 'rede fora' });
   });
 });
 

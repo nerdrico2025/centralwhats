@@ -1,7 +1,7 @@
 import { loadEnv } from '../config';
 import { getRepo } from '../repo';
 import { BaileysWorker } from './baileysWorker';
-import { makeRealSocketFactory } from './realSocket';
+import { getWaVersion, makeRealSocketFactory } from './realSocket';
 
 /**
  * Entrypoint do WORKER BAILEYS (V2 / P5.2).
@@ -17,6 +17,10 @@ async function main(): Promise<void> {
   // eslint-disable-next-line no-console
   console.log(`[worker] banco: ${repo.driver} @ ${repo.target}`);
   await repo.migrate();
+
+  // Resolve (e loga) a versão do protocolo ANTES do primeiro socket: uma vez
+  // por boot, nunca por reconexão. Nunca lança — cai no default da lib.
+  await getWaVersion();
 
   const worker = new BaileysWorker(repo, {
     socketFactory: makeRealSocketFactory(repo),

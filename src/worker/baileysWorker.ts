@@ -106,6 +106,38 @@ export function shouldReconnect(lastDisconnect: unknown): boolean {
   return statusCode !== 401;
 }
 
+/**
+ * Extrai a CAUSA REAL de um fechamento de conexão.
+ *
+ * POR QUÊ: o Baileys só loga "connection errored" (genérico) — o motivo mora
+ * no Boom: `output.statusCode` (401 logout, 405 handshake rejeitado, 408
+ * timeout, 428 fechada, 515 restart) e, em falhas de stream, `data.reason`.
+ * Sem isto o diagnóstico vira adivinhação.
+ */
+export function describeDisconnect(lastDisconnect: unknown): {
+  statusCode: number | null;
+  reason: string | null;
+  message: string | null;
+} {
+  const error = (
+    lastDisconnect as
+      | {
+          error?: {
+            message?: string;
+            output?: { statusCode?: number };
+            data?: { reason?: unknown };
+          };
+        }
+      | undefined
+  )?.error;
+  const reason = error?.data?.reason;
+  return {
+    statusCode: error?.output?.statusCode ?? null,
+    reason: reason != null ? String(reason) : null,
+    message: error?.message ?? null,
+  };
+}
+
 /** Forma mínima de mensagem inbound do Baileys que normalizamos. */
 export interface BaileysInboundMessage {
   key?: { remoteJid?: string | null; id?: string | null; fromMe?: boolean | null };
@@ -287,7 +319,18 @@ export class BaileysWorker {
       this.reconnectAttempts.set(instance.id, 0);
     }
     if (update.connection === 'close') {
+      const causa = describeDisconnect(update.lastDisconnect);
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[worker] conexão fechada — instância=${instance.id} (${instance.name}) ` +
+          `statusCode=${causa.statusCode ?? '-'} reason=${causa.reason ?? '-'} ` +
+          `message=${causa.message ?? '-'}`,
+      );
       await this.repo.instances.update(instance.id, { connection_status: 'disconnected' });
+      // O QR morre junto com o socket que o gerou (o `ref` é daquela conexão),
+      // então NUNCA sobrevive a um close: mantê-lo faria o painel exibir um
+      // código que jamais vai parear, sem nenhum indício de que está morto.
+      await this.repo.baileysAuth.delete(instance.id, 'qr');
       this.sockets.delete(instance.id);
       if (!this.stopped && shouldReconnect(update.lastDisconnect)) {
         // Reconexão com backoff exponencial (1s, 2s, 4s... teto configurável).
