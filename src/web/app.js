@@ -2680,6 +2680,19 @@ function instanciasScreen() {
       listCard.appendChild(h('div', { class: 'muted' }, 'Nenhuma instância. Crie ao lado.'));
       return;
     }
+    // Credenciais que não decifram com a chave atual: avisa em cima da lista,
+    // com o caminho de saída. Antes disto o painel inteiro dava 500 e o
+    // operador não tinha como nem chegar no formulário para recadastrar.
+    const ilegiveis = list.filter((i) => i.secrets_unreadable);
+    if (ilegiveis.length) {
+      listCard.appendChild(
+        h('div', { class: 'builder-warnings', style: 'margin-bottom:10px' },
+          'Credenciais ilegíveis em: ' + ilegiveis.map((i) => i.name).join(', ') + '. ' +
+          'Elas foram gravadas com outra SECRETS_ENCRYPTION_KEY. Restaure a chave usada ' +
+          'para gravá-las OU clique em Editar e recadastre o token da Meta. ' +
+          'Enquanto isso, envios por essas instâncias falham.'),
+      );
+    }
     listCard.appendChild(
       h('table', { class: 'table' }, [
         h('thead', {}, [h('tr', {}, [
@@ -2690,6 +2703,9 @@ function instanciasScreen() {
             h('td', {}, [
               h('div', {}, i.name),
               h('div', { class: 'muted', style: 'font-size:11px' }, i.phone_number_id || '—'),
+              i.secrets_unreadable
+                ? h('div', { style: 'font-size:11px;color:#991b1b' }, 'credenciais ilegíveis')
+                : null,
             ]),
             h('td', {}, i.provider_type === 'baileys' ? 'Baileys' : 'Meta'),
             h('td', {}, [h('span', {

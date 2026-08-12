@@ -34,6 +34,14 @@ export async function fetchMetaTemplates(
   if (!instance.waba_id) {
     throw new MetaApiError(null, 'Instância sem waba_id configurado', 400);
   }
+  if (instance.secrets_unreadable) {
+    throw new MetaApiError(
+      null,
+      'As credenciais desta instância não puderam ser decifradas com a SECRETS_ENCRYPTION_KEY ' +
+        'atual. Restaure a chave usada para gravá-las ou recadastre o token da Meta.',
+      400,
+    );
+  }
   if (!instance.token) {
     throw new MetaApiError(null, 'Instância sem token configurado', 400);
   }

@@ -64,6 +64,17 @@ export class MetaCloudProvider implements Provider {
     if (!instance.phone_number_id) {
       throw new MetaApiError(null, 'Instância sem phone_number_id configurado', 400);
     }
+    if (instance.secrets_unreadable) {
+      // Diferente de "sem token": o token EXISTE no banco, mas foi cifrado com
+      // outra SECRETS_ENCRYPTION_KEY. Dizer "sem token" mandaria o operador
+      // procurar no lugar errado.
+      throw new MetaApiError(
+        null,
+        'As credenciais desta instância não puderam ser decifradas com a SECRETS_ENCRYPTION_KEY ' +
+          'atual. Restaure a chave usada para gravá-las ou recadastre o token da Meta.',
+        400,
+      );
+    }
     if (!instance.token) {
       throw new MetaApiError(null, 'Instância sem token configurado', 400);
     }

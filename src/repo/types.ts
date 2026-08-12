@@ -107,6 +107,14 @@ export interface Instance {
   waba_id: string | null;
   token: string | null;
   verify_token: string | null;
+  /**
+   * true quando os segredos gravados NÃO puderam ser decifrados com a
+   * SECRETS_ENCRYPTION_KEY atual (chave trocada ou perdida). Nesse caso
+   * `token`/`verify_token` vêm null e a instância continua listável — o painel
+   * mostra o aviso e o operador recadastra o token. Envio por ela falha com
+   * mensagem específica, nunca com "sem token" genérico.
+   */
+  secrets_unreadable?: boolean;
   active: boolean;
   connection_status: ConnectionStatus;
   created_at?: string;

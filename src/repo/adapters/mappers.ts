@@ -146,12 +146,43 @@ export function mapInstance(r: Row): Instance {
     waba_id: strOrNull(r.waba_id),
     // Segredos: decifrados AQUI, na fronteira do adapter. O resto do sistema
     // (rotas, domínio, worker) só vê texto claro e não sabe que há cifra.
-    token: openSecret(r.token),
-    verify_token: openSecret(r.verify_token),
+    //
+    // SE NÃO DER PARA DECIFRAR (chave trocada/perdida), o campo vira null e a
+    // instância sai marcada com secrets_unreadable — em vez de a exceção subir
+    // e derrubar a listagem inteira.
+    //
+    // POR QUE: quase toda leitura de instância NÃO precisa do segredo — a
+    // listagem do painel mascara o token antes de responder. Deixar o
+    // openSecret explodir aqui transformava "uma credencial ilegível" em
+    // "painel inteiro fora do ar", inclusive para as instâncias saudáveis, e
+    // ainda por cima com um 500 opaco. A falha continua ALTA (log explícito +
+    // flag propagada + erro específico na hora de ENVIAR), só deixou de ser
+    // fatal para quem só queria ver a lista.
+    ...decodeSecrets(r),
     active: toBool(r.active),
     connection_status: r.connection_status as Instance['connection_status'],
     created_at: strOrNull(r.created_at) ?? undefined,
   };
+}
+
+/** Decifra token/verify_token tolerando chave errada — nunca em silêncio. */
+function decodeSecrets(r: Row): Pick<Instance, 'token' | 'verify_token' | 'secrets_unreadable'> {
+  try {
+    return {
+      token: openSecret(r.token),
+      verify_token: openSecret(r.verify_token),
+      secrets_unreadable: false,
+    };
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(
+      `[segredos] instância ${String(r.id)} ("${String(r.name)}"): não foi possível decifrar as ` +
+        'credenciais com a SECRETS_ENCRYPTION_KEY atual. A instância aparece no painel marcada ' +
+        'como ilegível; envios por ela vão falhar até o token ser recadastrado ou a chave certa ' +
+        `ser restaurada. Detalhe: ${(err as Error).message}`,
+    );
+    return { token: null, verify_token: null, secrets_unreadable: true };
+  }
 }
 
 export function mapContact(r: Row): Contact {

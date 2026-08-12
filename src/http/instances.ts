@@ -31,6 +31,10 @@ export function maskInstance(i: Instance) {
     verify_token: maskSecret(i.verify_token),
     has_token: !!i.token,
     has_verify_token: !!i.verify_token,
+    // Credenciais gravadas que não decifram com a chave atual. A UI avisa e
+    // oferece o recadastro — em vez de o operador ver a instância "sem token"
+    // e não entender por quê.
+    secrets_unreadable: i.secrets_unreadable === true,
   };
 }
 

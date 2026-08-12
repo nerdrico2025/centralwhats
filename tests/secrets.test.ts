@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import request from 'supertest';
 import { createSqliteAdapter } from '../src/repo/adapters/SqliteAdapter';
+import { createApp } from '../src/http/app';
 import { resetEnvCache } from '../src/config';
 import {
   isEncrypted,
@@ -109,15 +111,19 @@ describe('repo.* cifra na fronteira do adapter', () => {
     expect((await repo.instances.list('org_default'))[0].verify_token).toBe('verificacao');
   });
 
-  it('o que ESTÁ no banco é cifrado: outra chave torna a leitura um erro', async () => {
+  it('o que ESTÁ no banco é cifrado: outra chave não devolve o segredo', async () => {
     const inst = await repo.instances.create({
       org_id: 'org_default',
       name: 'Loja', provider_type: 'meta', phone_number_id: '111', waba_id: null,
       token: 'EAAG-token', verify_token: null, active: true, connection_status: 'connected',
     });
-    // Se estivesse em texto claro, a leitura com outra chave funcionaria.
+    // Se estivesse em texto claro, a leitura com outra chave devolveria o valor.
     usarChave(OUTRA_CHAVE);
-    await expect(repo.instances.getById(inst.id)).rejects.toThrow(SecretDecryptError);
+    const lido = await repo.instances.getById(inst.id);
+    // A instância CONTINUA legível como registro (senão o painel cai inteiro),
+    // mas o segredo não vaza e a marcação é explícita.
+    expect(lido?.token).toBeNull();
+    expect(lido?.secrets_unreadable).toBe(true);
   });
 
   it('update também cifra (token trocado não volta em claro para o banco)', async () => {
@@ -130,7 +136,9 @@ describe('repo.* cifra na fronteira do adapter', () => {
     expect((await repo.instances.getById(inst.id))?.token).toBe('novo-token');
 
     usarChave(OUTRA_CHAVE);
-    await expect(repo.instances.getById(inst.id)).rejects.toThrow(SecretDecryptError);
+    const lido = await repo.instances.getById(inst.id);
+    expect(lido?.token).toBeNull();
+    expect(lido?.secrets_unreadable).toBe(true);
   });
 
   it('sessão do Baileys é cifrada e volta idêntica (Buffers preservados)', async () => {
@@ -204,9 +212,13 @@ describe('backfill de criptografia (npm run encrypt-secrets)', () => {
     });
     usarChave(CHAVE);
     await repo.maintenance.backfillSecretEncryption();
+    expect((await repo.instances.getById(inst.id))?.token).toBe('token-em-claro');
 
+    // Com a chave errada o segredo não sai — mas o registro segue listável.
     usarChave(OUTRA_CHAVE);
-    await expect(repo.instances.getById(inst.id)).rejects.toThrow(SecretDecryptError);
+    const lido = await repo.instances.getById(inst.id);
+    expect(lido?.token).toBeNull();
+    expect(lido?.secrets_unreadable).toBe(true);
   });
 
   it('instância sem segredo nenhum não conta nada (nem cifra string vazia)', async () => {
@@ -222,5 +234,113 @@ describe('backfill de criptografia (npm run encrypt-secrets)', () => {
       baileysAuthValues: 0,
       skipped: 0,
     });
+  });
+});
+
+describe('chave trocada NÃO pode derrubar o painel (regressão de produção)', () => {
+  /**
+   * Bug real: com os segredos cifrados por uma chave e o processo web rodando
+   * com outra, `GET /api/instances` respondia 500 "Erro interno do servidor" —
+   * o painel inteiro ficava inutilizável, inclusive o formulário que permitiria
+   * recadastrar o token. E a listagem nem usa o token: ela MASCARA o valor.
+   *
+   * Regra: listar continua funcionando (com aviso explícito); ENVIAR falha com
+   * mensagem específica.
+   */
+  let repo: Repo;
+  let app: ReturnType<typeof createApp>;
+
+  beforeEach(async () => {
+    usarChave(CHAVE);
+    repo = createSqliteAdapter({ path: ':memory:' });
+    await repo.migrate();
+    app = createApp(repo);
+    await repo.instances.create({
+      org_id: 'org_default',
+      name: 'Jean API', provider_type: 'meta', phone_number_id: '109999888777', waba_id: null,
+      token: 'EAAG-token', verify_token: 'verify', active: true, connection_status: 'connected',
+    });
+  });
+
+  afterEach(() => {
+    delete process.env.PUBLIC_SIGNUP;
+    resetEnvCache();
+  });
+
+  /** Registra o primeiro owner (adota a org_default) e devolve o token. */
+  async function logar(): Promise<string> {
+    const reg = await request(app)
+      .post('/api/auth/register')
+      .send({ org_name: 'Agência', email: 'rafael@x.com', password: 'senha-de-teste-1' })
+      .expect(201);
+    expect(reg.body.adopted_default_org).toBe(true);
+    const login = await request(app)
+      .post('/api/auth/login')
+      .send({ email: 'rafael@x.com', password: 'senha-de-teste-1' })
+      .expect(200);
+    return login.body.token as string;
+  }
+
+  it('CAMINHO FELIZ: usuário loga e vê a instância da própria org', async () => {
+    const token = await logar();
+    const res = await request(app)
+      .get('/api/instances')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+    expect(res.body.map((i: { name: string }) => i.name)).toEqual(['Jean API']);
+    expect(res.body[0].has_token).toBe(true);
+    expect(res.body[0].secrets_unreadable).toBe(false);
+    expect(res.body[0].token).not.toContain('EAAG'); // segue mascarado
+  });
+
+  it('com a chave TROCADA, a listagem responde 200 e marca a instância', async () => {
+    const token = await logar();
+    usarChave(OUTRA_CHAVE);
+
+    const res = await request(app)
+      .get('/api/instances')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200); // <- era 500
+    expect(res.body).toHaveLength(1);
+    expect(res.body[0].secrets_unreadable).toBe(true);
+    expect(res.body[0].has_token).toBe(false);
+  });
+
+  it('ENVIAR por instância ilegível falha com mensagem específica (não "sem token")', async () => {
+    const token = await logar();
+    usarChave(OUTRA_CHAVE);
+    const lista = await request(app)
+      .get('/api/instances')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+
+    const res = await request(app)
+      .post(`/api/instances/${lista.body[0].id}/messages`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ type: 'text', to: '5511999998888', text: 'oi' });
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(JSON.stringify(res.body)).toMatch(/SECRETS_ENCRYPTION_KEY/);
+  });
+
+  it('recadastrar o token pelo painel recupera a instância', async () => {
+    const token = await logar();
+    usarChave(OUTRA_CHAVE);
+    const lista = await request(app)
+      .get('/api/instances')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+
+    await request(app)
+      .patch(`/api/instances/${lista.body[0].id}`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ token: 'EAAG-token-novo', verify_token: 'verify-novo' })
+      .expect(200);
+
+    const depois = await request(app)
+      .get('/api/instances')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+    expect(depois.body[0].secrets_unreadable).toBe(false);
+    expect(depois.body[0].has_token).toBe(true);
   });
 });
