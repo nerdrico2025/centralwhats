@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import fs from 'node:fs';
-import path from 'node:path';
+import { loadApp as carregarApp, type FetchImpl } from './helpers/appSandbox';
 
 /**
  * REGRESSÃO — "a tela de login some a cada poucos segundos, em loop".
@@ -20,121 +19,9 @@ import path from 'node:path';
  * pegar o comportamento e não a intenção.
  */
 
-// ---------------------------------------------------------------- DOM mínimo
-class FakeEl {
-  children: FakeEl[] = [];
-  attrs: Record<string, string> = {};
-  listeners: Record<string, ((ev: unknown) => void)[]> = {};
-  className = '';
-  id = '';
-  value = '';
-  textContent = '';
-  style: Record<string, string> = {};
-  constructor(readonly tag: string) {}
-
-  set innerHTML(v: string) {
-    if (v === '') this.children = [];
-  }
-  get innerHTML(): string {
-    return '';
-  }
-  appendChild(c: FakeEl): FakeEl {
-    this.children.push(c);
-    return c;
-  }
-  addEventListener(ev: string, fn: (e: unknown) => void): void {
-    (this.listeners[ev] ||= []).push(fn);
-  }
-  setAttribute(k: string, v: string): void {
-    this.attrs[k] = v;
-  }
-  select(): void {}
-  replaceWith(): void {}
-
-  /** Percorre a árvore procurando um input pelo placeholder. */
-  find(placeholder: string): FakeEl | null {
-    if (this.attrs.placeholder === placeholder) return this;
-    for (const c of this.children) {
-      const hit = c.find(placeholder);
-      if (hit) return hit;
-    }
-    return null;
-  }
-}
-
-interface Sandbox {
-  api: { raw: (m: string, p: string, b?: unknown) => Promise<unknown>; get: (p: string) => Promise<unknown> };
-  registerCleanup: (fn: () => void) => void;
-  renderLoginScreen: () => void;
-  appEl: FakeEl;
-  fetchCalls: string[];
-}
-
-/**
- * Carrega o app.js real num sandbox com DOM/fetch falsos. O `boot()` final é
- * removido — ele dispara requests de verdade e monta o painel inteiro.
- */
-function loadApp(fetchImpl: (url: string) => Promise<{ status: number; ok: boolean; json: () => Promise<unknown> }>): Sandbox {
-  const source = fs.readFileSync(path.join(process.cwd(), 'src', 'web', 'app.js'), 'utf8');
-  const semBoot = source.replace(/\nboot\(\);\s*$/, '\n');
-  expect(semBoot).not.toBe(source); // se o boot() sumir/renomear, o teste avisa
-
-  const appEl = new FakeEl('div');
-  appEl.id = 'app';
-  const fetchCalls: string[] = [];
-
-  const store: Record<string, string> = {};
-  const localStorage = {
-    getItem: (k: string) => store[k] ?? null,
-    setItem: (k: string, v: string) => {
-      store[k] = v;
-    },
-    removeItem: (k: string) => {
-      delete store[k];
-    },
-  };
-
-  const doc = {
-    getElementById: (id: string) => (id === 'app' ? appEl : new FakeEl('div')),
-    createElement: (tag: string) => new FakeEl(tag),
-    createTextNode: (t: string) => {
-      const el = new FakeEl('#text');
-      el.textContent = t;
-      return el;
-    },
-  };
-
-  const fn = new Function(
-    'document',
-    'localStorage',
-    'fetch',
-    'location',
-    'history',
-    'window',
-    'navigator',
-    'alert',
-    'console',
-    `${semBoot}\n; return { api, registerCleanup, renderLoginScreen };`,
-  );
-
-  const wrappedFetch = (url: string) => {
-    fetchCalls.push(url);
-    return fetchImpl(url);
-  };
-
-  const exported = fn(
-    doc,
-    localStorage,
-    wrappedFetch,
-    { pathname: '/', origin: 'http://localhost', reload: () => {}, href: '' },
-    { pushState: () => {} },
-    { addEventListener: () => {} },
-    { clipboard: null },
-    () => {},
-    { error: () => {}, log: () => {}, warn: () => {} },
-  ) as Omit<Sandbox, 'appEl' | 'fetchCalls'>;
-
-  return { ...exported, appEl, fetchCalls };
+/** Harness compartilhado (tests/helpers/appSandbox), com o que este arquivo usa. */
+function loadApp(fetchImpl: FetchImpl) {
+  return carregarApp({ fetchImpl, expose: ['api', 'registerCleanup', 'renderLoginScreen'] });
 }
 
 /** Resposta 401 — o sistema trancou (primeiro owner criado / sessão revogada). */
@@ -245,7 +132,7 @@ describe('tela de login não pode ser remontada em loop', () => {
 
     // O rodapé precisa ter sido atualizado (senão o teste passaria por não ter
     // acontecido nada ainda, em vez de por o formulário ter sido preservado).
-    expect(sandbox.fetchCalls).toContain('/api/auth/registration-status');
+    expect(sandbox.fetchCalls.map((c) => c.url)).toContain('/api/auth/registration-status');
     expect(sandbox.appEl.find('E-mail')!.value).toBe('rafael@clickhero.com.br');
   });
 

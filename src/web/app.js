@@ -435,32 +435,29 @@ function livechatScreen() {
     }
   }
 
-  function renderConversation(msgs, error) {
+  // === Conversa aberta: nós ESTÁVEIS ===
+  //
+  // O composer NUNCA é recriado enquanto a conversa aberta é a mesma. Antes,
+  // renderConversation() fazia `rightEl.innerHTML = ''` e remontava a árvore
+  // inteira — inclusive um <textarea> novo. Como o polling de 4s chama
+  // loadMessages(), cada tick apagava o que estava sendo digitado e roubava o
+  // foco. É o mesmo defeito do bug da tela de login (90a1dbc): trabalho
+  // periódico redesenhando por cima da entrada do usuário.
+  //
+  // O padrão aqui é o mesmo do resto do painel (listCard/sideCard/convitesCard):
+  // containers fixos, preenchidos de novo — em vez de recriar a árvore.
+  let aberta = null; // { phone, nomeEl, msgsEl, input }
+
+  /** Monta a casca da conversa. Só quando a conversa muda DE VERDADE. */
+  function montarConversa() {
     const conv = convs.find((c) => c.phone === selected);
+    const nomeEl = h('strong', {}, (conv && conv.name) || selected);
     const header = h('div', { class: 'conversation__header' }, [
-      h('strong', {}, (conv && conv.name) || selected),
+      nomeEl,
       ' ',
       h('span', { class: 'muted' }, selected),
     ]);
-    if (error) {
-      rightEl.innerHTML = '';
-      rightEl.appendChild(
-        h('div', { class: 'conversation' }, [
-          header,
-          h('div', { class: 'placeholder placeholder--error' }, [
-            h('strong', {}, 'Não foi possível carregar o histórico.'),
-            h('div', { class: 'muted' }, error),
-          ]),
-        ]),
-      );
-      return;
-    }
-    const msgsEl = h('div', { class: 'conversation__messages' }, msgs.map((mm) =>
-      h('div', { class: 'bubble bubble--' + (mm.direction === 'in' ? 'in' : 'out') }, [
-        h('div', {}, messageText(mm.type, mm.content)),
-        h('div', { class: 'bubble__time' }, formatTime(mm.created_at)),
-      ]),
-    ));
+    const msgsEl = h('div', { class: 'conversation__messages' });
     const input = h('textarea', {
       class: 'composer__input',
       rows: '1',
@@ -479,11 +476,56 @@ function livechatScreen() {
 
     rightEl.innerHTML = '';
     rightEl.appendChild(h('div', { class: 'conversation' }, [header, msgsEl, composer]));
-    msgsEl.scrollTop = msgsEl.scrollHeight; // rola pro fim
+    aberta = { phone: selected, nomeEl, msgsEl, input };
+  }
+
+  /** Garante a casca da conversa atual sem tocar no composer se já é a mesma. */
+  function garantirConversa() {
+    if (!aberta || aberta.phone !== selected) montarConversa();
+  }
+
+  /**
+   * Atualiza SÓ a lista de mensagens (o único dado que muda a cada tick).
+   * Nunca toca no composer — nem no erro: a falha aparece na área das
+   * mensagens, e o texto digitado continua onde estava.
+   */
+  function renderMensagens(msgs, error) {
+    if (!aberta) return;
+    const { msgsEl } = aberta;
+
+    const conv = convs.find((c) => c.phone === selected);
+    aberta.nomeEl.textContent = (conv && conv.name) || selected;
+
+    // Só rola pro fim se o usuário JÁ estava no fim — senão o polling puxaria
+    // a rolagem no meio da leitura do histórico.
+    const distanciaDoFim =
+      Number(msgsEl.scrollHeight || 0) - Number(msgsEl.scrollTop || 0) - Number(msgsEl.clientHeight || 0);
+    const estavaNoFim = !(distanciaDoFim > 40);
+
+    msgsEl.innerHTML = '';
+    if (error) {
+      msgsEl.appendChild(
+        h('div', { class: 'placeholder placeholder--error' }, [
+          h('strong', {}, 'Não foi possível carregar o histórico.'),
+          h('div', { class: 'muted' }, error),
+        ]),
+      );
+      return;
+    }
+    for (const mm of msgs) {
+      msgsEl.appendChild(
+        h('div', { class: 'bubble bubble--' + (mm.direction === 'in' ? 'in' : 'out') }, [
+          h('div', {}, messageText(mm.type, mm.content)),
+          h('div', { class: 'bubble__time' }, formatTime(mm.created_at)),
+        ]),
+      );
+    }
+    if (estavaNoFim) msgsEl.scrollTop = msgsEl.scrollHeight;
   }
 
   async function loadMessages() {
     if (!selected) return;
+    garantirConversa();
     let msgs = [];
     try {
       msgs = await api.get(
@@ -491,10 +533,10 @@ function livechatScreen() {
       );
     } catch (e) {
       console.error('[livechat] falha ao carregar mensagens:', e);
-      renderConversation([], e.message);
+      renderMensagens([], e.message);
       return;
     }
-    renderConversation(msgs.slice().reverse()); // repo retorna DESC; exibe ASC
+    renderMensagens(msgs.slice().reverse()); // repo retorna DESC; exibe ASC
   }
 
   async function selectConversation(phone) {
