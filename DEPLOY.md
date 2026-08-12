@@ -28,13 +28,19 @@ Mobile**. Cada seção termina com um teste de fumaça.
 ## 1. Supabase (Postgres)
 
 1. Crie um projeto em [supabase.com](https://supabase.com) (região próxima, ex.: `sa-east-1`).
-2. Em **Settings → Database**, anote as DUAS connection strings:
+2. Em **Settings → Database** (ou **Connect**), anote as TRÊS connection strings:
    - **Transaction pooler (porta 6543)** → usada pela Vercel (serverless abre
      muitas conexões curtas; o pooler evita esgotar o Postgres). Acrescente
-     `?pgbouncer=true` se não vier.
-   - **Direct (porta 5432)** → usada para migrations e pelo worker (conexão
-     longa única).
-3. Rode as migrations **da sua máquina**, apontando para a conexão direta:
+     `?pgbouncer=true` se não vier. **Não** serve para o worker: conexões longas
+     não sobrevivem ao modo transaction.
+   - **Session pooler (porta 5432, host `*.pooler.supabase.com`)** → usada pelo
+     **worker no Railway** (conexão longa única, e resolve em IPv4). É a
+     recomendação primária lá — ver §4.
+   - **Direct (porta 5432, host `db.*.supabase.co`)** → migrations rodadas da
+     sua máquina. Serve também para o worker **só** em ambiente com saída IPv6
+     confirmada — não é o caso do Railway.
+3. Rode as migrations **da sua máquina**, apontando para a conexão direta (ou
+   para o session pooler, se sua rede não tiver IPv6):
 
 ```bash
 DB_DRIVER=postgres DATABASE_URL='postgres://postgres:SENHA@db.xxxx.supabase.co:5432/postgres' \
@@ -50,9 +56,10 @@ Se aparecer `sqlite` aqui, a env não chegou ao processo — o script agora
 aborta com erro em vez de migrar o banco errado.
 
 > **Rede sem IPv6?** A conexão direta `db.xxxx.supabase.co` é IPv6-only em
-> muitos planos. Se der `ENETUNREACH`/timeout, use a string do **Session
-> pooler** (Settings → Database → em "Connection string", modo *Session*, host
-> `aws-0-<região>.pooler.supabase.com:5432`) — serve para migrations e worker.
+> muitos planos — foi exatamente isso que derrubou o worker no Railway. Se der
+> `ENETUNREACH`/timeout, use a string do **Session pooler** (Connect → *Session
+> pooler*, host `aws-1-<região>.pooler.supabase.com:5432`) — serve para
+> migrations e é o padrão do worker (§4).
 
 4. *(Recomendado — valida o PostgresAdapter de verdade)* rode a suíte contra o
    Postgres uma vez:
@@ -207,6 +214,11 @@ curl https://SEU-APP.vercel.app/health          # {"ok":true,...}
 
 O worker é um processo sempre-ligado que compartilha o MESMO Postgres.
 
+**Pré-requisito (já resolvido no repositório):** a versão de Node está fixada em
+**22.x** via `.nvmrc` e `engines.node`, e o Nixpacks do Railway lê esses arquivos
+sozinho — não há nada a configurar no painel. Só defina
+`NIXPACKS_NODE_VERSION=22` se o log do build insistir noutra versão (§6.1).
+
 1. Em [railway.app](https://railway.app): New Project → **Deploy from GitHub
    repo** (o mesmo repositório).
 2. Em **Settings** do serviço:
@@ -218,8 +230,16 @@ O worker é um processo sempre-ligado que compartilha o MESMO Postgres.
 |---|---|
 | `NODE_ENV` | `production` |
 | `DB_DRIVER` | `postgres` |
-| `DATABASE_URL` | connection **direta (5432)** — o worker mantém 1 conexão viva |
+| `DATABASE_URL` | **session pooler (5432)** — host `*.pooler.supabase.com`, IPv4. A connection **direta** pode falhar no Railway: ela resolve para um endereço IPv6-only e o Railway não tem saída IPv6. **Não** use o *transaction pooler* (6543) aqui — ele não é seguro para as conexões longas do worker |
 | `JWT_SECRET` / `SECRETS_ENCRYPTION_KEY` | os mesmos da Vercel |
+
+> **Erro comum:** `ENETUNREACH` num endereço IPv6 ao conectar no Postgres.
+> **Causa:** a `DATABASE_URL` é a "Direct connection" do Supabase, que resolve
+> para IPv6-only — e o Railway não tem saída IPv6.
+> **Correção:** use a connection string do **Session pooler** do Supabase
+> (Connect → *Session pooler*, host tipo
+> `aws-1-us-east-2.pooler.supabase.com:5432`), não a "Direct connection" nem o
+> "Transaction pooler" (6543).
 
 4. Deploy. O log deve mostrar `[worker] Baileys worker rodando`.
 5. **Parear um número**: no painel → Instâncias → Nova instância → provider
@@ -284,7 +304,8 @@ requisito e é convergência.
 
 **Por que 22 e não a LTS mais nova (24):**
 - `node:sqlite`, usado pelo adapter de desenvolvimento, só existe a partir do
-  **Node 22.5**. Abaixo disso o processo nem carrega o módulo.
+  **Node 22.5**. Quem roda `DB_DRIVER=sqlite` (dev local e a suíte de testes)
+  exercita esse builtin de verdade — abaixo de 22.5 o adapter não abre o banco.
 - O Baileys pede `>=20` — coberto.
 - A Vercel oferece 24.x, 22.x e 20.x. O builder do Railway, pela evidência do
   log real (`Node.js v20.20.2` com `engines: ">=20"`), **não estava servindo
@@ -314,9 +335,23 @@ patches sozinhos; por isso o `.nvmrc` traz `22`, e não um patch exato — pinar
 `22.23.2` daria uma precisão falsa que nenhum dos dois honra, e ainda faria o
 local divergir dos servidores a cada patch de segurança.
 
-**Sintoma de que isto saiu do lugar:** `ERR_UNKNOWN_BUILTIN_MODULE: node:sqlite`
-no boot (Node < 22.5), ou comportamento que difere entre painel e worker sem
-explicação. O primeiro passo do diagnóstico é `node -v` nos dois ambientes.
+**O `node:sqlite` é resolvido sob demanda** (dentro de `createSqliteAdapter()`,
+não no escopo do módulo — `src/repo/adapters/SqliteAdapter.ts`). Foi essa
+mudança que separou "importar o arquivo" de "precisar do builtin": o factory de
+`repo.*` importa os dois adapters, então enquanto a resolução morava no topo do
+módulo bastava carregar o arquivo para o processo morrer em Node < 22.5. Era o
+crash de boot do worker no Railway (`ERR_UNKNOWN_BUILTIN_MODULE: node:sqlite`
+com `DB_DRIVER=postgres`), corrigido em `7523f00`.
+
+**Consequência prática:** rodando com `DB_DRIVER=postgres` — o caso do worker em
+produção — o `SqliteAdapter` nunca é carregado e esse crash não deve mais
+aparecer, qualquer que seja a versão de Node. O pinning em 22.x continua valendo
+por consistência entre os três ambientes (e porque `DB_DRIVER=sqlite` ainda
+precisa dele), não como remendo desse bug.
+
+**Sintoma de que a versão saiu do lugar:** erro de `node:sqlite` ao rodar local
+ou os testes (Node < 22.5), ou comportamento que difere entre painel e worker
+sem explicação. O primeiro passo do diagnóstico é `node -v` nos dois ambientes.
 
 ---
 
@@ -335,7 +370,8 @@ DB_DRIVER=postgres DATABASE_URL='postgres://...:5432/postgres' npm run audit-ins
 ```
 
 **2. Migrations** (`010` org_members + campos de `users`, `011` invites,
-`012` NOT NULL/FK). Use a connection **direta (5432)**:
+`012` NOT NULL/FK). Rode **da sua máquina**, pela connection **direta (5432)**
+— ou pelo session pooler, se sua rede não tiver IPv6 (§1):
 
 ```bash
 DB_DRIVER=postgres DATABASE_URL='postgres://...:5432/postgres' npm run migrate
@@ -396,6 +432,7 @@ conta "já cifradas"). Depois, confira o painel (envio funcionando) e o worker
 | Template rejeitado em silêncio | Idioma errado — use SEMPRE o sincronizado (o painel já força isso) |
 | `429/131056` em campanha | Rate-limit da Meta — o motor já retenta sozinho; aumente `interval_ms` |
 | Vercel: `too many connections` no Postgres | `DATABASE_URL` sem pooler — use a porta **6543** na Vercel |
+| Worker (Railway): `ENETUNREACH` num IPv6 ao conectar no Postgres | `DATABASE_URL` é a conexão direta, que é IPv6-only, e o Railway não tem saída IPv6 — troque para o **session pooler** (5432). Detalhes na nota da §4 |
 | Worker desconecta e não volta | Veja o log: `statusCode 401` = logout no celular (re-parear via QR); outros códigos reconectam com backoff |
 | Painel abre sem pedir login | Modo bootstrap: nenhum usuário criado ainda — crie a primeira conta |
 | Depois de criar a conta, o painel não mostra as instâncias antigas | A conta nasceu numa org nova em vez de adotar a `org_default`. Rode `npm run create-owner -- --email=... --password=... --org=org_default` e entre com esse usuário |
