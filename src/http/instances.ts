@@ -39,7 +39,7 @@ export function maskInstance(i: Instance) {
 }
 
 const providerTypeSchema = z.enum(['meta', 'baileys']);
-const connectionStatusSchema = z.enum(['connected', 'disconnected', 'pending']);
+const connectionStatusSchema = z.enum(['connected', 'connecting', 'disconnected', 'pending']);
 
 const createSchema = z.object({
   name: z.string().min(1, 'name é obrigatório'),

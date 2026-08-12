@@ -263,6 +263,79 @@ describe('worker — QR, status e reconexão', () => {
     await worker.stop();
   });
 
+  it('scan → isNewLogin → close 515 → open: o meio é "connecting", nunca "disconnected"', async () => {
+    let connects = 0;
+    const worker = new BaileysWorker(repo, {
+      socketFactory: async () => {
+        connects++;
+        return makeFakeSocket().socket;
+      },
+      maxReconnectDelayMs: 1,
+    });
+    await worker.connectInstance(inst);
+
+    // 1. QR na tela, esperando o scan.
+    await worker.handleConnectionUpdate(inst, { qr: 'QR-PRA-ESCANEAR' });
+    expect((await repo.instances.getById(inst.id))?.connection_status).toBe('pending');
+
+    // 2. Scan aceito: o WhatsApp confirma o pareamento (QR já não serve).
+    await worker.handleConnectionUpdate(inst, { isNewLogin: true });
+    expect((await repo.instances.getById(inst.id))?.connection_status).toBe('connecting');
+    expect(await repo.baileysAuth.get(inst.id, 'qr')).toBeNull();
+
+    // 3. 515: reinício MANDADO pelo WhatsApp — etapa do sucesso, não queda.
+    await worker.handleConnectionUpdate(inst, {
+      connection: 'close',
+      lastDisconnect: { error: { message: 'Restart Required', output: { statusCode: 515 } } },
+    });
+    expect((await repo.instances.getById(inst.id))?.connection_status).toBe('connecting');
+
+    // 4. Reconecta e abre.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(connects).toBe(2);
+    await worker.handleConnectionUpdate(inst, { connection: 'open' });
+    expect((await repo.instances.getById(inst.id))?.connection_status).toBe('connected');
+    await worker.stop();
+  });
+
+  it('515 zera o backoff acumulado; falha real continua escalando', async () => {
+    const atrasos: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = ((cb: () => void, ms?: number) => {
+      atrasos.push(ms ?? 0);
+      return realSetTimeout(cb, 1);
+    }) as typeof globalThis.setTimeout;
+    globalThis.setTimeout = spy;
+    try {
+      const worker = new BaileysWorker(repo, { socketFactory: async () => makeFakeSocket().socket });
+      await worker.connectInstance(inst);
+
+      // Duas quedas reais: backoff escala (1s, 2s).
+      const queda = {
+        connection: 'close',
+        lastDisconnect: { error: { message: 'Connection Lost', output: { statusCode: 428 } } },
+      };
+      await worker.handleConnectionUpdate(inst, queda);
+      await worker.handleConnectionUpdate(inst, queda);
+      expect(atrasos).toEqual([1000, 2000]);
+
+      // O 515 chega DEPOIS: zera o acumulado e volta pro mínimo (1s), em vez
+      // de esperar 4s logo após um scan bem-sucedido.
+      await worker.handleConnectionUpdate(inst, {
+        connection: 'close',
+        lastDisconnect: { error: { message: 'Restart Required', output: { statusCode: 515 } } },
+      });
+      expect(atrasos).toEqual([1000, 2000, 1000]);
+
+      // E uma falha real seguinte volta a escalar normalmente.
+      await worker.handleConnectionUpdate(inst, queda);
+      expect(atrasos).toEqual([1000, 2000, 1000, 2000]);
+      await worker.stop();
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
+  });
+
   it('describeDisconnect extrai statusCode/reason do Boom (não o texto genérico)', () => {
     expect(
       describeDisconnect({

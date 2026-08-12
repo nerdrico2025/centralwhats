@@ -2696,6 +2696,21 @@ function templatesScreen() {
 }
 
 // ------------------------------------------------------ Instâncias (P6.2/V2)
+
+// Status de conexão em português. `connecting` é o intervalo entre o QR ser
+// aceito e a conexão voltar (o WhatsApp manda reiniciar depois do pareamento);
+// sem rótulo próprio o painel dizia "disconnected" logo após um scan que deu
+// certo — ver 03_MULTITENANCY_E_V2.md §3.4.
+var STATUS_CONEXAO = {
+  connected: { label: 'Conectado', badge: 'badge--ok' },
+  connecting: { label: 'Conectando…', badge: 'badge--info' },
+  pending: { label: 'Aguardando leitura', badge: 'badge--warn' },
+  disconnected: { label: 'Desconectado', badge: 'badge--off' },
+};
+function statusConexao(status) {
+  return STATUS_CONEXAO[status] || { label: status || '—', badge: 'badge--off' };
+}
+
 function instanciasScreen() {
   const listCard = h('div', { class: 'card' });
   const sideCard = h('div', { class: 'card' });
@@ -2751,9 +2766,8 @@ function instanciasScreen() {
             ]),
             h('td', {}, i.provider_type === 'baileys' ? 'Baileys' : 'Meta'),
             h('td', {}, [h('span', {
-              class: 'badge ' + (i.connection_status === 'connected' ? 'badge--ok'
-                : i.connection_status === 'pending' ? 'badge--warn' : 'badge--off'),
-            }, i.connection_status)]),
+              class: 'badge ' + statusConexao(i.connection_status).badge,
+            }, statusConexao(i.connection_status).label)]),
             h('td', { style: 'white-space:nowrap' }, [
               h('button', { class: 'btn', style: 'padding:3px 8px', onclick: () => { editing = i; renderForm(); } }, 'Editar'),
               ' ',
@@ -2799,12 +2813,20 @@ function instanciasScreen() {
     async function poll() {
       try {
         const info = await api.get('/api/instances/' + inst.id + '/qr');
-        status.textContent = 'Status: ' + info.connection_status;
+        status.textContent = statusConexao(info.connection_status).label;
         if (info.connection_status === 'connected') {
           qrBox.innerHTML = '';
           qrBox.appendChild(h('div', { class: 'placeholder__emoji' }, '✅'));
           stopQr();
           loadList();
+          return;
+        }
+        if (info.connection_status === 'connecting') {
+          // QR aceito: ele já foi apagado no banco e não serve mais. Mostra o
+          // carregando em vez de deixar um QR morto na tela.
+          status.textContent = 'QR aceito, conectando…';
+          qrBox.innerHTML = '';
+          qrBox.appendChild(h('div', { class: 'spinner' }));
           return;
         }
         if (info.qr) {

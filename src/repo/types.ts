@@ -5,7 +5,12 @@
  */
 
 export type ProviderType = 'meta' | 'baileys';
-export type ConnectionStatus = 'connected' | 'disconnected' | 'pending';
+/**
+ * `pending` = QR na tela, esperando o scan. `connecting` = QR ACEITO, o
+ * pareamento foi confirmado e a conexão está sendo restabelecida (transitório).
+ * Coluna é TEXT sem CHECK nos dois bancos — valor novo não pede migration.
+ */
+export type ConnectionStatus = 'connected' | 'connecting' | 'disconnected' | 'pending';
 
 export type MessageDirection = 'in' | 'out';
 export type MessageStatus =

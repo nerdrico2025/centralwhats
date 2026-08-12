@@ -107,6 +107,22 @@ export function shouldReconnect(lastDisconnect: unknown): boolean {
 }
 
 /**
+ * 515 (`DisconnectReason.restartRequired`): logo após um pareamento bem
+ * sucedido o WhatsApp MANDA reiniciar a conexão. É etapa do sucesso, não
+ * queda — tratar como falha faz o painel exibir "desconectado" no instante
+ * seguinte a um scan que deu certo.
+ */
+const RESTART_REQUIRED = 515;
+
+/** O close é o reinício esperado do pós-pareamento? */
+export function isRestartRequired(lastDisconnect: unknown): boolean {
+  return (
+    (lastDisconnect as { error?: { output?: { statusCode?: number } } } | undefined)?.error?.output
+      ?.statusCode === RESTART_REQUIRED
+  );
+}
+
+/**
  * Extrai a CAUSA REAL de um fechamento de conexão.
  *
  * POR QUÊ: o Baileys só loga "connection errored" (genérico) — o motivo mora
@@ -286,6 +302,7 @@ export class BaileysWorker {
     socket.ev.on('connection.update', ((update: {
       qr?: string;
       connection?: string;
+      isNewLogin?: boolean;
       lastDisconnect?: unknown;
     }) => {
       void this.handleConnectionUpdate(instance, update).catch((err) => {
@@ -307,11 +324,23 @@ export class BaileysWorker {
   /** QR/conexão: reflete em connection_status e persiste o QR pro painel. */
   async handleConnectionUpdate(
     instance: Instance,
-    update: { qr?: string; connection?: string; lastDisconnect?: unknown },
+    update: {
+      qr?: string;
+      connection?: string;
+      isNewLogin?: boolean;
+      lastDisconnect?: unknown;
+    },
   ): Promise<void> {
     if (update.qr) {
       await this.repo.baileysAuth.set(instance.id, 'qr', update.qr);
       await this.repo.instances.update(instance.id, { connection_status: 'pending' });
+    }
+    if (update.isNewLogin) {
+      // "QR aceito": o pareamento foi confirmado, mas ainda falta o reinício
+      // (515) + novo handshake até o 'open'. Sem este estado o painel fica
+      // ~5-8s dizendo "desconectado" logo depois de um scan que deu certo.
+      await this.repo.baileysAuth.delete(instance.id, 'qr');
+      await this.repo.instances.update(instance.id, { connection_status: 'connecting' });
     }
     if (update.connection === 'open') {
       await this.repo.baileysAuth.delete(instance.id, 'qr');
@@ -320,18 +349,28 @@ export class BaileysWorker {
     }
     if (update.connection === 'close') {
       const causa = describeDisconnect(update.lastDisconnect);
+      const reinicio = isRestartRequired(update.lastDisconnect);
       // eslint-disable-next-line no-console
       console.warn(
         `[worker] conexão fechada — instância=${instance.id} (${instance.name}) ` +
           `statusCode=${causa.statusCode ?? '-'} reason=${causa.reason ?? '-'} ` +
-          `message=${causa.message ?? '-'}`,
+          `message=${causa.message ?? '-'}` +
+          (reinicio ? ' (reinício esperado do pós-pareamento)' : ''),
       );
-      await this.repo.instances.update(instance.id, { connection_status: 'disconnected' });
+      await this.repo.instances.update(instance.id, {
+        connection_status: reinicio ? 'connecting' : 'disconnected',
+      });
       // O QR morre junto com o socket que o gerou (o `ref` é daquela conexão),
       // então NUNCA sobrevive a um close: mantê-lo faria o painel exibir um
       // código que jamais vai parear, sem nenhum indício de que está morto.
       await this.repo.baileysAuth.delete(instance.id, 'qr');
       this.sockets.delete(instance.id);
+      if (reinicio) {
+        // Reconexão de SUCESSO, não de falha: zera o backoff acumulado (QR que
+        // expirou antes do scan podia ter empurrado a espera para 8s, 16s…).
+        // Só aqui — falha real continua escalando como antes.
+        this.reconnectAttempts.set(instance.id, 0);
+      }
       if (!this.stopped && shouldReconnect(update.lastDisconnect)) {
         // Reconexão com backoff exponencial (1s, 2s, 4s... teto configurável).
         const attempt = (this.reconnectAttempts.get(instance.id) ?? 0) + 1;

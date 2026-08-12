@@ -465,6 +465,27 @@ body {
   background: #fef3c7;
   color: #92400e;
 }
+.badge--info {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+/* Carregando do pareamento: entre o QR ser aceito e a conexão voltar. CSS
+   puro de propósito — nenhuma dependência nova por causa de um spinner. */
+.spinner {
+  width: 40px;
+  height: 40px;
+  border: 4px solid #e2e8f0;
+  border-top-color: #25d366;
+  border-radius: 50%;
+  animation: spinner-gira 0.9s linear infinite;
+}
+@keyframes spinner-gira {
+  to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation-duration: 3s; }
+}
 .builder-warnings {
   background: #fef3c7;
   color: #92400e;
