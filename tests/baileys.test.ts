@@ -47,6 +47,7 @@ beforeEach(async () => {
   repo = createSqliteAdapter({ path: ':memory:' });
   await repo.migrate();
   inst = await repo.instances.create({
+    org_id: 'org_default',
     name: 'Zap', provider_type: 'baileys', phone_number_id: '5511000000000', waba_id: null,
     token: null, verify_token: null, active: true, connection_status: 'disconnected',
   });
@@ -289,6 +290,7 @@ describe('rotas de QR (painel)', () => {
 
   it('QR em instância Meta → 400', async () => {
     const meta = await repo.instances.create({
+    org_id: 'org_default',
       name: 'Meta', provider_type: 'meta', phone_number_id: '111', waba_id: null,
       token: 't', verify_token: 'v', active: true, connection_status: 'connected',
     });

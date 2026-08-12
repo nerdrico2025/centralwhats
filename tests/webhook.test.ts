@@ -46,6 +46,7 @@ beforeEach(async () => {
   repo = createSqliteAdapter({ path: ':memory:' });
   await repo.migrate();
   instance = await repo.instances.create({
+    org_id: 'org_default',
     name: 'Loja',
     provider_type: 'meta',
     phone_number_id: PNID,
@@ -159,7 +160,7 @@ describe('GET /webhook — verificação do desafio', () => {
       ...repo,
       instances: {
         ...repo.instances,
-        list: () => Promise.reject(boom),
+        listAll: () => Promise.reject(boom),
       },
     } as unknown as Repo;
 
@@ -216,7 +217,7 @@ describe('GET /webhook — motivo do 403 fica logado (nunca silencioso)', () => 
     // Reproduz a produção: tabela existe (sem erro de banco), porém vazia.
     const emptyRepo = {
       ...repo,
-      instances: { ...repo.instances, list: () => Promise.resolve([]) },
+      instances: { ...repo.instances, listAll: () => Promise.resolve([]) },
     } as unknown as Repo;
 
     const log = await get403(createApp(emptyRepo), VERIFY);

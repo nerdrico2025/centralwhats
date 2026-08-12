@@ -306,7 +306,7 @@ export interface CronSweepResult {
  * ar, ela usaria uma fatia mínima e o resto do orçamento seria jogado fora.
  * Cada rodada dá a cada campanha mais um lote até o orçamento total acabar.
  *
- * Escopo: `instances.list()` sem orgId devolve todas (uso interno, é o ponto
+ * Escopo: `instances.listAll()` sem orgId devolve todas (uso interno, é o ponto
  * do cron), mas cada tick continua escopado por instância — nenhuma operação
  * cruza instâncias.
  *
@@ -329,7 +329,7 @@ export async function processAllPendingCampaigns(
 
   let instances: Instance[];
   try {
-    instances = await repo.instances.list();
+    instances = await repo.instances.listAll();
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error('[cron] falha ao listar instâncias:', err);

@@ -3,6 +3,7 @@
  * Compartilhado pelos dois adapters porque ambos armazenam a mesma forma
  * portável: JSON como TEXT, booleanos como INTEGER (0/1), timestamps ISO.
  */
+import { openSecret } from '../../util/crypto';
 import type {
   Campaign,
   CampaignSend,
@@ -65,9 +66,59 @@ export function mapUser(r: Row): import('../types').User {
     id: str(r.id),
     org_id: str(r.org_id),
     email: str(r.email),
+    name: strOrNull(r.name),
     role: r.role as import('../types').UserRole,
+    // Linha anterior à migration 010 não tem status: 'active' é o legado.
+    status: (strOrNull(r.status) ?? 'active') as import('../types').UserStatus,
     password_hash: str(r.password_hash),
+    password_changed_at: strOrNull(r.password_changed_at),
+    last_login_at: strOrNull(r.last_login_at),
     created_at: str(r.created_at),
+  };
+}
+
+export function mapOrgMember(r: Row): import('../types').OrgMember {
+  return {
+    org_id: str(r.org_id),
+    user_id: str(r.user_id),
+    role: r.role as import('../types').UserRole,
+    created_at: str(r.created_at),
+  };
+}
+
+export function mapMembership(r: Row): import('../types').OrgMembership {
+  return {
+    org_id: str(r.org_id),
+    org_name: str(r.org_name),
+    role: r.role as import('../types').UserRole,
+  };
+}
+
+export function mapMemberView(r: Row): import('../types').OrgMemberView {
+  return {
+    user_id: str(r.user_id),
+    email: str(r.email),
+    name: strOrNull(r.name),
+    role: r.role as import('../types').UserRole,
+    status: (strOrNull(r.status) ?? 'active') as import('../types').UserStatus,
+    last_login_at: strOrNull(r.last_login_at),
+    created_at: str(r.created_at),
+  };
+}
+
+export function mapInvite(r: Row): import('../types').Invite {
+  return {
+    id: str(r.id),
+    org_id: str(r.org_id),
+    email: str(r.email),
+    role: r.role as import('../types').UserRole,
+    token_hash: str(r.token_hash),
+    status: r.status as import('../types').InviteStatus,
+    expires_at: str(r.expires_at),
+    created_at: str(r.created_at),
+    created_by: strOrNull(r.created_by),
+    accepted_at: strOrNull(r.accepted_at),
+    accepted_user_id: strOrNull(r.accepted_user_id),
   };
 }
 
@@ -88,13 +139,15 @@ export function mapOutbox(r: Row): import('../types').OutboxItem {
 export function mapInstance(r: Row): Instance {
   return {
     id: str(r.id),
-    org_id: strOrNull(r.org_id),
+    org_id: str(r.org_id),
     name: str(r.name),
     provider_type: r.provider_type as Instance['provider_type'],
     phone_number_id: strOrNull(r.phone_number_id),
     waba_id: strOrNull(r.waba_id),
-    token: strOrNull(r.token),
-    verify_token: strOrNull(r.verify_token),
+    // Segredos: decifrados AQUI, na fronteira do adapter. O resto do sistema
+    // (rotas, domínio, worker) só vê texto claro e não sabe que há cifra.
+    token: openSecret(r.token),
+    verify_token: openSecret(r.verify_token),
     active: toBool(r.active),
     connection_status: r.connection_status as Instance['connection_status'],
     created_at: strOrNull(r.created_at) ?? undefined,

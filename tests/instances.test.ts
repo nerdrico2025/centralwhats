@@ -84,6 +84,7 @@ describe('PATCH/DELETE /api/instances/:id', () => {
 describe('resolvedor por phone_number_id', () => {
   it('resolve a instância correta pelo phone_number_id do payload', async () => {
     const a = await repo.instances.create({
+    org_id: 'org_default',
       name: 'A',
       provider_type: 'meta',
       phone_number_id: 'PNID_A',
@@ -94,6 +95,7 @@ describe('resolvedor por phone_number_id', () => {
       connection_status: 'disconnected',
     });
     await repo.instances.create({
+    org_id: 'org_default',
       name: 'B',
       provider_type: 'meta',
       phone_number_id: 'PNID_B',

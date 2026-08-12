@@ -23,6 +23,8 @@ export type FlowExecutionStatus =
 
 // === V2 (multi-tenancy) ===
 export type UserRole = 'owner' | 'agent';
+export type UserStatus = 'active' | 'disabled';
+export type InviteStatus = 'pending' | 'accepted' | 'revoked';
 
 export interface Org {
   id: string;
@@ -33,16 +35,72 @@ export interface Org {
 
 export interface User {
   id: string;
+  /**
+   * CACHE da org de entrada (última ativa / primeira que o usuário teve).
+   * NÃO é autoritativo: a fonte da verdade do vínculo é `org_members`. Nunca
+   * decida acesso por este campo — use `repo.orgMembers.getRole()`.
+   */
+  org_id: string;
+  email: string;
+  name: string | null;
+  /**
+   * Papel HISTÓRICO (o que o usuário tinha quando só havia uma org). Mantido
+   * para leitura legada; o papel efetivo é o do vínculo em `org_members`.
+   */
+  role: UserRole;
+  status: UserStatus;
+  password_hash: string;
+  /** Token emitido ANTES desta marca é recusado (revogação de sessão). */
+  password_changed_at: string | null;
+  last_login_at: string | null;
+  created_at: string;
+}
+
+/** Vínculo N:N usuário↔org — a fonte da verdade do acesso e do papel. */
+export interface OrgMember {
+  org_id: string;
+  user_id: string;
+  role: UserRole;
+  created_at: string;
+}
+
+/** Org com o papel do usuário nela — o que alimenta o seletor de conta. */
+export interface OrgMembership {
+  org_id: string;
+  org_name: string;
+  role: UserRole;
+}
+
+/** Membro de uma org com os dados do usuário (tela de equipe). */
+export interface OrgMemberView {
+  user_id: string;
+  email: string;
+  name: string | null;
+  role: UserRole;
+  status: UserStatus;
+  last_login_at: string | null;
+  created_at: string;
+}
+
+export interface Invite {
+  id: string;
   org_id: string;
   email: string;
   role: UserRole;
-  password_hash: string;
+  /** SHA-256 do token. O token em claro só existe no link. */
+  token_hash: string;
+  status: InviteStatus;
+  expires_at: string;
   created_at: string;
+  created_by: string | null;
+  accepted_at: string | null;
+  accepted_user_id: string | null;
 }
 
 export interface Instance {
   id: string;
-  org_id?: string | null; // [V2]
+  /** [V2] Dono da instância. NOT NULL no banco desde a migration 012. */
+  org_id: string;
   name: string;
   provider_type: ProviderType;
   phone_number_id: string | null;
@@ -50,7 +108,6 @@ export interface Instance {
   token: string | null;
   verify_token: string | null;
   active: boolean;
-  baileys_session_ref?: string | null; // [V2]
   connection_status: ConnectionStatus;
   created_at?: string;
 }

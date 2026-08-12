@@ -282,6 +282,7 @@ describe('integração — round-robin sob concorrência + limpeza de presas', (
     repo = createSqliteAdapter({ path: ':memory:' });
     await repo.migrate();
     inst = await repo.instances.create({
+    org_id: 'org_default',
       name: 'Loja', provider_type: 'meta', phone_number_id: '109999888777', waba_id: null,
       token: 't', verify_token: 'v', active: true, connection_status: 'connected',
     });

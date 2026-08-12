@@ -30,6 +30,7 @@ beforeEach(async () => {
   repo = createSqliteAdapter({ path: ':memory:' });
   await repo.migrate();
   inst = await repo.instances.create({
+    org_id: 'org_default',
     name: 'Loja',
     provider_type: 'meta',
     phone_number_id: '109999888777',

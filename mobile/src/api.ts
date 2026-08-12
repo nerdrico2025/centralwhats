@@ -11,9 +11,15 @@ const TOKEN_KEY = 'wa.token';
 
 export interface SessionUser {
   id: string;
-  org_id: string;
   email: string;
+  name: string | null;
+  /**
+   * Papel NA CONTA ATIVA da sessão (P6.1): o mesmo usuário pode ser owner numa
+   * conta e agent em outra. Não existe mais "a org do usuário" — a conta ativa
+   * vem em `active_org_id` na resposta do login.
+   */
   role: 'owner' | 'agent';
+  status: 'active' | 'disabled';
 }
 
 export interface Instance {
@@ -79,8 +85,11 @@ async function raw<T>(method: string, path: string, body?: unknown): Promise<T> 
 }
 
 export const api = {
-  async login(email: string, password: string): Promise<{ token: string; user: SessionUser }> {
-    const res = await raw<{ token: string; user: SessionUser }>('POST', '/api/auth/login', {
+  async login(
+    email: string,
+    password: string,
+  ): Promise<{ token: string; user: SessionUser; active_org_id: string }> {
+    const res = await raw<{ token: string; user: SessionUser; active_org_id: string }>('POST', '/api/auth/login', {
       email,
       password,
     });

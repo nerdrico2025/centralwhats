@@ -22,6 +22,19 @@ const EnvSchema = z
     // [V2] Segredo do JWT. Obrigatório em produção; default só em dev/test.
     JWT_SECRET: z.string().default('dev-secret-nao-use-em-producao'),
 
+    // Registro público de novas organizações. FAIL-CLOSED, mesmo padrão do
+    // CRON_SECRET/META_APP_SECRET: ausente = FECHADO. No modelo agência quem
+    // cria conta de cliente é o operador, e usuário novo entra por CONVITE.
+    // Sem esta trava, /api/auth/register é um endpoint público que qualquer um
+    // usa para criar conta no deploy — e, pior, para DESLIGAR o modo bootstrap
+    // dos outros (users.countAll() é global).
+    // Exceção permanente: durante o bootstrap (zero usuários) o register
+    // responde de qualquer jeito — é como o primeiro owner nasce.
+    PUBLIC_SIGNUP: z
+      .enum(['true', 'false'])
+      .optional()
+      .transform((v) => v === 'true'),
+
     // Segredo do cron de campanhas (a Vercel injeta como "Authorization:
     // Bearer <CRON_SECRET>" nas chamadas agendadas). Opcional DE PROPÓSITO no
     // schema: exigi-lo aqui derrubaria o app inteiro (inclusive o webhook) num

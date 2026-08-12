@@ -44,18 +44,35 @@ export function requireOwner(req: Request, res: Response, next: NextFunction): v
 
 /**
  * Carrega a instância do :id da rota ou lança 404. Todo escopo começa aqui.
- * [V2] Com orgId: instância de OUTRA org retorna o MESMO 404 (não vaza que
- * existe). Toda a cadeia de dados pende de instance_id, então o isolamento
- * cross-org é garantido neste gargalo único.
+ * Instância de OUTRA org retorna o MESMO 404 (não vaza que existe). Toda a
+ * cadeia de dados (contacts, messages, flows, campaigns…) pende de
+ * instance_id, então o isolamento cross-org é garantido neste gargalo único.
+ *
+ * `orgId` é OBRIGATÓRIO de propósito (P6.1): enquanto era opcional, esquecer o
+ * argumento numa rota nova compilava, passava nos testes e vazava dados entre
+ * contas em silêncio. Caminho de sistema (sem usuário) tem porta própria e
+ * explícita: requireInstanceSystem().
  */
 export async function requireInstance(
   repo: Repo,
   id: string,
-  orgId?: string,
+  orgId: string,
 ): Promise<Instance> {
   const inst = await repo.instances.getById(id);
   if (!inst) throw new HttpError(404, 'Instância não encontrada');
-  if (orgId && inst.org_id !== orgId) throw new HttpError(404, 'Instância não encontrada');
+  if (inst.org_id !== orgId) throw new HttpError(404, 'Instância não encontrada');
+  return inst;
+}
+
+/**
+ * Versão SEM escopo de org, para chamadores MÁQUINA-A-MÁQUINA (cron, worker
+ * Baileys, webhook) — que autenticam por segredo/assinatura e não têm usuário
+ * nem conta ativa. O nome é longo e explícito de propósito: usá-la a partir de
+ * uma rota de usuário é um bug visível na revisão, não um descuido invisível.
+ */
+export async function requireInstanceSystem(repo: Repo, id: string): Promise<Instance> {
+  const inst = await repo.instances.getById(id);
+  if (!inst) throw new HttpError(404, 'Instância não encontrada');
   return inst;
 }
 

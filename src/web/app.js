@@ -10,6 +10,9 @@
 const auth = {
   token: localStorage.getItem('wa.jwt'),
   user: JSON.parse(localStorage.getItem('wa.user') || 'null'),
+  // Sessão vinda de GET /api/me: conta ativa, papel NELA e as contas do
+  // usuário (modelo agência — a mesma pessoa administra várias contas).
+  session: null,
   set(token, user) {
     this.token = token;
     this.user = user;
@@ -19,11 +22,21 @@ const auth = {
   clear() {
     this.token = null;
     this.user = null;
+    this.session = null;
     localStorage.removeItem('wa.jwt');
     localStorage.removeItem('wa.user');
   },
   role() {
+    // O papel É POR CONTA: quem manda é a sessão, não o que ficou salvo no
+    // localStorage de um login anterior (podia ser owner em outra conta).
+    if (this.session) return this.session.role;
     return this.user ? this.user.role : 'owner'; // bootstrap = owner
+  },
+  orgs() {
+    return this.session ? this.session.orgs || [] : [];
+  },
+  activeOrgId() {
+    return this.session ? this.session.active_org_id : null;
   },
 };
 
@@ -129,7 +142,7 @@ const NAV = [
   },
   {
     section: 'CONFIGURAÇÕES',
-    items: [{ path: '/usuarios', label: 'Usuários', icon: '👥' }],
+    items: [{ path: '/usuarios', label: 'Equipe', icon: '👥' }],
   },
 ];
 
@@ -141,6 +154,12 @@ function visibleNav() {
     {
       section: 'ATENDIMENTO',
       items: [{ path: '/livechat', label: 'Live Chat', icon: '💬', badgeKey: 'unread' }],
+    },
+    // A tela de Equipe mostra só o cartão de senha para o agent — sem ela ele
+    // não teria como trocar a própria senha pelo painel.
+    {
+      section: 'CONFIGURAÇÕES',
+      items: [{ path: '/usuarios', label: 'Minha conta', icon: '👤' }],
     },
   ];
 }
@@ -2824,10 +2843,26 @@ function renderLoginScreen() {
   app.innerHTML = '';
 
   let mode = 'login'; // 'login' | 'register'
+  // Registro público é FAIL-CLOSED no servidor: a tela só oferece "criar
+  // organização" quando ele responde que está aberto (bootstrap ou
+  // PUBLIC_SIGNUP). Sem isto, o botão levaria a um 403 sem explicação.
+  let registroAberto = false;
   const wrap = h('div', {
     style: 'min-height:100vh;display:grid;place-items:center;background:var(--bg);padding:20px',
   });
   app.appendChild(wrap);
+
+  fetch('/api/auth/registration-status')
+    .then((r) => (r.ok ? r.json() : null))
+    .then((s) => {
+      if (s) {
+        registroAberto = !!s.open;
+        draw();
+      }
+    })
+    .catch(() => {
+      /* offline: fica só o login, que é o caminho normal */
+    });
 
   function draw() {
     wrap.innerHTML = '';
@@ -2869,91 +2904,317 @@ function renderLoginScreen() {
         errEl,
         h('button', { class: 'btn btn--primary', style: 'width:100%', onclick: submit },
           mode === 'login' ? 'Entrar' : 'Criar conta'),
-        h('button', {
-          class: 'btn', style: 'width:100%;margin-top:8px;border:none',
-          onclick: () => { mode = mode === 'login' ? 'register' : 'login'; draw(); },
-        }, mode === 'login' ? 'Não tem conta? Criar organização' : 'Já tem conta? Entrar'),
+        registroAberto
+          ? h('button', {
+              class: 'btn', style: 'width:100%;margin-top:8px;border:none',
+              onclick: () => { mode = mode === 'login' ? 'register' : 'login'; draw(); },
+            }, mode === 'login' ? 'Não tem conta? Criar organização' : 'Já tem conta? Entrar')
+          : h('div', { class: 'muted', style: 'font-size:12px;margin-top:10px;text-align:center' },
+              'Novos usuários entram por convite do administrador da conta.'),
       ]),
     );
   }
   draw();
 }
 
-// --------------------------------------------------------- Usuários (P6.1/V2)
-function usuariosScreen() {
-  const listCard = h('div', { class: 'card' });
-  const formCard = h('div', { class: 'card' });
-  const root = h('div', {}, [
-    pageHeader('Usuários', 'Contas da sua organização (owner gerencia; agent só atende).'),
-    h('div', { class: 'dash-grid' }, [listCard, formCard]),
-  ]);
+// ------------------------------------------------------ Convite (P6.1)
+/**
+ * Tela de aceite de convite (/convite/<token>). Rota PÚBLICA, como o login:
+ * o convidado define a própria senha — o owner nunca a conhece.
+ *
+ * Quando o e-mail JÁ tem conta, o campo pede a SENHA ATUAL: é o que impede que
+ * um convite vire "esqueci a senha" de conta alheia.
+ */
+function renderInviteScreen(token) {
+  const app = document.getElementById('app');
+  app.innerHTML = '';
+  const wrap = h('div', {
+    style: 'min-height:100vh;display:grid;place-items:center;background:var(--bg);padding:20px',
+  });
+  app.appendChild(wrap);
 
-  async function loadUsers() {
-    listCard.innerHTML = '';
-    listCard.appendChild(h('h3', { class: 'card__title' }, 'Usuários da organização'));
-    let users = [];
+  function card(children) {
+    wrap.innerHTML = '';
+    wrap.appendChild(h('div', { class: 'card', style: 'width:380px;max-width:100%' }, children));
+  }
+
+  card([h('div', { class: 'muted' }, 'Carregando convite…')]);
+
+  fetch('/api/auth/invite/' + encodeURIComponent(token))
+    .then(async (r) => {
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'Convite inválido');
+      return r.json();
+    })
+    .then((info) => {
+      const errEl = h('div', { class: 'muted', style: 'color:#991b1b;min-height:18px;margin-bottom:8px' });
+      const pass = h('input', {
+        class: 'select', type: 'password', style: 'width:100%;margin-bottom:10px',
+        placeholder: info.has_account ? 'Sua senha ATUAL' : 'Crie sua senha (mín. 8)',
+      });
+      const nome = h('input', { class: 'select', placeholder: 'Seu nome (opcional)', style: 'width:100%;margin-bottom:10px' });
+
+      async function aceitar() {
+        errEl.textContent = '';
+        try {
+          const body = { token, password: pass.value };
+          if (!info.has_account && nome.value.trim()) body.name = nome.value.trim();
+          const res = await api.raw('POST', '/api/auth/invite/accept', body);
+          auth.set(res.token, res.user);
+          location.href = '/';
+        } catch (e) {
+          errEl.textContent = e.message;
+        }
+      }
+      pass.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') aceitar(); });
+
+      card([
+        h('div', { style: 'font-weight:700;margin-bottom:4px' }, 'Convite para ' + info.org_name),
+        h('div', { class: 'muted', style: 'font-size:12px;margin-bottom:14px' },
+          info.email + ' — papel: ' + info.role),
+        info.has_account
+          ? h('div', { class: 'builder-warnings', style: 'margin-bottom:10px' },
+              'Este e-mail já tem conta. Informe a senha atual dela para entrar também nesta conta.')
+          : nome,
+        pass,
+        errEl,
+        h('button', { class: 'btn btn--primary', style: 'width:100%', onclick: aceitar },
+          info.has_account ? 'Entrar nesta conta' : 'Criar minha conta'),
+      ]);
+    })
+    .catch((e) => {
+      card([
+        h('div', { style: 'font-weight:700;margin-bottom:8px' }, 'Convite indisponível'),
+        h('div', { class: 'muted', style: 'margin-bottom:14px' }, e.message),
+        h('button', { class: 'btn', style: 'width:100%', onclick: () => { location.href = '/'; } }, 'Ir para o login'),
+      ]);
+    });
+}
+
+// Estado do convite vem do servidor ('valid' = pendente e no prazo).
+const ESTADO_CONVITE = {
+  valid: 'pendente',
+  used: 'aceito',
+  revoked: 'cancelado',
+  expired: 'expirado',
+};
+
+// --------------------------------------------------------- Equipe (P6.1)
+/**
+ * Tela de Equipe da CONTA ATIVA: membros (via org_members), convites e troca
+ * da própria senha.
+ *
+ * A criação de usuário com senha escolhida pelo owner saiu de cena — entrada
+ * de gente nova é só por convite, e quem define a senha é o convidado.
+ */
+function usuariosScreen() {
+  const membrosCard = h('div', { class: 'card' });
+  const convitesCard = h('div', { class: 'card' });
+  const senhaCard = h('div', { class: 'card' });
+  const ehOwner = auth.role() === 'owner';
+  const root = ehOwner
+    ? h('div', {}, [
+        pageHeader('Equipe', 'Membros e convites desta conta (owner gerencia; agent só atende).'),
+        h('div', { class: 'dash-grid' }, [membrosCard, convitesCard]),
+        senhaCard,
+      ])
+    : h('div', {}, [pageHeader('Minha conta', 'Sua senha de acesso.'), senhaCard]);
+
+  async function carregarMembros() {
+    membrosCard.innerHTML = '';
+    membrosCard.appendChild(h('h3', { class: 'card__title' }, 'Membros desta conta'));
+    let membros = [];
     try {
-      users = await api.get('/api/users');
+      membros = await api.get('/api/users');
     } catch (e) {
-      listCard.appendChild(h('div', { class: 'muted' }, 'Erro: ' + e.message));
+      membrosCard.appendChild(h('div', { class: 'muted' }, 'Erro: ' + e.message));
       return;
     }
-    if (!users.length) {
-      listCard.appendChild(h('div', { class: 'builder-warnings' },
+    if (!membros.length) {
+      membrosCard.appendChild(h('div', { class: 'builder-warnings' },
         'Modo inicial: nenhum usuário cadastrado — o painel está aberto sem login. ' +
-        'Crie a primeira conta ao lado para ativar a autenticação.'));
+        'Crie a primeira conta pela tela de login para ativar a autenticação.'));
       return;
     }
-    listCard.appendChild(
+    membrosCard.appendChild(
       h('table', { class: 'table' }, [
-        h('thead', {}, [h('tr', {}, [h('th', {}, 'E-mail'), h('th', {}, 'Papel')])]),
-        h('tbody', {}, users.map((u) =>
+        h('thead', {}, [h('tr', {}, [
+          h('th', {}, 'E-mail'), h('th', {}, 'Papel'), h('th', {}, 'Situação'), h('th', {}, ''),
+        ])]),
+        h('tbody', {}, membros.map((u) =>
           h('tr', {}, [
             h('td', {}, u.email),
             h('td', {}, [h('span', { class: 'badge ' + (u.role === 'owner' ? 'badge--ok' : '') }, u.role)]),
+            h('td', {}, u.status === 'active' ? 'ativo' : 'desabilitado'),
+            h('td', {}, [
+              h('button', {
+                class: 'btn',
+                onclick: async () => {
+                  const acao = u.status === 'active' ? 'disable' : 'enable';
+                  try {
+                    await api.post('/api/users/' + u.user_id + '/' + acao, {});
+                    carregarMembros();
+                  } catch (e) {
+                    alert('Erro: ' + e.message);
+                  }
+                },
+              }, u.status === 'active' ? 'Desabilitar' : 'Reabilitar'),
+            ]),
           ]),
         )),
       ]),
     );
   }
 
-  function renderForm() {
-    formCard.innerHTML = '';
-    formCard.appendChild(h('h3', { class: 'card__title' }, 'Novo usuário'));
-    const email = h('input', { class: 'select', placeholder: 'E-mail', style: 'width:100%;margin-bottom:8px' });
-    const pass = h('input', { class: 'select', placeholder: 'Senha (mín. 8)', type: 'password', style: 'width:100%;margin-bottom:8px' });
-    const role = h('select', { class: 'select', style: 'width:100%;margin-bottom:8px' }, [
+  async function carregarConvites() {
+    convitesCard.innerHTML = '';
+    convitesCard.appendChild(h('h3', { class: 'card__title' }, 'Convites'));
+
+
+    const email = h('input', { class: 'select', placeholder: 'E-mail do convidado', style: 'width:100%;margin-bottom:8px' });
+    const papel = h('select', { class: 'select', style: 'width:100%;margin-bottom:8px' }, [
       h('option', { value: 'agent' }, 'agent — só Live Chat'),
       h('option', { value: 'owner' }, 'owner — administra tudo'),
     ]);
-    const msg = h('div', { class: 'muted', style: 'min-height:18px;margin-bottom:8px' });
-    formCard.appendChild(email);
-    formCard.appendChild(pass);
-    formCard.appendChild(role);
-    formCard.appendChild(msg);
-    formCard.appendChild(
+    const msg = h('div', { class: 'muted', style: 'min-height:18px;margin-bottom:8px;word-break:break-all' });
+
+    // O link só aparece UMA vez (o banco guarda apenas o hash do token).
+    function mostrarLink(res) {
+      const url = location.origin + res.path;
+      msg.innerHTML = '';
+      msg.appendChild(h('div', {}, 'Link do convite (copie agora — ele não é exibido de novo):'));
+      const campo = h('input', { class: 'select', style: 'width:100%;margin:6px 0' });
+      campo.value = url;
+      msg.appendChild(campo);
+      msg.appendChild(h('button', {
+        class: 'btn',
+        onclick: () => {
+          campo.select();
+          if (navigator.clipboard) navigator.clipboard.writeText(url);
+        },
+      }, 'Copiar link'));
+    }
+
+    convitesCard.appendChild(email);
+    convitesCard.appendChild(papel);
+    convitesCard.appendChild(
       h('button', {
         class: 'btn btn--primary',
         onclick: async () => {
           msg.textContent = '';
           try {
-            await api.post('/api/users', { email: email.value.trim(), password: pass.value, role: role.value });
+            mostrarLink(await api.post('/api/invites', { email: email.value.trim(), role: papel.value }));
             email.value = '';
-            pass.value = '';
-            msg.textContent = 'Usuário criado.';
-            loadUsers();
+            carregarConvites();
           } catch (e) {
             msg.textContent = 'Erro: ' + e.message;
           }
         },
-      }, 'Criar usuário'),
+      }, 'Convidar'),
+    );
+    convitesCard.appendChild(msg);
+
+    let convites = [];
+    try {
+      convites = await api.get('/api/invites');
+    } catch (e) {
+      convitesCard.appendChild(h('div', { class: 'muted' }, 'Erro: ' + e.message));
+      return;
+    }
+    if (!convites.length) {
+      convitesCard.appendChild(h('div', { class: 'muted' }, 'Nenhum convite ainda.'));
+      return;
+    }
+    convitesCard.appendChild(
+      h('table', { class: 'table' }, [
+        h('thead', {}, [h('tr', {}, [
+          h('th', {}, 'E-mail'), h('th', {}, 'Papel'), h('th', {}, 'Estado'), h('th', {}, ''),
+        ])]),
+        h('tbody', {}, convites.map((c) =>
+          h('tr', {}, [
+            h('td', {}, c.email),
+            h('td', {}, c.role),
+            h('td', {}, ESTADO_CONVITE[c.state] || c.state),
+            h('td', {}, [
+              c.state === 'valid'
+                ? h('button', {
+                    class: 'btn',
+                    onclick: async () => {
+                      try {
+                        await api.del('/api/invites/' + c.id);
+                        carregarConvites();
+                      } catch (e) {
+                        alert('Erro: ' + e.message);
+                      }
+                    },
+                  }, 'Cancelar')
+                : null,
+              c.state !== 'accepted'
+                ? h('button', {
+                    class: 'btn',
+                    style: 'margin-left:6px',
+                    onclick: async () => {
+                      try {
+                        mostrarLink(await api.post('/api/invites/' + c.id + '/resend', {}));
+                        carregarConvites();
+                      } catch (e) {
+                        alert('Erro: ' + e.message);
+                      }
+                    },
+                  }, 'Reenviar')
+                : null,
+            ]),
+          ]),
+        )),
+      ]),
     );
   }
 
-  loadUsers();
-  renderForm();
+  function renderSenha() {
+    senhaCard.innerHTML = '';
+    senhaCard.appendChild(h('h3', { class: 'card__title' }, 'Minha senha'));
+    if (!auth.token) {
+      senhaCard.appendChild(h('div', { class: 'muted' },
+        'Modo inicial (sem usuários): não há senha para trocar.'));
+      return;
+    }
+    const atual = h('input', { class: 'select', type: 'password', placeholder: 'Senha atual', style: 'width:100%;margin-bottom:8px' });
+    const nova = h('input', { class: 'select', type: 'password', placeholder: 'Nova senha (mín. 8)', style: 'width:100%;margin-bottom:8px' });
+    const msg = h('div', { class: 'muted', style: 'min-height:18px;margin-bottom:8px' });
+    senhaCard.appendChild(atual);
+    senhaCard.appendChild(nova);
+    senhaCard.appendChild(msg);
+    senhaCard.appendChild(
+      h('button', {
+        class: 'btn btn--primary',
+        onclick: async () => {
+          msg.textContent = '';
+          try {
+            const res = await api.post('/api/me/password', {
+              current_password: atual.value,
+              new_password: nova.value,
+            });
+            // Trocar a senha derruba TODAS as outras sessões; esta continua
+            // valendo com o token novo.
+            auth.set(res.token, auth.user);
+            atual.value = '';
+            nova.value = '';
+            msg.textContent = 'Senha alterada. As outras sessões foram encerradas.';
+          } catch (e) {
+            msg.textContent = 'Erro: ' + e.message;
+          }
+        },
+      }, 'Trocar senha'),
+    );
+  }
+
+  if (ehOwner) {
+    carregarMembros();
+    carregarConvites();
+  }
+  renderSenha();
   return root;
 }
+
 
 // ---------------------------------------------------------------- render shell
 function renderSidebar() {
@@ -3012,7 +3273,39 @@ function renderTopbar() {
     selector.appendChild(h('option', { value: '' }, 'Nenhuma instância'));
   }
 
+  // Seletor de CONTA (org ativa) — só aparece para quem participa de mais de
+  // uma. Trocar reemite o JWT com a outra org e recarrega o painel inteiro,
+  // porque tudo (instâncias, conversas, campanhas) muda de contexto.
+  const orgs = auth.orgs();
+  const orgSelector =
+    orgs.length > 1
+      ? h(
+          'select',
+          {
+            class: 'select',
+            style: 'margin-right:8px',
+            onchange: async (e) => {
+              try {
+                const res = await api.post('/api/me/switch-org', { org_id: e.target.value });
+                auth.set(res.token, auth.user);
+                localStorage.removeItem('wa.instanceId'); // instância era da outra conta
+                location.reload();
+              } catch (err) {
+                alert('Erro ao trocar de conta: ' + err.message);
+              }
+            },
+          },
+          orgs.map((o) =>
+            h('option', {
+              value: o.org_id,
+              ...(o.org_id === auth.activeOrgId() ? { selected: 'selected' } : {}),
+            }, o.org_name),
+          ),
+        )
+      : null;
+
   return h('header', { class: 'topbar' }, [
+    orgSelector,
     selector,
     h('div', { class: 'topbar__spacer' }),
     auth.user ? h('span', { class: 'muted', style: 'font-size:12px' }, auth.user.email) : null,
@@ -3067,12 +3360,31 @@ function navigate(path) {
 
 // ------------------------------------------------------------------ bootstrap
 async function boot() {
+  // Convite é rota PÚBLICA: não passa por sessão nenhuma.
+  const convite = /^\/convite\/(.+)$/.exec(location.pathname);
+  if (convite) {
+    renderInviteScreen(decodeURIComponent(convite[1]));
+    return;
+  }
+
   // Sessão primeiro: 401 aqui = sistema trancado sem token válido → o handler
   // do api.raw renderiza a tela de login e abortamos a montagem do shell.
   try {
-    state.instances = await api.listInstances();
+    // GET /api/me traz a conta ativa, o papel NELA e as contas do usuário.
+    auth.session = await api.get('/api/me');
+    if (auth.session.user) auth.user = auth.session.user;
   } catch (e) {
     if (e.message === 'Não autenticado') return; // login já renderizado
+    // Sessão existe mas não vale mais nesta conta (ex.: removido dela, papel
+    // revogado). Montar o shell aqui daria um painel quebrado — volta ao login.
+    auth.clear();
+    renderLoginScreen();
+    return;
+  }
+  try {
+    state.instances = await api.listInstances();
+  } catch (e) {
+    if (e.message === 'Não autenticado') return;
     state.instances = [];
   }
 

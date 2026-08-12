@@ -14,6 +14,7 @@ beforeEach(async () => {
   repo = createSqliteAdapter({ path: ':memory:' });
   await repo.migrate();
   inst = await repo.instances.create({
+    org_id: 'org_default',
     name: 'Loja',
     provider_type: 'meta',
     phone_number_id: '109999888777',
@@ -181,6 +182,7 @@ describe('Campanha — exclusão (DELETE)', () => {
   it('campanha de OUTRA instância → 404 (não vaza existência) e não é apagada', async () => {
     const camp = await comSends('draft');
     const outra = await repo.instances.create({
+    org_id: 'org_default',
       name: 'Outra', provider_type: 'meta', phone_number_id: '10777666555',
       waba_id: null, token: 't', verify_token: 'v', active: true,
       connection_status: 'connected',

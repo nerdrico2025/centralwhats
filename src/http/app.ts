@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import express, { type Express, type Request, type Response } from 'express';
+import express, { type Express, type Request, type Response, type Router } from 'express';
 import { getRepo, type Repo } from '../repo';
 import { findProjectRoot } from '../util/paths';
 import type { Instance } from '../repo/types';
@@ -19,9 +19,53 @@ import { createCronRouter } from './cron';
 import { captureRawBody } from './metaSignature';
 import { createFlowsRouter } from './flows';
 import { createWebhookRouter, type BackgroundScheduler } from './webhook';
-import { createAuthMiddleware, createAuthRouter, createUsersRouter } from './auth';
+import { createAuthMiddleware, createAuthRouter } from './auth';
+import { createInvitesRouter, createSessionRouter, createUsersRouter } from './team';
 import { errorMiddleware, requireOwner } from './util';
 import type { MetaTemplatesOptions } from '../providers/metaTemplates';
+
+/**
+ * TABELA das rotas escopadas por instância (P6.1).
+ *
+ * Existe para que "montar um router novo" e "declarar que ele é escopado por
+ * conta" sejam o MESMO ato. O teste tests/orgscope.test.ts percorre esta lista
+ * e exige, de cada mount, 404 cross-org — então um router novo entra no teste
+ * automaticamente, em vez de depender de alguém lembrar de adicioná-lo.
+ *
+ * `ownerOnly`: agent (Live Chat) só passa em messages/conversations.
+ */
+export interface InstanceScopedMount {
+  segment: string;
+  ownerOnly: boolean;
+  make: (repo: Repo, deps: AppDeps) => Router;
+}
+
+export const INSTANCE_SCOPED_MOUNTS: InstanceScopedMount[] = [
+  // Atendimento — agent também usa.
+  {
+    segment: 'messages',
+    ownerOnly: false,
+    make: (repo, deps) => createMessagesRouter(repo, { providerFor: deps.providerFor }),
+  },
+  { segment: 'conversations', ownerOnly: false, make: (repo) => createLiveChatRouter(repo) },
+  // Gestão — owner only.
+  {
+    segment: 'templates',
+    ownerOnly: true,
+    make: (repo, deps) => createTemplatesRouter(repo, deps.templatesApi ?? {}),
+  },
+  { segment: 'contacts', ownerOnly: true, make: (repo) => createContactsRouter(repo) },
+  { segment: 'tags', ownerOnly: true, make: (repo) => createTagsRouter(repo) },
+  { segment: 'crm', ownerOnly: true, make: (repo) => createCrmRouter(repo) },
+  { segment: 'dashboard', ownerOnly: true, make: (repo) => createDashboardRouter(repo) },
+  { segment: 'lists', ownerOnly: true, make: (repo) => createListsRouter(repo) },
+  { segment: 'flows', ownerOnly: true, make: (repo) => createFlowsRouter(repo) },
+  {
+    segment: 'campaigns',
+    ownerOnly: true,
+    make: (repo, deps) => createCampaignsRouter(repo, { providerFor: deps.providerFor }),
+  },
+];
 
 export interface AppDeps {
   /** Agendador do processamento em background do webhook (injetável em testes). */
@@ -61,20 +105,21 @@ export function createApp(repo: Repo = getRepo(), deps: AppDeps = {}): Express {
   const api = express.Router();
   api.use(createAuthMiddleware(repo));
 
-  // Agent (Live Chat) pode: listar instâncias, conversar e responder.
-  api.use('/instances/:id/messages', createMessagesRouter(repo, { providerFor: deps.providerFor }));
-  api.use('/instances/:id/conversations', createLiveChatRouter(repo));
+  // Sessão: quem sou eu, em que conta estou, trocar de conta/senha.
+  // Disponível para QUALQUER papel — é o que permite ao agente trocar a
+  // própria senha e alternar entre as contas de que participa.
+  api.use('/me', createSessionRouter(repo));
 
-  // Owner only: gestão de instâncias/marketing/fluxos/usuários.
-  api.use('/instances/:id/templates', requireOwner, createTemplatesRouter(repo, deps.templatesApi ?? {}));
-  api.use('/instances/:id/contacts', requireOwner, createContactsRouter(repo));
-  api.use('/instances/:id/tags', requireOwner, createTagsRouter(repo));
-  api.use('/instances/:id/crm', requireOwner, createCrmRouter(repo));
-  api.use('/instances/:id/dashboard', requireOwner, createDashboardRouter(repo));
-  api.use('/instances/:id/lists', requireOwner, createListsRouter(repo));
-  api.use('/instances/:id/flows', requireOwner, createFlowsRouter(repo));
-  api.use('/instances/:id/campaigns', requireOwner, createCampaignsRouter(repo, { providerFor: deps.providerFor }));
+  // Rotas escopadas por instância — montadas a partir da tabela acima.
+  for (const mount of INSTANCE_SCOPED_MOUNTS) {
+    const path = `/instances/:id/${mount.segment}`;
+    if (mount.ownerOnly) api.use(path, requireOwner, mount.make(repo, deps));
+    else api.use(path, mount.make(repo, deps));
+  }
+
+  // Owner only: equipe e convites da conta ativa.
   api.use('/users', requireOwner, createUsersRouter(repo));
+  api.use('/invites', requireOwner, createInvitesRouter(repo));
   api.use('/instances', createInstancesRouter(repo)); // papel checado por rota
   app.use('/api', api);
 

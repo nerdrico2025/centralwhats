@@ -17,6 +17,7 @@ beforeEach(async () => {
   repo = createSqliteAdapter({ path: ':memory:' });
   await repo.migrate();
   inst = await repo.instances.create({
+    org_id: 'org_default',
     name: 'Loja',
     provider_type: 'meta',
     phone_number_id: '109999888777',
@@ -76,6 +77,7 @@ describe('Tags — CRUD e aplicação EM MASSA', () => {
 
   it('aplicação em massa ignora contatos de outra instância (escopo)', async () => {
     const other = await repo.instances.create({
+    org_id: 'org_default',
       name: 'Outra',
       provider_type: 'meta',
       phone_number_id: '200',
@@ -218,6 +220,7 @@ describe('Contatos — plano B do nome (PRD §3.5)', () => {
   it('PATCH em contato de OUTRA instância → 404 (não vaza nem renomeia)', async () => {
     const c = await makeContact('5511777770004', 'Da Loja');
     const outra = await repo.instances.create({
+    org_id: 'org_default',
       name: 'Outra', provider_type: 'meta', phone_number_id: '10555444333',
       waba_id: null, token: 't', verify_token: 'v', active: true, connection_status: 'connected',
     });
@@ -260,6 +263,7 @@ describe('Contatos — tags aplicadas (leitura)', () => {
   it('contato de outra instância → 404', async () => {
     const c = await makeContact('5511666660002', 'B');
     const outra = await repo.instances.create({
+    org_id: 'org_default',
       name: 'Outra', provider_type: 'meta', phone_number_id: '10555444222',
       waba_id: null, token: 't', verify_token: 'v', active: true, connection_status: 'connected',
     });
@@ -271,6 +275,7 @@ describe('Contatos — tags aplicadas (leitura)', () => {
 describe('Contatos/CRM — isolamento entre instâncias', () => {
   it('contato, tag e CRM de uma instância não aparecem na outra', async () => {
     const outra = await repo.instances.create({
+    org_id: 'org_default',
       name: 'Outra', provider_type: 'meta', phone_number_id: '10555444111',
       waba_id: null, token: 't', verify_token: 'v', active: true, connection_status: 'connected',
     });
@@ -316,6 +321,7 @@ describe('Tags — mapa agrupado por contato (evita N+1 na UI)', () => {
 
     // Outra instância enxerga um mapa vazio, não as tags da primeira.
     const outra = await repo.instances.create({
+    org_id: 'org_default',
       name: 'Outra', provider_type: 'meta', phone_number_id: '10333222111',
       waba_id: null, token: 't', verify_token: 'v', active: true, connection_status: 'connected',
     });

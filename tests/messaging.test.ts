@@ -46,6 +46,7 @@ beforeEach(async () => {
   repo = createSqliteAdapter({ path: ':memory:' });
   await repo.migrate();
   instance = await repo.instances.create({
+    org_id: 'org_default',
     name: 'Loja',
     provider_type: 'meta',
     phone_number_id: '109999888777',
@@ -232,6 +233,7 @@ describe('POST /api/instances/:id/messages', () => {
 
   it('recurso não suportado pelo provider (template no Baileys) → 422', async () => {
     const baileys = await repo.instances.create({
+    org_id: 'org_default',
       name: 'Baileys',
       provider_type: 'baileys',
       phone_number_id: '55110000000',

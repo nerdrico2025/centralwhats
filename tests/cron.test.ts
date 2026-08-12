@@ -60,6 +60,7 @@ async function seedRunningCampaign(
   ddd = '11',
 ): Promise<{ instance: Instance; campaignId: string }> {
   const instance = await repo.instances.create({
+    org_id: 'org_default',
     name: nome, provider_type: 'meta', phone_number_id: phoneNumberId, waba_id: null,
     token: 't', verify_token: 'v', active: true, connection_status: 'connected',
   });
@@ -310,6 +311,7 @@ describe('Cron — varredura de FLUXOS (lacuna simétrica à das campanhas)', ()
     n: number,
   ): Promise<{ instance: Instance; flowId: string }> {
     const instance = await repo.instances.create({
+    org_id: 'org_default',
       name: 'Loja ' + ddd, provider_type: 'meta', phone_number_id: phoneNumberId,
       waba_id: null, token: 't', verify_token: 'v', active: true, connection_status: 'connected',
     });

@@ -351,7 +351,7 @@ export async function processAllPendingFlows(
 
   let instances: Instance[];
   try {
-    instances = await repo.instances.list();
+    instances = await repo.instances.listAll();
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error('[cron/flows] falha ao listar instâncias:', err);

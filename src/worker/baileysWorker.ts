@@ -226,7 +226,7 @@ export class BaileysWorker {
 
   async start(): Promise<void> {
     this.stopped = false;
-    const instances = await this.repo.instances.list();
+    const instances = await this.repo.instances.listAll();
     for (const inst of instances) {
       if (inst.provider_type === 'baileys' && inst.active) {
         await this.connectInstance(inst);

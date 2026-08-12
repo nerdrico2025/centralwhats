@@ -3,8 +3,9 @@ import { Pool } from 'pg';
 import { normalizePhone } from '../../util/phone';
 import { listMigrations } from '../../util/paths';
 import { buildVolumeSeries } from '../../util/metrics';
+import { isEncrypted, openSecret, sealSecret } from '../../util/crypto';
 import type { Repo } from '../Repo';
-import type { Campaign, Flow, FlowExecution, Tag } from '../types';
+import type { Campaign, Flow, FlowExecution, Tag, UserRole } from '../types';
 import * as m from './mappers';
 
 /**
@@ -47,6 +48,12 @@ export function createPostgresAdapter(opts: { connectionString: string }): Repo 
     target,
     instances: {
       async create(data) {
+        // SEM default de org_id: instância sem dono é invisível para todo
+        // usuário e ainda assim varrida por cron/webhook/worker (L3). Quem
+        // cria sempre tem a org ativa à mão — passar é obrigatório.
+        if (!data.org_id) {
+          throw new Error('instances.create: org_id é obrigatório (instância sem dono é proibida)');
+        }
         const id = uid();
         await run(
           `INSERT INTO instances
@@ -54,13 +61,13 @@ export function createPostgresAdapter(opts: { connectionString: string }): Repo 
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
           [
             id,
-            data.org_id ?? 'org_default',
+            data.org_id,
             data.name,
             data.provider_type ?? 'meta',
             data.phone_number_id,
             data.waba_id,
-            data.token,
-            data.verify_token,
+            sealSecret(data.token),
+            sealSecret(data.verify_token),
             m.fromBool(data.active ?? true),
             data.connection_status ?? 'disconnected',
             now(),
@@ -73,11 +80,11 @@ export function createPostgresAdapter(opts: { connectionString: string }): Repo 
         return r ? m.mapInstance(r) : null;
       },
       async list(orgId) {
-        if (orgId) {
-          return (
-            await all(`SELECT * FROM instances WHERE org_id=$1 ORDER BY created_at ASC`, [orgId])
-          ).map(m.mapInstance);
-        }
+        return (
+          await all(`SELECT * FROM instances WHERE org_id=$1 ORDER BY created_at ASC`, [orgId])
+        ).map(m.mapInstance);
+      },
+      async listAll() {
         return (await all(`SELECT * FROM instances ORDER BY created_at ASC`)).map(m.mapInstance);
       },
       async update(id, patch) {
@@ -92,8 +99,8 @@ export function createPostgresAdapter(opts: { connectionString: string }): Repo 
         if (patch.provider_type !== undefined) set('provider_type', patch.provider_type);
         if (patch.phone_number_id !== undefined) set('phone_number_id', patch.phone_number_id);
         if (patch.waba_id !== undefined) set('waba_id', patch.waba_id);
-        if (patch.token !== undefined) set('token', patch.token);
-        if (patch.verify_token !== undefined) set('verify_token', patch.verify_token);
+        if (patch.token !== undefined) set('token', sealSecret(patch.token));
+        if (patch.verify_token !== undefined) set('verify_token', sealSecret(patch.verify_token));
         if (patch.active !== undefined) set('active', m.fromBool(patch.active));
         if (patch.connection_status !== undefined)
           set('connection_status', patch.connection_status);
@@ -917,18 +924,29 @@ export function createPostgresAdapter(opts: { connectionString: string }): Repo 
         const r = await get(`SELECT * FROM orgs WHERE id=$1`, [id]);
         return r ? m.mapOrg(r) : null;
       },
+      async rename(id, name) {
+        await run(`UPDATE orgs SET name=$1 WHERE id=$2`, [name, id]);
+        return this.getById(id);
+      },
+      async countInstances(id) {
+        return Number(
+          (await get(`SELECT COUNT(*) c FROM instances WHERE org_id=$1`, [id]))?.c ?? 0,
+        );
+      },
     },
 
     users: {
       async create(data) {
         const r = await get(
-          `INSERT INTO users (id,org_id,email,role,password_hash,created_at)
-             VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+          `INSERT INTO users (id,org_id,email,name,role,status,password_hash,password_changed_at,last_login_at,created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,NULL,NULL,$8) RETURNING *`,
           [
             uid(),
             data.org_id,
             data.email.trim().toLowerCase(),
+            data.name ?? null,
             data.role ?? 'agent',
+            data.status ?? 'active',
             data.password_hash,
             now(),
           ],
@@ -950,6 +968,185 @@ export function createPostgresAdapter(opts: { connectionString: string }): Repo 
       },
       async countAll() {
         return Number((await get(`SELECT COUNT(*) c FROM users`))?.c ?? 0);
+      },
+      async setPassword(id, passwordHash, changedAt) {
+        await run(`UPDATE users SET password_hash=$1, password_changed_at=$2 WHERE id=$3`, [
+          passwordHash,
+          changedAt,
+          id,
+        ]);
+      },
+      async setStatus(id, status) {
+        await run(`UPDATE users SET status=$1 WHERE id=$2`, [status, id]);
+      },
+      async markLogin(id, at, activeOrgId) {
+        await run(`UPDATE users SET last_login_at=$1, org_id=$2 WHERE id=$3`, [
+          at,
+          activeOrgId,
+          id,
+        ]);
+      },
+    },
+
+    orgMembers: {
+      async add(orgId, userId, role) {
+        const r = await get(
+          `INSERT INTO org_members (org_id,user_id,role,created_at) VALUES ($1,$2,$3,$4)
+             ON CONFLICT(org_id,user_id) DO UPDATE SET role=excluded.role
+           RETURNING *`,
+          [orgId, userId, role, now()],
+        );
+        return m.mapOrgMember(r!);
+      },
+      async getRole(orgId, userId) {
+        const r = await get(`SELECT role FROM org_members WHERE org_id=$1 AND user_id=$2`, [
+          orgId,
+          userId,
+        ]);
+        return r ? (r.role as UserRole) : null;
+      },
+      async listByUser(userId) {
+        return (
+          await all(
+            `SELECT mem.org_id, o.name AS org_name, mem.role
+               FROM org_members mem JOIN orgs o ON o.id = mem.org_id
+              WHERE mem.user_id=$1 ORDER BY o.name ASC`,
+            [userId],
+          )
+        ).map(m.mapMembership);
+      },
+      async listByOrg(orgId) {
+        return (
+          await all(
+            `SELECT u.id AS user_id, u.email, u.name, mem.role, u.status,
+                    u.last_login_at, mem.created_at
+               FROM org_members mem JOIN users u ON u.id = mem.user_id
+              WHERE mem.org_id=$1 ORDER BY mem.created_at ASC`,
+            [orgId],
+          )
+        ).map(m.mapMemberView);
+      },
+      async remove(orgId, userId) {
+        await run(`DELETE FROM org_members WHERE org_id=$1 AND user_id=$2`, [orgId, userId]);
+      },
+    },
+
+    invites: {
+      async create(data) {
+        const r = await get(
+          `INSERT INTO invites (id,org_id,email,role,token_hash,status,expires_at,created_at,created_by)
+             VALUES ($1,$2,$3,$4,$5,'pending',$6,$7,$8) RETURNING *`,
+          [
+            uid(),
+            data.org_id,
+            data.email.trim().toLowerCase(),
+            data.role,
+            data.token_hash,
+            data.expires_at,
+            now(),
+            data.created_by,
+          ],
+        );
+        return m.mapInvite(r!);
+      },
+      async getByTokenHash(tokenHash) {
+        const r = await get(`SELECT * FROM invites WHERE token_hash=$1`, [tokenHash]);
+        return r ? m.mapInvite(r) : null;
+      },
+      async getById(orgId, id) {
+        const r = await get(`SELECT * FROM invites WHERE org_id=$1 AND id=$2`, [orgId, id]);
+        return r ? m.mapInvite(r) : null;
+      },
+      async listByOrg(orgId) {
+        return (
+          await all(`SELECT * FROM invites WHERE org_id=$1 ORDER BY created_at DESC`, [orgId])
+        ).map(m.mapInvite);
+      },
+      async markAcceptedIfPending(id, userId, at) {
+        // UMA instrução condicional = uso único garantido sob concorrência.
+        const changed = await run(
+          `UPDATE invites SET status='accepted', accepted_at=$1, accepted_user_id=$2
+             WHERE id=$3 AND status='pending'`,
+          [at, userId, id],
+        );
+        return changed > 0;
+      },
+      async revoke(orgId, id) {
+        const changed = await run(
+          `UPDATE invites SET status='revoked' WHERE org_id=$1 AND id=$2 AND status='pending'`,
+          [orgId, id],
+        );
+        return changed > 0;
+      },
+      async refreshToken(orgId, id, tokenHash, expiresAt) {
+        const changed = await run(
+          `UPDATE invites SET token_hash=$1, expires_at=$2, status='pending'
+             WHERE org_id=$3 AND id=$4 AND status IN ('pending','revoked')`,
+          [tokenHash, expiresAt, orgId, id],
+        );
+        return changed > 0;
+      },
+    },
+
+    maintenance: {
+      async backfillSecretEncryption() {
+        const out = {
+          instanceTokens: 0,
+          instanceVerifyTokens: 0,
+          baileysAuthValues: 0,
+          skipped: 0,
+        };
+        // SELECT cru de propósito: aqui é o único ponto que precisa ver a
+        // FORMA ARMAZENADA (mapInstance já decifraria e a checagem de
+        // idempotência perderia o sentido).
+        for (const r of await all(`SELECT id, token, verify_token FROM instances`)) {
+          if (r.token != null && r.token !== '') {
+            if (isEncrypted(r.token)) out.skipped++;
+            else {
+              await run(`UPDATE instances SET token=$1 WHERE id=$2`, [
+                sealSecret(String(r.token)),
+                r.id,
+              ]);
+              out.instanceTokens++;
+            }
+          }
+          if (r.verify_token != null && r.verify_token !== '') {
+            if (isEncrypted(r.verify_token)) out.skipped++;
+            else {
+              await run(`UPDATE instances SET verify_token=$1 WHERE id=$2`, [
+                sealSecret(String(r.verify_token)),
+                r.id,
+              ]);
+              out.instanceVerifyTokens++;
+            }
+          }
+        }
+        for (const r of await all(`SELECT instance_id, key, value FROM baileys_auth`)) {
+          if (isEncrypted(r.value)) {
+            out.skipped++;
+            continue;
+          }
+          await run(`UPDATE baileys_auth SET value=$1 WHERE instance_id=$2 AND key=$3`, [
+            sealSecret(String(r.value)),
+            r.instance_id,
+            r.key,
+          ]);
+          out.baileysAuthValues++;
+        }
+        return out;
+      },
+      async findOrphanInstances() {
+        return (
+          await all(
+            `SELECT i.id, i.name, i.org_id FROM instances i
+               LEFT JOIN orgs o ON o.id = i.org_id
+              WHERE i.org_id IS NULL OR o.id IS NULL`,
+          )
+        ).map((r) => ({
+          id: r.id as string,
+          name: r.name as string,
+          org_id: (r.org_id ?? null) as string | null,
+        }));
       },
     },
 
@@ -1026,13 +1223,14 @@ export function createPostgresAdapter(opts: { connectionString: string }): Repo 
           instanceId,
           key,
         ]);
-        return r ? m.parseJson<unknown>(r.value, null) : null;
+        // Decifra ANTES do parse: o que foi cifrado é o JSON serializado.
+        return r ? m.parseJson<unknown>(openSecret(r.value), null) : null;
       },
       async set(instanceId, key, value) {
         await run(
           `INSERT INTO baileys_auth (instance_id,key,value,updated_at) VALUES ($1,$2,$3,$4)
              ON CONFLICT(instance_id,key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
-          [instanceId, key, m.stringifyJson(value), now()],
+          [instanceId, key, sealSecret(m.stringifyJson(value)), now()],
         );
       },
       async delete(instanceId, key) {

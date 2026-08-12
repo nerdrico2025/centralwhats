@@ -36,7 +36,7 @@ describe('repo adapter (sqlite in-memory)', () => {
     await repo.migrate();
     expect(repo.instances).toBeDefined();
     expect(repo.flowNodeCounters).toBeDefined();
-    await expect(repo.instances.list()).resolves.toEqual([]);
+    await expect(repo.instances.listAll()).resolves.toEqual([]);
     await repo.close();
   });
 });

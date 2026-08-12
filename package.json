@@ -15,6 +15,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "migrate": "tsx src/repo/migrate.ts",
+    "audit-instances": "tsx src/scripts/auditInstances.ts",
+    "create-owner": "tsx src/scripts/createOwner.ts",
+    "encrypt-secrets": "tsx src/scripts/encryptSecrets.ts",
     "worker": "tsx src/worker/index.ts",
     "worker:prod": "node dist/worker/index.js"
   },

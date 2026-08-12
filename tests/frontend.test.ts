@@ -17,6 +17,7 @@ async function appWithData() {
   const repo = createSqliteAdapter({ path: ':memory:' });
   await repo.migrate();
   await repo.instances.create({
+    org_id: 'org_default',
     name: 'Loja',
     provider_type: 'meta',
     phone_number_id: '109999888777',
@@ -57,6 +58,14 @@ describe('frontend shell', () => {
   it('fallback do SPA: rota client-side retorna o index.html', async () => {
     const app = await appWithData();
     const res = await request(app).get('/instancias').expect(200);
+    expect(res.text).toContain('<div id="app">');
+  });
+
+  it('a rota pública de convite cai no SPA (não vira 404 do Express)', async () => {
+    // O link do convite é /convite/<token>: se o fallback não pegasse, o
+    // convidado veria um 404 em vez da tela de aceite.
+    const app = await appWithData();
+    const res = await request(app).get('/convite/um-token-qualquer').expect(200);
     expect(res.text).toContain('<div id="app">');
   });
 

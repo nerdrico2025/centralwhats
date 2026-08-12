@@ -9,15 +9,21 @@ import type {
   Flow,
   FlowExecution,
   Instance,
+  Invite,
   Message,
   NewContact,
   NewInstance,
   NewMessage,
   Org,
+  OrgMember,
+  OrgMembership,
+  OrgMemberView,
   OutboxItem,
   Tag,
   Template,
   User,
+  UserRole,
+  UserStatus,
 } from './types';
 
 /**
@@ -50,13 +56,36 @@ export interface Repo {
   metrics: MetricsRepo;
   orgs: OrgsRepo; // [V2]
   users: UsersRepo; // [V2]
+  orgMembers: OrgMembersRepo; // [P6.1]
+  invites: InvitesRepo; // [P6.1]
   outbox: OutboxRepo; // [V2]
   baileysAuth: BaileysAuthRepo; // [V2]
+  maintenance: MaintenanceRepo; // [P6.1]
 
   /** Roda as migrations pendentes para o driver ativo. */
   migrate(): Promise<void>;
   /** Fecha conexões/handles do banco. */
   close(): Promise<void>;
+}
+
+/** Tarefas de manutenção que precisam olhar a forma CRUA do dado gravado. */
+export interface MaintenanceRepo {
+  /**
+   * Backfill de criptografia (P6.1 / L1): cifra os segredos que ainda estão em
+   * texto claro. IDEMPOTENTE — linha já cifrada é contada em `skipped` e não é
+   * tocada, então rodar duas vezes não gera cifra sobre cifra.
+   *
+   * Vive no adapter porque precisa ler o valor ANTES da camada transparente de
+   * decifragem — é o único lugar do sistema que enxerga o formato armazenado.
+   */
+  backfillSecretEncryption(): Promise<{
+    instanceTokens: number;
+    instanceVerifyTokens: number;
+    baileysAuthValues: number;
+    skipped: number;
+  }>;
+  /** Instâncias sem org ou com org inexistente — auditoria pré-migration 012. */
+  findOrphanInstances(): Promise<{ id: string; name: string; org_id: string | null }[]>;
 }
 
 export interface OutboxRepo {
@@ -89,23 +118,85 @@ export interface BaileysAuthRepo {
 export interface OrgsRepo {
   create(data: Omit<Org, 'id' | 'created_at'>): Promise<Org>;
   getById(id: string): Promise<Org | null>;
+  /** Renomeia a org (usado quando o primeiro owner adota a org default). */
+  rename(id: string, name: string): Promise<Org | null>;
+  /** Quantas instâncias pertencem à org — decide a adoção da org default. */
+  countInstances(id: string): Promise<number>;
 }
 
 export interface UsersRepo {
-  create(data: Omit<User, 'id' | 'created_at'>): Promise<User>;
-  /** Login: email é único GLOBAL (resolve a org do usuário). */
+  create(
+    data: Omit<
+      User,
+      'id' | 'created_at' | 'status' | 'password_changed_at' | 'last_login_at' | 'name'
+    > & { name?: string | null; status?: UserStatus },
+  ): Promise<User>;
+  /** Login: email é único GLOBAL (resolve o usuário, não a org). */
   getByEmail(email: string): Promise<User | null>;
   getById(id: string): Promise<User | null>;
+  /**
+   * @deprecated Lê `users.org_id`, que é cache. Para a equipe de uma conta use
+   * `repo.orgMembers.listByOrg()`.
+   */
   listByOrg(orgId: string): Promise<User[]>;
   /** Total global de usuários — decide o modo bootstrap (V1 sem auth). */
   countAll(): Promise<number>;
+  /** Troca a senha e carimba password_changed_at (derruba as sessões). */
+  setPassword(id: string, passwordHash: string, changedAt: string): Promise<void>;
+  /** Ativa/desativa. 'disabled' derruba as sessões na request seguinte. */
+  setStatus(id: string, status: UserStatus): Promise<void>;
+  /** Marca o login e a org de entrada (cache) — nunca decide acesso. */
+  markLogin(id: string, at: string, activeOrgId: string): Promise<void>;
+}
+
+/** Vínculo N:N usuário↔org. Fonte da verdade do acesso e do papel [P6.1]. */
+export interface OrgMembersRepo {
+  add(orgId: string, userId: string, role: UserRole): Promise<OrgMember>;
+  /**
+   * Papel do usuário NAQUELA org, ou null se não é membro. É o que o
+   * middleware de auth consulta a cada request — o `org_id` do JWT sozinho
+   * nunca autoriza nada.
+   */
+  getRole(orgId: string, userId: string): Promise<UserRole | null>;
+  /** Orgs do usuário (com nome e papel) — alimenta o seletor de conta. */
+  listByUser(userId: string): Promise<OrgMembership[]>;
+  /** Equipe da org (com dados do usuário). */
+  listByOrg(orgId: string): Promise<OrgMemberView[]>;
+  remove(orgId: string, userId: string): Promise<void>;
+}
+
+export interface InvitesRepo {
+  create(
+    data: Omit<Invite, 'id' | 'status' | 'created_at' | 'accepted_at' | 'accepted_user_id'>,
+  ): Promise<Invite>;
+  getByTokenHash(tokenHash: string): Promise<Invite | null>;
+  getById(orgId: string, id: string): Promise<Invite | null>;
+  listByOrg(orgId: string): Promise<Invite[]>;
+  /**
+   * Consome o convite ATOMICAMENTE: só marca 'accepted' se ainda estiver
+   * 'pending'. Retorna false se outro aceite chegou antes — é o que garante o
+   * uso único do token (CLAUDE.md §contadores atômicos).
+   */
+  markAcceptedIfPending(id: string, userId: string, at: string): Promise<boolean>;
+  revoke(orgId: string, id: string): Promise<boolean>;
+  /** Novo token/validade para o mesmo convite (reenviar link). */
+  refreshToken(orgId: string, id: string, tokenHash: string, expiresAt: string): Promise<boolean>;
 }
 
 export interface InstancesRepo {
   create(data: NewInstance): Promise<Instance>;
   getById(id: string): Promise<Instance | null>;
-  /** [V2] com orgId: só instâncias daquela org. Sem orgId: todas (interno). */
-  list(orgId?: string): Promise<Instance[]>;
+  /**
+   * Instâncias de UMA org. O escopo é obrigatório: quem precisa varrer tudo
+   * usa `listAll()` e assume explicitamente que é caminho de sistema.
+   */
+  list(orgId: string): Promise<Instance[]>;
+  /**
+   * TODAS as instâncias, sem escopo de org. Só para caminhos MÁQUINA-A-MÁQUINA
+   * (cron, worker Baileys, verificação do webhook), que não têm usuário nem org
+   * ativa. Nunca use a partir de uma rota de usuário.
+   */
+  listAll(): Promise<Instance[]>;
   update(id: string, patch: Partial<NewInstance>): Promise<Instance | null>;
   delete(id: string): Promise<void>;
   /**

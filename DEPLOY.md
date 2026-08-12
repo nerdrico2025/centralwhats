@@ -86,7 +86,8 @@ Passos:
 | `DB_DRIVER` | `postgres` |
 | `DATABASE_URL` | connection do **pooler (6543)** |
 | `JWT_SECRET` | string longa aleatória (`openssl rand -hex 32`) |
-| `SECRETS_ENCRYPTION_KEY` | idem (validada no boot; reservada p/ criptografia em repouso — os tokens hoje ficam em texto no banco, protegidos pelo acesso ao Postgres) |
+| `SECRETS_ENCRYPTION_KEY` | idem — **cifra de verdade** os segredos em repouso (token/verify_token da Meta e sessão do Baileys). Precisa ser **a MESMA** na Vercel e no worker (Railway). Ver §7 |
+| `PUBLIC_SIGNUP` | **não defina** (ausente = registro público FECHADO). Só ligue (`true`) se quiser que qualquer pessoa crie conta pela tela de login — no modelo agência, usuário novo entra por convite |
 | `CRON_SECRET` | string longa aleatória (`openssl rand -hex 32`) — **obrigatória** para o disparo autônomo de campanhas |
 | `META_APP_SECRET` | App Secret do app da Meta — **obrigatória**: sem ela o webhook recusa todo evento (ver abaixo) |
 
@@ -163,8 +164,10 @@ pelo polling da UI aberta (como no P3.1) — só não avançam sozinhas.
 **Fumaça**:
 ```bash
 curl https://SEU-APP.vercel.app/health          # {"ok":true,...}
-# navegador: abre o painel; crie a PRIMEIRA conta em Usuários (isso tranca o
-# sistema — depois disso, tudo exige login)
+# navegador: abre o painel e crie a PRIMEIRA conta na tela de login. Isso
+# tranca o sistema (depois disso tudo exige login) E, se já houver instância na
+# org_default, a nova conta ADOTA essa org — as instâncias/conversas que já
+# existiam continuam visíveis. Confira isso ANTES de seguir (ver §7).
 ```
 
 ---
@@ -259,10 +262,12 @@ as conversas da org dele → responde → a resposta aparece no Live Chat web.
 
 ## 6. Checklist final
 
-- [ ] Migrations aplicadas no Supabase (18 tabelas, `org_default` existe)
+- [ ] `npm run audit-instances` sem órfãs **antes** de migrar (ver §7)
+- [ ] Migrations aplicadas no Supabase (~21 tabelas: + `org_members`, `invites`)
 - [ ] `npm test` verde contra o Postgres (valida o PostgresAdapter)
 - [ ] `/health` responde na Vercel
-- [ ] **Primeira conta criada** (sistema trancado — sem token = 401)
+- [ ] **Primeira conta criada** e as instâncias antigas continuam visíveis nela
+- [ ] `npm run encrypt-secrets` rodado DEPOIS do deploy (§7) e painel/worker OK
 - [ ] Webhook da Meta verificado + campo `messages` assinado
 - [ ] Template sincronizado e enviado com sucesso
 - [ ] Live Chat bidirecional (Meta)
@@ -270,6 +275,73 @@ as conversas da org dele → responde → a resposta aparece no Live Chat web.
 - [ ] Campanha pequena (10–20 contatos) com falhas visíveis em `campaign_sends`
 - [ ] Worker: QR pareado, mensagem via outbox entregue, restart sem re-parear
 - [ ] APK instalado, agent logado, resposta chegando no web
+
+## 7. Multi-tenancy e criptografia (P6.1) — ORDEM DE DEPLOY
+
+Esta rodada mexe em schema, em auth e em como os segredos são gravados. A
+ordem abaixo não é sugestão: cada passo depende do anterior.
+
+**1. Auditoria (antes de qualquer migration).** A migration 012 torna
+`instances.org_id` NOT NULL com FK — instância órfã faz ela falhar de
+propósito:
+
+```bash
+DB_DRIVER=postgres DATABASE_URL='postgres://...:5432/postgres' npm run audit-instances
+# "OK — N instância(s), todas com org válida" → pode seguir
+```
+
+**2. Migrations** (`010` org_members + campos de `users`, `011` invites,
+`012` NOT NULL/FK). Use a connection **direta (5432)**:
+
+```bash
+DB_DRIVER=postgres DATABASE_URL='postgres://...:5432/postgres' npm run migrate
+```
+
+A 010 copia TODO vínculo de `users.org_id` para `org_members` — ninguém perde
+acesso. `users.org_id` continua existindo, mas vira só cache da conta de
+entrada; a fonte da verdade passa a ser `org_members`.
+
+**3. Deploy do código** (Vercel + Railway). Só agora, porque o código novo lê
+`org_members` e as colunas criadas no passo 2.
+
+**4. Primeiro owner.** Pela tela de login (o primeiro registro adota a
+`org_default` se ela tiver instâncias) ou, se algo já tiver saído do trilho:
+
+```bash
+DB_DRIVER=postgres DATABASE_URL='postgres://...' \
+  npm run create-owner -- --email=voce@dominio.com --password='...' --org=org_default
+```
+
+Entre no painel e confirme que as instâncias/conversas antigas aparecem.
+**Não siga para o passo 5 antes disso.**
+
+**5. Backfill da criptografia — DEPOIS do deploy, nunca antes.** A leitura é
+tolerante (valor sem o prefixo `enc:` é lido como texto claro), então o sistema
+funciona nos dois estados e não há janela de indisponibilidade:
+
+```bash
+DB_DRIVER=postgres DATABASE_URL='postgres://...' \
+  SECRETS_ENCRYPTION_KEY='<a MESMA da Vercel e do Railway>' npm run encrypt-secrets
+```
+
+É idempotente: rodar duas vezes não cifra duas vezes (a segunda execução só
+conta "já cifradas"). Depois, confira o painel (envio funcionando) e o worker
+(sessão Baileys conectada).
+
+### Sobre a `SECRETS_ENCRYPTION_KEY`
+
+- Cifra `instances.token`, `instances.verify_token` e `baileys_auth.value`
+  (AES-256-GCM, prefixo `enc:v1:`).
+- **A MESMA chave na Vercel e no Railway.** Chaves diferentes = o worker não lê
+  a sessão que a web gravou, e vice-versa (erro alto, `SecretDecryptError` —
+  nunca falha em silêncio).
+- **Perder a chave torna os dados cifrados irrecuperáveis.** A recuperação é
+  manual: re-cadastrar o token da Meta na instância e re-escanear o QR do
+  Baileys. Guarde-a fora do repositório (gerenciador de senhas).
+- Rotação de chave ainda não é automática: o prefixo de versão existe
+  justamente para permitir isso depois sem quebrar o que já está gravado.
+
+---
 
 ## Troubleshooting
 
@@ -282,3 +354,7 @@ as conversas da org dele → responde → a resposta aparece no Live Chat web.
 | Vercel: `too many connections` no Postgres | `DATABASE_URL` sem pooler — use a porta **6543** na Vercel |
 | Worker desconecta e não volta | Veja o log: `statusCode 401` = logout no celular (re-parear via QR); outros códigos reconectam com backoff |
 | Painel abre sem pedir login | Modo bootstrap: nenhum usuário criado ainda — crie a primeira conta |
+| Depois de criar a conta, o painel não mostra as instâncias antigas | A conta nasceu numa org nova em vez de adotar a `org_default`. Rode `npm run create-owner -- --email=... --password=... --org=org_default` e entre com esse usuário |
+| `SecretDecryptError` no painel ou no worker | `SECRETS_ENCRYPTION_KEY` diferente da que gravou o dado. Use a MESMA na Vercel e no Railway — chave perdida = token/sessão irrecuperáveis (§7) |
+| `403 Registro público desabilitado` | Comportamento esperado: convide o usuário pela tela **Equipe**, ou defina `PUBLIC_SIGNUP=true` |
+| Convite dá "já foi utilizado" | Token é de uso único; use **Reenviar** na tela Equipe para gerar um link novo |

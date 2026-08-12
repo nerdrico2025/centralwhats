@@ -6,6 +6,7 @@ let repo: Repo;
 
 async function newInstance(name = 'Inst', phoneNumberId: string | null = null) {
   return repo.instances.create({
+    org_id: 'org_default',
     name,
     provider_type: 'meta',
     phone_number_id: phoneNumberId,
@@ -26,7 +27,7 @@ describe('instances', () => {
   it('CRUD + resolve por phone_number_id', async () => {
     const a = await newInstance('A', '111');
     const b = await newInstance('B', '222');
-    expect((await repo.instances.list()).map((i) => i.name).sort()).toEqual(['A', 'B']);
+    expect((await repo.instances.listAll()).map((i) => i.name).sort()).toEqual(['A', 'B']);
 
     const resolved = await repo.instances.getByPhoneNumberId('222');
     expect(resolved?.id).toBe(b.id);

@@ -382,7 +382,7 @@ export async function verifyChallenge(
   }
   if (!verifyToken) return { ok: false, reason: 'token_ausente' };
 
-  const instances = await repo.instances.list();
+  const instances = await repo.instances.listAll();
   if (instances.length === 0) {
     return { ok: false, reason: 'nenhuma_instancia', diag: { totalInstances: 0 } };
   }

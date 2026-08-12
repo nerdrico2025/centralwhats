@@ -199,6 +199,7 @@ describe('roteamento ponta a ponta (webhook → fluxo)', () => {
     repo = createSqliteAdapter({ path: ':memory:' });
     await repo.migrate();
     inst = await repo.instances.create({
+    org_id: 'org_default',
       name: 'Loja', provider_type: 'meta', phone_number_id: PNID, waba_id: null,
       token: 't', verify_token: 'v', active: true, connection_status: 'connected',
     });
