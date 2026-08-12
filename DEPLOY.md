@@ -262,6 +262,7 @@ as conversas da org dele → responde → a resposta aparece no Live Chat web.
 
 ## 6. Checklist final
 
+- [ ] Node **22.x** nos três lugares: `.nvmrc`, `engines` e painel da Vercel (§6.1)
 - [ ] `npm run audit-instances` sem órfãs **antes** de migrar (ver §7)
 - [ ] Migrations aplicadas no Supabase (~21 tabelas: + `org_members`, `invites`)
 - [ ] `npm test` verde contra o Postgres (valida o PostgresAdapter)
@@ -275,6 +276,49 @@ as conversas da org dele → responde → a resposta aparece no Live Chat web.
 - [ ] Campanha pequena (10–20 contatos) com falhas visíveis em `campaign_sends`
 - [ ] Worker: QR pareado, mensagem via outbox entregue, restart sem re-parear
 - [ ] APK instalado, agent logado, resposta chegando no web
+
+## 6.1 Versão de Node — FIXADA, e nos três lugares
+
+O projeto roda em **Node 22.x** (LTS "Jod"). Isso não é preferência: é
+requisito e é convergência.
+
+**Por que 22 e não a LTS mais nova (24):**
+- `node:sqlite`, usado pelo adapter de desenvolvimento, só existe a partir do
+  **Node 22.5**. Abaixo disso o processo nem carrega o módulo.
+- O Baileys pede `>=20` — coberto.
+- A Vercel oferece 24.x, 22.x e 20.x. O builder do Railway, pela evidência do
+  log real (`Node.js v20.20.2` com `engines: ">=20"`), **não estava servindo
+  24** — e o Nixpacks, quando não consegue resolver a versão pedida, cai em
+  silêncio no default dele (**Node 18**), que é pior que o problema original.
+  22 é o major mais novo que os três ambientes garantidamente entregam.
+- Quando um build do Railway confirmar que 24 está disponível lá, mover é
+  trocar `22` por `24` nos dois arquivos abaixo. Não antes.
+
+**Onde a versão está fixada (mudou um, mude todos):**
+
+| Lugar | Valor | Quem lê |
+|---|---|---|
+| `.nvmrc` | `22` | `nvm use` local; Railway/Nixpacks (3ª na ordem de precedência) |
+| `package.json` → `engines.node` | `22.x` | **Vercel** (sobrepõe o Node.js Version do painel) e Railway/Nixpacks (2ª na precedência, vence o `.nvmrc`) |
+| Painel da Vercel → Settings → Build and Deployment → **Node.js Version** | `22.x` | fallback quando o `engines` não existe — **confira na mão** |
+| Railway → Variables → `NIXPACKS_NODE_VERSION` *(opcional)* | `22` | 1ª na precedência; use se o build lá insistir noutra versão |
+
+**`vercel.json` não entra nessa lista de propósito:** o schema oficial
+(`https://openapi.vercel.sh/vercel.json`) **não tem** campo `nodeVersion` — só
+`bunVersion`. Inventar a chave faria a validação do deploy falhar. Na Vercel, o
+mecanismo de pinning é o `engines.node`, que por documentação sobrepõe a seleção
+do painel.
+
+**Só o major é fixável.** Vercel e Nixpacks instalam "a última 22.x" e aplicam
+patches sozinhos; por isso o `.nvmrc` traz `22`, e não um patch exato — pinar
+`22.23.2` daria uma precisão falsa que nenhum dos dois honra, e ainda faria o
+local divergir dos servidores a cada patch de segurança.
+
+**Sintoma de que isto saiu do lugar:** `ERR_UNKNOWN_BUILTIN_MODULE: node:sqlite`
+no boot (Node < 22.5), ou comportamento que difere entre painel e worker sem
+explicação. O primeiro passo do diagnóstico é `node -v` nos dois ambientes.
+
+---
 
 ## 7. Multi-tenancy e criptografia (P6.1) — ORDEM DE DEPLOY
 

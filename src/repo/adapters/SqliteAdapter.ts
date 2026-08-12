@@ -14,9 +14,36 @@ import * as m from './mappers';
 // isso bundlers (Vite/vitest) tentam resolvê-lo como pacote. Carregar via
 // createRequire mantém a resolução no runtime do Node.
 const nodeRequire = createRequire(__filename);
-const { DatabaseSync } = nodeRequire('node:sqlite') as {
-  DatabaseSync: new (path: string) => DatabaseSyncType;
-};
+
+/**
+ * Resolve `node:sqlite` NA HORA DE USAR — nunca no carregamento do módulo.
+ *
+ * POR QUÊ (bug real de produção): `node:sqlite` só existe a partir do Node
+ * 22.5. Enquanto esta resolução morava no escopo do módulo, bastava ALGUÉM
+ * IMPORTAR este arquivo para o processo morrer em Node 20 — e o factory de
+ * `repo.*` importa os dois adapters, então o worker Baileys no Railway
+ * (Node 20.20.2) crashava no boot com ERR_UNKNOWN_BUILTIN_MODULE mesmo estando
+ * configurado com DB_DRIVER=postgres, sem nunca ter pedido SQLite.
+ *
+ * Aqui dentro, quem paga o custo é só quem realmente cria um adapter SQLite —
+ * e a mensagem diz o que fazer, em vez de um erro de builtin desconhecido.
+ */
+function carregarDatabaseSync(): new (path: string) => DatabaseSyncType {
+  try {
+    return (
+      nodeRequire('node:sqlite') as {
+        DatabaseSync: new (path: string) => DatabaseSyncType;
+      }
+    ).DatabaseSync;
+  } catch (err) {
+    throw new Error(
+      `O driver SQLite exige o módulo "node:sqlite", que só existe a partir do Node 22.5 ` +
+        `(este processo é ${process.version}). Use Node 22.5+ para desenvolvimento local ou ` +
+        'defina DB_DRIVER=postgres com DATABASE_URL. ' +
+        `Detalhe: ${(err as Error).message}`,
+    );
+  }
+}
 
 /**
  * Adapter SQLite (dev), via node:sqlite (built-in, sem build nativo).
@@ -24,6 +51,9 @@ const { DatabaseSync } = nodeRequire('node:sqlite') as {
  * Toda operação de tenant filtra por instance_id.
  */
 export function createSqliteAdapter(opts: { path: string }): Repo {
+  // Resolvido AQUI (não no topo do módulo): importar este arquivo não pode
+  // exigir node:sqlite — ver carregarDatabaseSync().
+  const DatabaseSync = carregarDatabaseSync();
   const db = new DatabaseSync(opts.path);
   db.exec('PRAGMA foreign_keys = ON;');
 
