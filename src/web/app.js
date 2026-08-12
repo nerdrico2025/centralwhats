@@ -2838,7 +2838,29 @@ function instanciasScreen() {
 }
 
 // ------------------------------------------------------------ Login (P6.1/V2)
+// A tela de login está montada? Enquanto estiver, NINGUÉM a remonta.
+//
+// Remontar parece inofensivo, mas destrói o formulário: o que o usuário já
+// digitou some. Como renderLoginScreen() é chamada de todo 401 do api.raw,
+// qualquer request em voo (ou polling que tenha escapado) transformava a tela
+// num ciclo de "limpa tudo" — o bug relatado em produção.
+let loginMontado = false;
+
+/** Sai do modo login (chamado quando o shell do painel é montado). */
+function resetLoginScreen() {
+  loginMontado = false;
+}
+
 function renderLoginScreen() {
+  // Idempotente: já está na tela → não mexe em nada.
+  if (loginMontado) return;
+  loginMontado = true;
+
+  // Ir para o login é SAIR da tela anterior: mata pollings pendentes (Live
+  // Chat, disparo, QR). Sem isto eles seguem batendo na API, tomam 401 e
+  // reentram aqui em loop.
+  runScreenCleanup();
+
   const app = document.getElementById('app');
   app.innerHTML = '';
 
@@ -2852,12 +2874,31 @@ function renderLoginScreen() {
   });
   app.appendChild(wrap);
 
+  // Nó próprio para o rodapé: a resposta do registration-status atualiza SÓ
+  // ele. Redesenhar o cartão inteiro aqui apagaria o que já foi digitado —
+  // a resposta chega alguns instantes depois de a tela abrir, bem no meio da
+  // digitação.
+  const rodape = h('div', {});
+
+  function desenharRodape() {
+    rodape.innerHTML = '';
+    rodape.appendChild(
+      registroAberto
+        ? h('button', {
+            class: 'btn', style: 'width:100%;margin-top:8px;border:none',
+            onclick: () => { mode = mode === 'login' ? 'register' : 'login'; draw(); },
+          }, mode === 'login' ? 'Não tem conta? Criar organização' : 'Já tem conta? Entrar')
+        : h('div', { class: 'muted', style: 'font-size:12px;margin-top:10px;text-align:center' },
+            'Novos usuários entram por convite do administrador da conta.'),
+    );
+  }
+
   fetch('/api/auth/registration-status')
     .then((r) => (r.ok ? r.json() : null))
     .then((s) => {
       if (s) {
         registroAberto = !!s.open;
-        draw();
+        desenharRodape(); // só o rodapé — os campos ficam intactos
       }
     })
     .catch(() => {
@@ -2904,15 +2945,10 @@ function renderLoginScreen() {
         errEl,
         h('button', { class: 'btn btn--primary', style: 'width:100%', onclick: submit },
           mode === 'login' ? 'Entrar' : 'Criar conta'),
-        registroAberto
-          ? h('button', {
-              class: 'btn', style: 'width:100%;margin-top:8px;border:none',
-              onclick: () => { mode = mode === 'login' ? 'register' : 'login'; draw(); },
-            }, mode === 'login' ? 'Não tem conta? Criar organização' : 'Já tem conta? Entrar')
-          : h('div', { class: 'muted', style: 'font-size:12px;margin-top:10px;text-align:center' },
-              'Novos usuários entram por convite do administrador da conta.'),
+        rodape,
       ]),
     );
+    desenharRodape();
   }
   draw();
 }
@@ -2926,6 +2962,7 @@ function renderLoginScreen() {
  * um convite vire "esqueci a senha" de conta alheia.
  */
 function renderInviteScreen(token) {
+  runScreenCleanup();
   const app = document.getElementById('app');
   app.innerHTML = '';
   const wrap = h('div', {
@@ -3324,20 +3361,40 @@ function renderTopbar() {
   ]);
 }
 
-// Limpeza da tela atual (ex.: parar o polling do Live Chat ao navegar).
-let screenCleanup = null;
+// Limpeza da tela atual (ex.: parar o polling do Live Chat ao sair dela).
+//
+// POR QUE ISTO É CRÍTICO: os pollings (Live Chat 4s, disparo de campanha, QR)
+// fazem requests AUTENTICADAS. Se a tela some sem que o timer seja parado, ele
+// continua batendo na API; quando o sistema tranca (primeiro owner criado,
+// sessão revogada, token expirado), cada tick vira 401 → renderLoginScreen() →
+// a tela de login é reconstruída POR CIMA do que o usuário está digitando, no
+// ritmo do polling. Foi exatamente esse o bug do "login some a cada 2s".
+//
+// Lista, e não slot único: uma tela pode registrar mais de uma limpeza, e a
+// versão anterior descartava silenciosamente todas menos a última.
+let screenCleanups = [];
 function registerCleanup(fn) {
-  screenCleanup = fn;
+  screenCleanups.push(fn);
+}
+
+/** Executa e esvazia TODAS as limpezas pendentes. Nunca lança. */
+function runScreenCleanup() {
+  const pendentes = screenCleanups;
+  screenCleanups = [];
+  for (const fn of pendentes) {
+    try {
+      fn();
+    } catch (e) {
+      console.error('[cleanup] falhou (seguindo):', e); // eslint-disable-line no-console
+    }
+  }
 }
 function refreshSidebar() {
   document.getElementById('sidebar-mount').replaceWith(withId(renderSidebar(), 'sidebar-mount'));
 }
 
 async function renderCurrentScreen() {
-  if (screenCleanup) {
-    screenCleanup();
-    screenCleanup = null;
-  }
+  runScreenCleanup();
   refreshSidebar();
   document.getElementById('topbar-mount').replaceWith(withId(renderTopbar(), 'topbar-mount'));
   const content = document.getElementById('content-mount');
@@ -3390,6 +3447,7 @@ async function boot() {
 
   const app = document.getElementById('app');
   app.innerHTML = '';
+  resetLoginScreen(); // saímos do login: a próxima falha de auth pode remontá-lo
   app.appendChild(
     h('div', { class: 'app-shell' }, [
       withId(h('div', {}, []), 'sidebar-mount'),
