@@ -542,10 +542,11 @@ Baileys.
 - **B3** — instância nova não conecta até o worker reiniciar. Correção: o worker varre
   periodicamente (ele já é um processo com timers legítimos — o `CLAUDE.md` proíbe timers na
   camada serverless, não aqui) procurando instâncias Baileys ativas sem socket, e conecta.
-- **QR sem validade.** O QR do WhatsApp expira em ~20s e o Baileys emite um novo; o painel busca
-  sob demanda, então na prática funciona, mas um `qr` velho pode ficar em `baileys_auth`
-  indefinidamente se o worker cair no meio. Gravar o instante de emissão e tratar QR vencido como
-  ausente resolve.
+- **QR sem validade explícita.** O QR expira e o Baileys emite outro (primeiro após ~60s, depois a
+  cada ~20s), sobrescrevendo a linha. O caso "worker caiu e deixou QR morto no banco" **foi
+  corrigido**: o `close` agora apaga o `qr` (`baileysWorker.ts:335`), porque o `ref` pertence ao
+  socket que morreu. O que ainda não existe é um carimbo de emissão — dentro de um socket vivo, um
+  QR de 19s ainda é servido como se fosse novo.
 - **Não existe "desconectar/re-parear" na UI.** Só o logout vindo do celular limpa a sessão
   (`baileysWorker.ts:308`). Trocar de número exige mexer no banco.
 - **Pareamento por código de 8 dígitos** (alternativa ao QR, útil quando o celular não está à
@@ -587,6 +588,57 @@ Os pontos que **ainda assumem Meta implicitamente**, em ordem de importância:
 
 **Nada disso é reescrita.** São ajustes localizados, e o item 1 é o único que merece desenho antes
 de código.
+
+### 3.6 Histórico de conversas — NÃO é sincronizado (comportamento esperado)
+
+**Pergunta que isto responde:** "pareei o número, mas o Live Chat mostra 'Sem conversas ainda',
+mesmo o WhatsApp tendo conversas antigas. É bug?"
+
+**Não é bug. É o comportamento atual, por omissão de escopo.** O sistema só enxerga mensagens
+**recebidas a partir do pareamento** — exatamente como já acontece na Meta Cloud API (V1), que
+também não entrega histórico. Uma instância recém-pareada começa com o Live Chat vazio e vai se
+preenchendo conforme as pessoas escrevem.
+
+**O que o código faz hoje, verificado linha a linha:**
+
+| Ponto | Estado |
+|---|---|
+| `syncFullHistory` no `makeWASocket` | **não passamos** (`realSocket.ts:106-112` manda só `auth`, `printQRInTerminal` e `version`) → vale o default da lib, hoje `true` |
+| Handler de `messaging-history.set` | **não existe**. O worker registra só `connection.update` e `messages.upsert` (`baileysWorker.ts:286,296`) e `creds.update` (`realSocket.ts:115`) |
+| Efeito prático | o WhatsApp pode até mandar o histórico; **ninguém escuta**, então nada chega ao `repo.*` |
+
+Detalhe que engana: `syncFullHistory: true` faz o `requireFullSync` ir no nó de registro
+(`Utils/validate-connection.js:79`), mas o `shouldSyncHistoryMessage` default **descarta** o sync
+do tipo `FULL` (`Defaults/index.js:65-67`). Ou seja, nem mexendo só nessa flag o histórico
+completo apareceria — e, com zero listeners, a discussão é acadêmica.
+
+**Custo de implementar, se um dia for decidido (levantamento, não recomendação):**
+
+O trabalho **não** é criptografia nem paginação manual — a lib resolve isso. O
+`downloadAndProcessHistorySyncNotification` baixa, decifra e faz o parse do protobuf, e o evento
+chega pronto com `{ chats, contacts, messages, isLatest, progress, chunkOrder, syncType }`
+(`Utils/process-message.js:261-276`). O custo real é de **integração**, e tem uma armadilha séria:
+
+1. **Não passar histórico pelo `recordInbound`.** Ele dispara o motor de fluxos
+   (`src/domain/inbound.ts:80`) — importar histórico por ali faria o bot **responder a mensagens
+   de meses atrás**, disparando fluxos e possivelmente mensagens reais para clientes. O import
+   precisa de um caminho próprio, que grava contato/conversa/mensagem **sem** tocar em fluxos.
+2. **Volume e chunking.** O evento chega em pedaços, várias vezes, fora de ordem
+   (`chunkOrder`), e um número movimentado traz milhares de mensagens — gravar isso num
+   `for` sequencial pelo `repo.*` é lento e pode competir com o tráfego ao vivo.
+3. **Dedupe.** Já temos `wa_message_id` único por instância; o import precisa usá-lo, senão uma
+   segunda sincronização duplica tudo.
+4. **Mensagens `fromMe`.** Histórico traz os dois lados; hoje o worker ignora `fromMe`
+   (`baileysWorker.ts:298`). Sem tratar, a conversa importada fica só com metade das falas.
+
+**Estimativa: médio** — 1 a 2 dias, dominados pelos itens 1 e 2, não pelo Baileys. A alternativa
+barata (e honesta) é **não implementar** e deixar escrito na UI de pareamento que o histórico
+anterior não vem junto.
+
+> **Nota adjacente, encontrada na mesma auditoria:** o handler de `messages.upsert` ignora o campo
+> `u.type` (`'notify'` vs `'append'`) e processa tudo pelo mesmo caminho. Mensagens que chegam
+> enquanto o worker esteve fora entram como inbound normal — o que é desejável — mas é uma
+> distinção que não estamos fazendo de propósito, e sim por omissão.
 
 ---
 
