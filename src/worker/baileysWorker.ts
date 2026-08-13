@@ -28,7 +28,16 @@ export interface BaileysSocketLike {
   end?(err?: Error): void;
 }
 
-export type SocketFactory = (instance: Instance) => Promise<BaileysSocketLike>;
+/** Contexto que o worker dá à factory (o socket real usa no logger). */
+export interface SocketContext {
+  /** Este fechamento foi pedido por nós? Ver o Set `closing`. */
+  intentionalClose(): boolean;
+}
+
+export type SocketFactory = (
+  instance: Instance,
+  ctx: SocketContext,
+) => Promise<BaileysSocketLike>;
 
 export interface BaileysWorkerOpts {
   socketFactory: SocketFactory;
@@ -36,6 +45,8 @@ export interface BaileysWorkerOpts {
   pollMs?: number;
   /** Intervalo da varredura de instâncias (ms). */
   scanMs?: number;
+  /** TTL da outbox de instância sem socket (min). */
+  outboxStaleMinutes?: number;
   /** Backoff máximo de reconexão (ms). */
   maxReconnectDelayMs?: number;
 }
@@ -45,6 +56,16 @@ export interface BaileysWorkerOpts {
  * Configurável por env WORKER_SCAN_INTERVAL_S.
  */
 export const SCAN_INTERVAL_S = Number(process.env.WORKER_SCAN_INTERVAL_S ?? 30);
+
+/**
+ * B4 — quanto tempo um item pode ficar `pending` numa instância SEM socket
+ * antes de virar falha explícita (default 60min).
+ * Configurável por env OUTBOX_STALE_MINUTES.
+ */
+export const OUTBOX_STALE_MINUTES = Number(process.env.OUTBOX_STALE_MINUTES ?? 60);
+
+/** Motivo gravado em outbox.error e messages.error_code (auditável). */
+export const OUTBOX_STALE_REASON = 'instance_disconnected_timeout';
 
 /** Telefone → JID do WhatsApp. */
 export function toJid(phone: string): string {
@@ -359,10 +380,60 @@ export class BaileysWorker {
         await this.disconnectInstance(id);
         desconectadas++;
       }
+
+      // B4: instância sem socket não consome outbox. Sem isto, a fila cresce
+      // calada até um cliente reclamar que não recebeu nada.
+      for (const inst of instances) {
+        if (this.sockets.has(inst.id)) continue;
+        await this.failStaleOutbox(inst);
+      }
     } finally {
       this.scanning = false;
     }
     return { conectadas, desconectadas };
+  }
+
+  /**
+   * B4 — TTL da outbox de instância SEM socket.
+   *
+   * POR QUÊ o limiar é generoso (60min default): a outbox de instância viva é
+   * drenada a cada 2s e o backoff de reconexão tem teto de 60s. Um item parado
+   * há uma hora não é lentidão — é número morto. Curto demais transformaria
+   * queda passageira em mensagem perdida.
+   *
+   * POR QUÊ só quem não tem socket: com socket vivo o poll leva o item em
+   * segundos; marcar falha ali seria roubar trabalho de quem ia fazê-lo.
+   *
+   * Nada some em silêncio: o item vira `failed` COM motivo e a mensagem
+   * ligada a ele também, para o Live Chat parar de mostrar "queued" eterno.
+   */
+  async failStaleOutbox(instance: Instance): Promise<number> {
+    const limiteMin = this.opts.outboxStaleMinutes ?? OUTBOX_STALE_MINUTES;
+    const corte = Date.now() - limiteMin * 60_000;
+    // listByInstance basta: só olhamos instâncias PARADAS, cuja fila não cresce.
+    const pendentes = await this.repo.outbox.listByInstance(instance.id, 'pending');
+    const travados = pendentes.filter((item) => {
+      const criado = Date.parse(item.created_at);
+      return Number.isFinite(criado) && criado < corte;
+    });
+    if (!travados.length) return 0;
+
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[worker] outbox travada, marcando como falha: ${travados.length} mensagens ` +
+        `da instância ${instance.name} (${instance.id}), pending há mais de ${limiteMin}min`,
+    );
+    for (const item of travados) {
+      await this.repo.outbox.markFailed(item.id, OUTBOX_STALE_REASON);
+      if (item.message_id) {
+        await this.repo.messages.updateById(item.message_id, {
+          status: 'failed',
+          error_code: OUTBOX_STALE_REASON,
+          error_message: `Instância desconectada: mensagem ficou ${limiteMin}min na fila sem envio.`,
+        });
+      }
+    }
+    return travados.length;
   }
 
   /**
@@ -393,7 +464,9 @@ export class BaileysWorker {
     this.closing.delete(instance.id);
     let socket: BaileysSocketLike;
     try {
-      socket = await this.opts.socketFactory(instance);
+      socket = await this.opts.socketFactory(instance, {
+        intentionalClose: () => this.closing.has(instance.id),
+      });
     } finally {
       // Falhou? Sai de `connecting` e a próxima varredura tenta de novo.
       this.connecting.delete(instance.id);
@@ -414,8 +487,14 @@ export class BaileysWorker {
       for (const msg of u.messages ?? []) {
         if (msg.key?.fromMe) continue;
         void this.handleIncoming(instance, msg).catch((err) => {
+          // Instância e id da mensagem no log: com várias instâncias no mesmo
+          // worker, um stack solto não diz de qual número veio a falha.
           // eslint-disable-next-line no-console
-          console.error('[worker] inbound:', err);
+          console.error(
+            `[worker] inbound falhou — instância=${instance.id} (${instance.name}) ` +
+              `msg=${msg.key?.id ?? '-'}:`,
+            err,
+          );
         });
       }
     }) as never);

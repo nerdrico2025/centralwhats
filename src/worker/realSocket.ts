@@ -1,6 +1,7 @@
 import { createRequire } from 'node:module';
 import type { Repo } from '../repo';
 import { makeDbAuthState } from './dbAuthState';
+import { makeBaileysLogger } from './baileysLogger';
 import type { BaileysSocketLike, SocketFactory } from './baileysWorker';
 
 const nodeRequire = createRequire(__filename);
@@ -98,7 +99,7 @@ export function getWaVersion(): Promise<WaVersionInfo> {
  * usam factories fake.
  */
 export function makeRealSocketFactory(repo: Repo): SocketFactory {
-  return async (instance) => {
+  return async (instance, ctx) => {
     const baileys = loadBaileys();
     const makeWASocket = baileys.default ?? baileys.makeWASocket;
     if (!makeWASocket) throw new Error('makeWASocket não encontrado no pacote baileys');
@@ -110,6 +111,9 @@ export function makeRealSocketFactory(repo: Repo): SocketFactory {
       printQRInTerminal: false,
       // Sem `version` explícita o WhatsApp rejeita com 405 — ver resolveWaVersion().
       ...(version ? { version } : {}),
+      // Logger NOSSO: o default da lib perde message/stack do erro na
+      // serialização do pino — ver makeBaileysLogger().
+      logger: makeBaileysLogger(instance, { intentionalClose: ctx?.intentionalClose }),
       // O QR é persistido pelo worker (baileys_auth 'qr') e servido pela API.
     });
     socket.ev.on('creds.update', (() => {

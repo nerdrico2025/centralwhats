@@ -102,16 +102,19 @@ bootstrap para todo mundo** (`countAll()` é global), o que transforma o item B1
 negação de acesso trivial. Isso vale mesmo que hoje seja "só uso próprio" — a URL da Vercel é
 pública.
 
-**B3 — Instância Baileys criada com o worker no ar nunca conecta.**
-`BaileysWorker.start()` lista as instâncias **uma vez** (`src/worker/baileysWorker.ts:229`) e nunca
-mais varre. `connectInstance` só é chamada de novo pelo caminho de reconexão. Criar uma instância
-Baileys pelo painel e clicar em "QR" fica esperando para sempre, sem erro nem log — falha
-silenciosa, exatamente o que o `CLAUDE.md` proíbe. Contorno atual: reiniciar o worker.
+**B3 — Instância Baileys criada com o worker no ar nunca conecta.** ✅ **CORRIGIDO.**
+`BaileysWorker.start()` listava as instâncias **uma vez** e nunca mais varria: criar uma instância
+pelo painel e clicar em "QR" esperava para sempre, sem erro nem log. Agora `scanInstancesOnce()`
+roda no boot **e** a cada `WORKER_SCAN_INTERVAL_S` (default 30s), abrindo socket para toda Baileys
+ativa sem um — e fechando o das desativadas/removidas.
 
-**B4 — Outbox de instância desconectada acumula em silêncio.**
-`processOutboxOnce` itera sobre `this.sockets` (`:335`), ou seja, só instâncias **conectadas**.
-Se o número cair, as mensagens ficam `pending` indefinidamente: o Live Chat mostra "queued" para
-sempre, sem TTL, sem alerta, sem contador de idade.
+**B4 — Outbox de instância desconectada acumula em silêncio.** ✅ **CORRIGIDO.**
+`processOutboxOnce` itera sobre `this.sockets`, ou seja, só instâncias **conectadas** — se o número
+cai, ninguém consome a fila. Agora a varredura periódica chama `failStaleOutbox()`: item `pending`
+há mais de `OUTBOX_STALE_MINUTES` (default 60) numa instância **sem socket** vira `failed` com
+motivo `instance_disconnected_timeout`, na outbox **e** na mensagem ligada — o Live Chat para de
+mostrar "queued" eterno. Sai também um `console.warn` com a contagem e a instância. Alerta externo
+(email/Slack) continua fora de escopo.
 
 **L1 — Segredos em texto claro no banco. (a dívida que o briefing já suspeitava)**
 `instances.token`, `instances.verify_token` e `baileys_auth.value` são gravados como vieram
@@ -650,8 +653,8 @@ anterior não vem junto.
 - **Isolamento:** nenhuma request de usuário alcança dado de outra org. O gargalo é
   `requireInstance`; a proteção é ele ser o **único** caminho, e o `orgId` ser obrigatório nele.
 - **Sem falha silenciosa:** toda transição relevante (envio, conexão, retomada de fluxo, expiração
-  de convite, falha de decifragem) grava resultado — sucesso **e** falha — com motivo. B4 e B3
-  violam isso hoje.
+  de convite, falha de decifragem) grava resultado — sucesso **e** falha — com motivo. B3 e B4
+  eram as violações abertas; ambas fechadas (§1.3).
 - **Fail-closed em segredo ausente:** padrão já adotado por `CRON_SECRET` e `META_APP_SECRET`,
   e que deve valer para `PUBLIC_SIGNUP` e para a chave de criptografia.
 - **Zero estado em memória na camada web:** inalterado. O worker é a exceção **por desenho** e é a
@@ -732,9 +735,10 @@ Decisões tomadas pelo Rafael sobre este documento: **D2** = modelo agência (n�
 
 ### O que continua aberto (não fazia parte desta rodada)
 
-- **B3** — o worker Baileys só varre instâncias no `start()`: instância nova não conecta até
-  reiniciar o worker.
-- **B4** — outbox de instância desconectada acumula sem TTL nem alerta.
+- ~~**B3**~~ e ~~**B4**~~ — fechados na rodada do worker (varredura periódica + TTL da outbox);
+  ver §1.3. Junto foram: o 405 do handshake (versão do WhatsApp Web resolvida no boot), o estado
+  `connecting` no pareamento e o logger próprio do Baileys, que acabou com o
+  `error in handling message` sem causa.
 - **L2** — `META_APP_SECRET` global (aceito enquanto os WABAs forem todos do mesmo App Meta —
   decisão D6).
 - **L6 / D10** — uma réplica de worker por convenção, sem lock no banco.

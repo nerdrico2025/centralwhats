@@ -13,6 +13,7 @@ import {
   type BaileysSocketLike,
 } from '../src/worker/baileysWorker';
 import { resolveWaVersion } from '../src/worker/realSocket';
+import { extractErro, makeBaileysLogger } from '../src/worker/baileysLogger';
 import { makeDbAuthState } from '../src/worker/dbAuthState';
 import type { Repo } from '../src/repo';
 import type { Instance } from '../src/repo/types';
@@ -531,6 +532,150 @@ describe('B3 — varredura periódica de instâncias', () => {
     await new Promise((r2) => setTimeout(r2, 40));
     expect(aberturas).toBe(1);
     await worker.stop();
+  });
+});
+
+describe('B4 — outbox travada vira falha explícita (nunca some calada)', () => {
+  // O item nasce "agora"; quem controla o que é velho é o limiar. `0` = tudo
+  // que já existe está vencido (esperamos alguns ms para o corte ser > created_at);
+  // `60` = nada recém-criado vence. Evita SQL cru só para envelhecer a linha.
+  const JA_VENCIDO = 0;
+  const UMA_HORA = 60;
+
+  it('item vencido de instância SEM socket vira failed com motivo auditável', async () => {
+    const { message } = await sendViaProvider(repo, inst, { type: 'text', to: PHONE, text: 'oi' });
+    const worker = new BaileysWorker(repo, {
+      socketFactory: async () => makeFakeSocket().socket,
+      outboxStaleMinutes: JA_VENCIDO,
+    });
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(await worker.failStaleOutbox(inst)).toBe(1);
+
+    const failed = await repo.outbox.listByInstance(inst.id, 'failed');
+    expect(failed).toHaveLength(1);
+    expect(failed[0].error).toBe('instance_disconnected_timeout');
+
+    // A mensagem ligada sai do "queued" eterno no Live Chat.
+    const msgs = await repo.messages.listByContact(inst.id, PHONE);
+    const msg = msgs.find((m) => m.id === message.id);
+    expect(msg?.status).toBe('failed');
+    expect(msg?.error_code).toBe('instance_disconnected_timeout');
+    expect(msg?.error_message).toContain('Instância desconectada');
+  });
+
+  it('item recente NÃO é tocado', async () => {
+    await sendViaProvider(repo, inst, { type: 'text', to: PHONE, text: 'oi' });
+    const worker = new BaileysWorker(repo, {
+      socketFactory: async () => makeFakeSocket().socket,
+      outboxStaleMinutes: UMA_HORA,
+    });
+
+    expect(await worker.failStaleOutbox(inst)).toBe(0);
+    expect(await repo.outbox.listByInstance(inst.id, 'pending')).toHaveLength(1);
+  });
+
+  it('instância CONECTADA não sofre TTL, mesmo com item vencido', async () => {
+    await sendViaProvider(repo, inst, { type: 'text', to: PHONE, text: 'oi' });
+    const worker = new BaileysWorker(repo, {
+      socketFactory: async () => makeFakeSocket().socket,
+      pollMs: 10_000, // o consumo normal fora do caminho deste teste
+      outboxStaleMinutes: JA_VENCIDO,
+    });
+    await worker.start(); // instância ativa → ganha socket
+    await new Promise((r) => setTimeout(r, 10));
+
+    await worker.scanInstancesOnce(); // TTL só para quem NÃO tem socket
+    expect(await repo.outbox.listByInstance(inst.id, 'pending')).toHaveLength(1);
+    await worker.stop();
+  });
+
+  it('a varredura periódica aplica o TTL na instância desativada', async () => {
+    await sendViaProvider(repo, inst, { type: 'text', to: PHONE, text: 'oi' });
+    const worker = new BaileysWorker(repo, {
+      socketFactory: async () => makeFakeSocket().socket,
+      pollMs: 10_000,
+      outboxStaleMinutes: JA_VENCIDO,
+    });
+    await worker.start();
+    await repo.instances.update(inst.id, { active: false });
+    await new Promise((r) => setTimeout(r, 10));
+
+    await worker.scanInstancesOnce(); // fecha o socket E aplica o TTL
+    const failed = await repo.outbox.listByInstance(inst.id, 'failed');
+    expect(failed).toHaveLength(1);
+    expect(failed[0].error).toBe('instance_disconnected_timeout');
+    await worker.stop();
+  });
+});
+
+describe('logger do Baileys — o detalhe que o pino default perdia', () => {
+  const boom = Object.assign(new Error('Connection Closed'), {
+    output: { statusCode: 428 },
+  });
+
+  function coletar(opts: Parameters<typeof makeBaileysLogger>[1] = {}) {
+    const linhas: { level: string; linha: string }[] = [];
+    const logger = makeBaileysLogger(inst, {
+      ...opts,
+      sink: (level, linha) => linhas.push({ level, linha }),
+    });
+    return { logger, linhas };
+  }
+
+  it('extractErro puxa message, statusCode e stack (campos `error` e `err`)', () => {
+    expect(extractErro({ error: boom })).toMatchObject({
+      message: 'Connection Closed',
+      statusCode: 428,
+    });
+    expect(extractErro({ err: boom }).message).toBe('Connection Closed');
+    expect(extractErro({}).message).toBeNull();
+    expect(extractErro(undefined)).toEqual({ message: null, statusCode: null, stack: null });
+  });
+
+  it('error da lib sai COM message/statusCode/stack e a instância', () => {
+    const { logger, linhas } = coletar({ level: 'warn' });
+    // Exatamente como messages-recv.js:1436 chama.
+    logger.error({ error: boom, node: '<message id="X"/>' }, 'error in handling message');
+
+    expect(linhas).toHaveLength(1);
+    expect(linhas[0].level).toBe('error');
+    expect(linhas[0].linha).toContain('error in handling message');
+    expect(linhas[0].linha).toContain('erro=Connection Closed');
+    expect(linhas[0].linha).toContain('statusCode=428');
+    expect(linhas[0].linha).toContain(inst.name);
+    expect(linhas[0].linha).toContain(inst.id);
+    expect(linhas[0].linha).toContain('Error: Connection Closed'); // stack
+  });
+
+  it('428 logo após fechamento NOSSO vira debug (ruído esperado, some em warn)', () => {
+    const { logger, linhas } = coletar({ level: 'warn', intentionalClose: () => true });
+    logger.error({ error: boom }, 'error in handling message');
+    expect(linhas).toHaveLength(0); // rebaixado p/ debug e filtrado pelo nível
+
+    // O mesmo erro SEM fechamento intencional continua aparecendo.
+    const semFechamento = coletar({ level: 'warn', intentionalClose: () => false });
+    semFechamento.logger.error({ error: boom }, 'error in handling message');
+    expect(semFechamento.linhas).toHaveLength(1);
+    expect(semFechamento.linhas[0].level).toBe('error');
+  });
+
+  it('nível default warn corta o ruído de info, mas nunca um erro real', () => {
+    const { logger, linhas } = coletar({ level: 'warn' });
+    logger.info({ node: {} }, 'connected to WA');
+    logger.debug({}, 'sent ack');
+    expect(linhas).toHaveLength(0);
+
+    logger.error({ error: new Error('falha de verdade') }, 'boom');
+    expect(linhas).toHaveLength(1);
+    expect(linhas[0].linha).toContain('erro=falha de verdade');
+  });
+
+  it('child() preserva a instância (o Baileys chama child({class:"baileys"}))', () => {
+    const { logger, linhas } = coletar({ level: 'warn' });
+    logger.child({ class: 'baileys' }).error({ error: boom }, 'erro no filho');
+    expect(linhas[0].linha).toContain('class=baileys');
+    expect(linhas[0].linha).toContain(inst.id);
   });
 });
 
