@@ -518,7 +518,8 @@ Painel                      Postgres                      Worker (sempre-ligado)
   │ POST /api/instances        │                                  │
   │  {provider_type: baileys}  │                                  │
   ├───────────────────────────►│ instances (status=disconnected)   │
-  │                            │◄──── lê instâncias no start ──────┤  ⚠️ só no start (B3)
+  │                            │◄─ lê instâncias no start E a cada ┤  varredura periódica
+  │                            │   30s (WORKER_SCAN_INTERVAL_S)    │  (B3 corrigido)
   │                            │                                  │ abre socket
   │                            │      baileys_auth['qr'] = <str>  │◄─┤ evento connection.update{qr}
   │                            │      instances.status = pending  │◄─┤
@@ -539,9 +540,11 @@ Baileys.
 
 **O que falta neste fluxo:**
 
-- **B3** — instância nova não conecta até o worker reiniciar. Correção: o worker varre
-  periodicamente (ele já é um processo com timers legítimos — o `CLAUDE.md` proíbe timers na
-  camada serverless, não aqui) procurando instâncias Baileys ativas sem socket, e conecta.
+- ~~**B3** — instância nova não conecta até o worker reiniciar.~~ **CORRIGIDO.** O worker varre
+  a cada 30s (`WORKER_SCAN_INTERVAL_S`) procurando instâncias Baileys ativas sem socket e conecta
+  (`baileysWorker.ts:scanInstancesOnce`). O boot usa a MESMA função. A varredura também fecha o
+  socket de instância desativada/removida, que antes ficava órfã recebendo mensagem e rodando
+  fluxo de um número que o painel dava como desligado.
 - **QR sem validade explícita.** O QR expira e o Baileys emite outro (primeiro após ~60s, depois a
   cada ~20s), sobrescrevendo a linha. O caso "worker caiu e deixou QR morto no banco" **foi
   corrigido**: o `close` agora apaga o `qr` (`baileysWorker.ts:335`), porque o `ref` pertence ao

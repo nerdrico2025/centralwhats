@@ -34,9 +34,17 @@ export interface BaileysWorkerOpts {
   socketFactory: SocketFactory;
   /** Intervalo do consumo da outbox (ms). */
   pollMs?: number;
+  /** Intervalo da varredura de instâncias (ms). */
+  scanMs?: number;
   /** Backoff máximo de reconexão (ms). */
   maxReconnectDelayMs?: number;
 }
+
+/**
+ * Intervalo da varredura de instâncias, em segundos (default 30).
+ * Configurável por env WORKER_SCAN_INTERVAL_S.
+ */
+export const SCAN_INTERVAL_S = Number(process.env.WORKER_SCAN_INTERVAL_S ?? 30);
 
 /** Telefone → JID do WhatsApp. */
 export function toJid(phone: string): string {
@@ -243,7 +251,13 @@ export function extractBaileysInbound(waMsg: BaileysInboundMessage): {
 export class BaileysWorker {
   private sockets = new Map<string, BaileysSocketLike>();
   private reconnectAttempts = new Map<string, number>();
+  /** Aberturas EM VOO ou agendadas (backoff). Evita socket duplicado. */
+  private connecting = new Set<string>();
+  /** Fechamentos INTENCIONAIS (instância desativada/removida): não reconectar. */
+  private closing = new Set<string>();
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private scanTimer: ReturnType<typeof setInterval> | null = null;
+  private scanning = false;
   private stopped = false;
 
   constructor(
@@ -274,12 +288,9 @@ export class BaileysWorker {
 
   async start(): Promise<void> {
     this.stopped = false;
-    const instances = await this.repo.instances.listAll();
-    for (const inst of instances) {
-      if (inst.provider_type === 'baileys' && inst.active) {
-        await this.connectInstance(inst);
-      }
-    }
+    // Varredura do boot: MESMO caminho da periódica (nada duplicado aqui).
+    await this.scanInstancesOnce();
+
     const pollMs = this.opts.pollMs ?? 2000;
     this.pollTimer = setInterval(() => {
       void this.processOutboxOnce().catch((err) => {
@@ -287,17 +298,106 @@ export class BaileysWorker {
         console.error('[worker] erro no consumo da outbox:', err);
       });
     }, pollMs);
+
+    // B3: sem isto, instância criada DEPOIS do boot nunca ganha socket e o
+    // QR fica vazio até alguém reiniciar o serviço na mão. Timer é legítimo
+    // aqui — este processo é longo-vivo por desenho (ver nota no topo).
+    const scanMs = this.opts.scanMs ?? SCAN_INTERVAL_S * 1000;
+    this.scanTimer = setInterval(() => {
+      void this.scanInstancesOnce().catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error('[worker] erro na varredura de instâncias:', err);
+      });
+    }, scanMs);
   }
 
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.pollTimer) clearInterval(this.pollTimer);
+    if (this.scanTimer) clearInterval(this.scanTimer);
     for (const socket of this.sockets.values()) socket.end?.();
     this.sockets.clear();
   }
 
+  /**
+   * Varredura de instâncias: abre socket para toda Baileys ativa que ainda
+   * não tem um, e fecha o socket das que saíram do ar (desativadas/removidas).
+   *
+   * Roda no boot E periodicamente. Uma varredura nunca atropela a outra
+   * (`scanning`), e instâncias com abertura em voo ou aguardando backoff são
+   * puladas (`connecting`) — senão a varredura abriria um socket paralelo
+   * para quem já está reconectando.
+   */
+  async scanInstancesOnce(): Promise<{ conectadas: number; desconectadas: number }> {
+    if (this.scanning || this.stopped) return { conectadas: 0, desconectadas: 0 };
+    this.scanning = true;
+    let conectadas = 0;
+    let desconectadas = 0;
+    try {
+      const instances = await this.repo.instances.listAll();
+      const ativas = new Set<string>();
+
+      for (const inst of instances) {
+        if (inst.provider_type !== 'baileys' || !inst.active) continue;
+        ativas.add(inst.id);
+        if (this.sockets.has(inst.id) || this.connecting.has(inst.id)) continue;
+        // eslint-disable-next-line no-console
+        console.log(
+          `[worker] instância nova detectada, abrindo socket: ${inst.name} (${inst.id})`,
+        );
+        await this.connectInstance(inst);
+        conectadas++;
+      }
+
+      // Sumiu da lista de ativas (active=false ou deletada) mas o socket
+      // continua aberto: recebendo mensagem e rodando fluxo de uma instância
+      // que o painel considera desligada. Fecha.
+      for (const id of [...this.sockets.keys()]) {
+        if (ativas.has(id)) continue;
+        // eslint-disable-next-line no-console
+        console.log(`[worker] instância desativada/removida, fechando socket: ${id}`);
+        await this.disconnectInstance(id);
+        desconectadas++;
+      }
+    } finally {
+      this.scanning = false;
+    }
+    return { conectadas, desconectadas };
+  }
+
+  /**
+   * Fecha o socket de uma instância POR DECISÃO NOSSA (não é queda).
+   * O id fica em `closing` até alguém reabrir: o `close` que o socket emite
+   * chega depois, e sem essa marca o handler o trataria como queda e
+   * reconectaria justamente o que acabamos de desligar.
+   */
+  async disconnectInstance(instanceId: string): Promise<void> {
+    const socket = this.sockets.get(instanceId);
+    this.sockets.delete(instanceId);
+    this.closing.add(instanceId);
+    try {
+      socket?.end?.();
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('[worker] erro ao fechar socket:', (err as Error).message);
+    }
+    // A instância pode ter sido DELETADA — update em linha inexistente é no-op
+    // nos dois adapters, então não precisa de checagem prévia.
+    await this.repo.instances.update(instanceId, { connection_status: 'disconnected' });
+  }
+
   async connectInstance(instance: Instance): Promise<void> {
-    const socket = await this.opts.socketFactory(instance);
+    // Marca ANTES do await: a factory demora (rede), e sem isto uma varredura
+    // que caísse no meio veria a instância "sem socket" e abriria um segundo.
+    this.connecting.add(instance.id);
+    this.closing.delete(instance.id);
+    let socket: BaileysSocketLike;
+    try {
+      socket = await this.opts.socketFactory(instance);
+    } finally {
+      // Falhou? Sai de `connecting` e a próxima varredura tenta de novo.
+      this.connecting.delete(instance.id);
+    }
     this.sockets.set(instance.id, socket);
     socket.ev.on('connection.update', ((update: {
       qr?: string;
@@ -371,7 +471,10 @@ export class BaileysWorker {
         // Só aqui — falha real continua escalando como antes.
         this.reconnectAttempts.set(instance.id, 0);
       }
-      if (!this.stopped && shouldReconnect(update.lastDisconnect)) {
+      // Fechamento que NÓS pedimos (worker parando, instância desativada) não
+      // é queda: reconectar aqui religaria justamente o que foi desligado.
+      const intencional = this.stopped || this.closing.has(instance.id);
+      if (!intencional && shouldReconnect(update.lastDisconnect)) {
         // Reconexão com backoff exponencial (1s, 2s, 4s... teto configurável).
         const attempt = (this.reconnectAttempts.get(instance.id) ?? 0) + 1;
         this.reconnectAttempts.set(instance.id, attempt);
@@ -379,13 +482,17 @@ export class BaileysWorker {
           1000 * 2 ** (attempt - 1),
           this.opts.maxReconnectDelayMs ?? 60000,
         );
+        // A instância fica "em voo" durante o backoff — a varredura não pode
+        // achar que ela está sem socket e abrir um paralelo.
+        this.connecting.add(instance.id);
         setTimeout(() => {
           void this.connectInstance(instance).catch((err) => {
+            // connectInstance já tirou de `connecting` no finally dele.
             // eslint-disable-next-line no-console
             console.error('[worker] reconexão falhou:', err);
           });
         }, delay);
-      } else if (!shouldReconnect(update.lastDisconnect)) {
+      } else if (!intencional && !shouldReconnect(update.lastDisconnect)) {
         // Logout de verdade: limpa a sessão para permitir novo pareamento.
         await this.repo.baileysAuth.clear(instance.id);
       }

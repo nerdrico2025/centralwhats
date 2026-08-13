@@ -417,6 +417,123 @@ describe('versão do protocolo WA (fix do 405)', () => {
   });
 });
 
+describe('B3 — varredura periódica de instâncias', () => {
+  /** Espera até a condição valer (ou estoura). Evita sleep fixo e flaky. */
+  async function ate(cond: () => boolean, limiteMs = 500): Promise<void> {
+    const fim = Date.now() + limiteMs;
+    while (!cond() && Date.now() < fim) await new Promise((r) => setTimeout(r, 5));
+  }
+
+  it('instância criada DEPOIS do boot é detectada e ganha socket', async () => {
+    const conectadas: string[] = [];
+    const worker = new BaileysWorker(repo, {
+      socketFactory: async (i) => {
+        conectadas.push(i.id);
+        return makeFakeSocket().socket;
+      },
+      pollMs: 10_000, // outbox fora do caminho deste teste
+      scanMs: 20,
+    });
+    await worker.start();
+    expect(conectadas).toEqual([inst.id]); // varredura do boot
+
+    // Nasce uma instância nova com o worker JÁ no ar (o caso do B3).
+    const nova = await repo.instances.create({
+      org_id: 'org_default',
+      name: 'Teste Rafael', provider_type: 'baileys', phone_number_id: null, waba_id: null,
+      token: null, verify_token: null, active: true, connection_status: 'disconnected',
+    });
+
+    await ate(() => conectadas.includes(nova.id));
+    expect(conectadas).toContain(nova.id);
+    await worker.stop();
+  });
+
+  it('instância JÁ conectada não é tocada de novo (sem socket duplicado)', async () => {
+    let aberturas = 0;
+    const worker = new BaileysWorker(repo, {
+      socketFactory: async () => {
+        aberturas++;
+        return makeFakeSocket().socket;
+      },
+      pollMs: 10_000,
+      scanMs: 5,
+    });
+    await worker.start();
+    expect(aberturas).toBe(1);
+
+    // Várias varreduras seguidas não podem reabrir o que já está aberto.
+    await worker.scanInstancesOnce();
+    await worker.scanInstancesOnce();
+    await new Promise((r) => setTimeout(r, 40));
+    expect(aberturas).toBe(1);
+    await worker.stop();
+  });
+
+  it('instância em backoff de reconexão não ganha socket paralelo da varredura', async () => {
+    let aberturas = 0;
+    const worker = new BaileysWorker(repo, {
+      socketFactory: async () => {
+        aberturas++;
+        return makeFakeSocket().socket;
+      },
+      pollMs: 10_000,
+      maxReconnectDelayMs: 60, // backoff longo o bastante p/ a varredura cair no meio
+    });
+    await worker.start();
+    expect(aberturas).toBe(1);
+
+    // Queda: socket sai do Map e a reconexão fica AGENDADA.
+    await worker.handleConnectionUpdate(inst, {
+      connection: 'close',
+      lastDisconnect: { error: { message: 'Connection Lost', output: { statusCode: 428 } } },
+    });
+    // Varredura no meio do backoff: NÃO pode abrir um segundo socket.
+    const r = await worker.scanInstancesOnce();
+    expect(r.conectadas).toBe(0);
+    expect(aberturas).toBe(1);
+
+    // Passado o backoff, a reconexão agendada abre — uma vez só.
+    await ate(() => aberturas === 2);
+    expect(aberturas).toBe(2);
+    await worker.stop();
+  });
+
+  it('instância desativada tem o socket fechado e NÃO reconecta sozinha', async () => {
+    const fake = makeFakeSocket();
+    let fechado = false;
+    fake.socket.end = () => {
+      fechado = true;
+      // O Baileys emite o close DEPOIS do end() — é aqui que a versão sem a
+      // marca de fechamento intencional reconectaria o que acabou de desligar.
+      fake.emit('connection.update', { connection: 'close', lastDisconnect: undefined });
+    };
+    let aberturas = 0;
+    const worker = new BaileysWorker(repo, {
+      socketFactory: async () => {
+        aberturas++;
+        return fake.socket;
+      },
+      pollMs: 10_000,
+      maxReconnectDelayMs: 1,
+    });
+    await worker.start();
+    expect(aberturas).toBe(1);
+
+    await repo.instances.update(inst.id, { active: false });
+    const r = await worker.scanInstancesOnce();
+
+    expect(r.desconectadas).toBe(1);
+    expect(fechado).toBe(true);
+    expect((await repo.instances.getById(inst.id))?.connection_status).toBe('disconnected');
+
+    // Nenhuma reconexão fantasma depois do fechamento intencional.
+    await new Promise((r2) => setTimeout(r2, 40));
+    expect(aberturas).toBe(1);
+    await worker.stop();
+  });
+});
+
 describe('rotas de QR (painel)', () => {
   it('GET /qr devolve estado; /qr.svg renderiza o QR escaneável', async () => {
     const app = createApp(repo);
