@@ -9,3 +9,11 @@ public/
 *.db
 .DS_Store
 coverage/
+.vercel
+# Todo .env fica de fora: além do .env/.env.local, isto cobre os arquivos de
+# credencial usados em operação (.env.prod.local, .env.apikey.local…) e o
+# .env.local que a Vercel CLI gera no `vercel link`.
+.env*
+# …menos o modelo, que É para estar no repo. Sem esta exceção, um dia alguém
+# regenera o .env.example e ele some do commit sem ninguém notar.
+!.env.example
