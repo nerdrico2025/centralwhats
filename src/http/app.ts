@@ -20,6 +20,8 @@ import { captureRawBody } from './metaSignature';
 import { createFlowsRouter } from './flows';
 import { createWebhookRouter, type BackgroundScheduler } from './webhook';
 import { createAuthMiddleware, createAuthRouter } from './auth';
+import { createApiKeyMiddleware } from './apiKeyAuth';
+import { createApiKeysRouter } from './apiKeys';
 import { createInvitesRouter, createSessionRouter, createUsersRouter } from './team';
 import { errorMiddleware, requireOwner } from './util';
 import type { MetaTemplatesOptions } from '../providers/metaTemplates';
@@ -60,6 +62,7 @@ export const INSTANCE_SCOPED_MOUNTS: InstanceScopedMount[] = [
   { segment: 'dashboard', ownerOnly: true, make: (repo) => createDashboardRouter(repo) },
   { segment: 'lists', ownerOnly: true, make: (repo) => createListsRouter(repo) },
   { segment: 'flows', ownerOnly: true, make: (repo) => createFlowsRouter(repo) },
+  { segment: 'api-keys', ownerOnly: true, make: (repo) => createApiKeysRouter(repo) },
   {
     segment: 'campaigns',
     ownerOnly: true,
@@ -103,6 +106,10 @@ export function createApp(repo: Repo = getRepo(), deps: AppDeps = {}): Express {
 
   // === API REST (autenticada; modo bootstrap mantém a V1 sem login) ===
   const api = express.Router();
+  // Chave de serviço ANTES do JWT (mesmo raciocínio do CRON_SECRET: não há
+  // usuário por trás). Só intercepta o que tem o prefixo `cw_live_`; qualquer
+  // outro Authorization segue direto para o JWT, sem mudança de comportamento.
+  api.use(createApiKeyMiddleware(repo));
   api.use(createAuthMiddleware(repo));
 
   // Sessão: quem sou eu, em que conta estou, trocar de conta/senha.

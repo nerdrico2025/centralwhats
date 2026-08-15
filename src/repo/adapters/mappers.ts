@@ -122,6 +122,20 @@ export function mapInvite(r: Row): import('../types').Invite {
   };
 }
 
+export function mapApiKey(r: Row): import('../types').ApiKey {
+  return {
+    id: str(r.id),
+    org_id: str(r.org_id),
+    instance_id: strOrNull(r.instance_id),
+    key_hash: str(r.key_hash),
+    label: str(r.label),
+    created_at: str(r.created_at),
+    created_by: strOrNull(r.created_by),
+    revoked_at: strOrNull(r.revoked_at),
+    last_used_at: strOrNull(r.last_used_at),
+  };
+}
+
 export function mapOutbox(r: Row): import('../types').OutboxItem {
   return {
     id: str(r.id),

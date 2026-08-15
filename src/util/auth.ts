@@ -39,6 +39,44 @@ export function newInviteToken(): { token: string; hash: string } {
   return { token, hash: hashInviteToken(token) };
 }
 
+// ------------------------------------------------------ chaves de API [P6.3]
+/**
+ * Prefixo legível da chave de serviço. Existe para reconhecimento visual: um
+ * segredo colado por engano num log/issue é identificável como chave DESTE
+ * sistema sem que ninguém precise testá-la. Mesmo hábito de GitHub (`ghp_`) e
+ * Stripe (`sk_live_`).
+ */
+export const API_KEY_PREFIX = 'cw_live_';
+
+/** Mesmo raciocínio do hashInviteToken: SHA-256 sem sal sobre 256 bits. */
+export function hashApiKey(key: string): string {
+  return createHash('sha256').update(key).digest('hex');
+}
+
+/**
+ * Chave nova: prefixo + 32 bytes aleatórios. O valor em claro é devolvido UMA
+ * vez, na criação; o banco fica só com o hash.
+ */
+export function newApiKey(): { key: string; hash: string } {
+  const key = `${API_KEY_PREFIX}${randomBytes(32).toString('base64url')}`;
+  return { key, hash: hashApiKey(key) };
+}
+
+/** A string tem a cara de uma chave nossa? (roteia entre API key e JWT) */
+export function looksLikeApiKey(value: string): boolean {
+  return value.startsWith(API_KEY_PREFIX);
+}
+
+/**
+ * Amostra segura para log: só o prefixo e os 4 últimos caracteres. Nunca
+ * imprima a chave inteira — o log é justamente onde ela não pode estar.
+ */
+export function maskApiKey(key: string): string {
+  return key.length > API_KEY_PREFIX.length + 4
+    ? `${API_KEY_PREFIX}…${key.slice(-4)}`
+    : '(malformada)';
+}
+
 // --------------------------------------------------------------------- JWT
 export interface TokenPayload {
   sub: string; // user id

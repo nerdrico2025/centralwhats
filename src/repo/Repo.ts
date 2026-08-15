@@ -1,4 +1,5 @@
 import type {
+  ApiKey,
   Campaign,
   CampaignSend,
   Contact,
@@ -58,6 +59,7 @@ export interface Repo {
   users: UsersRepo; // [V2]
   orgMembers: OrgMembersRepo; // [P6.1]
   invites: InvitesRepo; // [P6.1]
+  apiKeys: ApiKeysRepo; // [P6.3] chaves de serviço (máquina-a-máquina)
   outbox: OutboxRepo; // [V2]
   baileysAuth: BaileysAuthRepo; // [V2]
   maintenance: MaintenanceRepo; // [P6.1]
@@ -181,6 +183,28 @@ export interface InvitesRepo {
   revoke(orgId: string, id: string): Promise<boolean>;
   /** Novo token/validade para o mesmo convite (reenviar link). */
   refreshToken(orgId: string, id: string, tokenHash: string, expiresAt: string): Promise<boolean>;
+}
+
+/**
+ * Chaves de API de serviço [P6.3]. O escopo por org é do DADO, não da query:
+ * toda chave nasce com `org_id`, e a autenticação devolve esse org_id ao
+ * `requireInstance` — que já é o gargalo único de isolamento do sistema.
+ */
+export interface ApiKeysRepo {
+  create(
+    data: Omit<ApiKey, 'id' | 'created_at' | 'revoked_at' | 'last_used_at'>,
+  ): Promise<ApiKey>;
+  /**
+   * Busca pelo hash — o único caminho de autenticação. Devolve a chave mesmo
+   * REVOGADA: quem decide é o middleware, que precisa distinguir "não existe"
+   * de "existia e foi revogada" para o log (sem contar isso ao cliente).
+   */
+  getByKeyHash(keyHash: string): Promise<ApiKey | null>;
+  listByOrg(orgId: string): Promise<ApiKey[]>;
+  /** Soft revoke. `false` se não existia nesta org ou já estava revogada. */
+  revoke(orgId: string, id: string, at: string): Promise<boolean>;
+  /** Carimbo de uso; chamado fora do caminho da resposta (nunca bloqueia). */
+  touchLastUsed(id: string, at: string): Promise<void>;
 }
 
 export interface InstancesRepo {

@@ -39,6 +39,15 @@ export const DEFAULT_ORG_ID = 'org_default';
 export function createAuthMiddleware(repo: Repo) {
   return (req: Request, res: Response, next: NextFunction): void => {
     void (async () => {
+      // Já autenticado antes daqui (chave de serviço — ver apiKeyAuth.ts):
+      // não tente ler o Authorization como JWT. Sem esta saída, uma chave
+      // VÁLIDA seria recusada com "Token inválido ou expirado" logo depois de
+      // ter sido aceita — o pior tipo de 401, porque a causa fica invisível.
+      if ((req as Request & { auth?: AuthInfo }).auth) {
+        next();
+        return;
+      }
+
       const header = req.headers.authorization;
       if (header?.startsWith('Bearer ')) {
         const payload = verifyToken(header.slice(7), loadEnv().JWT_SECRET);

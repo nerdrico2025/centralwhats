@@ -1088,6 +1088,37 @@ export function createPostgresAdapter(opts: { connectionString: string }): Repo 
       },
     },
 
+    // ------------------------------------------------------- apiKeys [P6.3]
+    apiKeys: {
+      async create(data) {
+        const r = await get(
+          `INSERT INTO api_keys (id,org_id,instance_id,key_hash,label,created_at,created_by,revoked_at,last_used_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,NULL,NULL) RETURNING *`,
+          [uid(), data.org_id, data.instance_id, data.key_hash, data.label, now(), data.created_by],
+        );
+        return m.mapApiKey(r!);
+      },
+      async getByKeyHash(keyHash) {
+        const r = await get(`SELECT * FROM api_keys WHERE key_hash=$1`, [keyHash]);
+        return r ? m.mapApiKey(r) : null;
+      },
+      async listByOrg(orgId) {
+        return (
+          await all(`SELECT * FROM api_keys WHERE org_id=$1 ORDER BY created_at DESC`, [orgId])
+        ).map(m.mapApiKey);
+      },
+      async revoke(orgId, id, at) {
+        const changed = await run(
+          `UPDATE api_keys SET revoked_at=$1 WHERE org_id=$2 AND id=$3 AND revoked_at IS NULL`,
+          [at, orgId, id],
+        );
+        return changed > 0;
+      },
+      async touchLastUsed(id, at) {
+        await run(`UPDATE api_keys SET last_used_at=$1 WHERE id=$2`, [at, id]);
+      },
+    },
+
     maintenance: {
       async backfillSecretEncryption() {
         const out = {

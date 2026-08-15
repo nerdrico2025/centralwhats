@@ -102,6 +102,26 @@ export interface Invite {
   accepted_user_id: string | null;
 }
 
+/**
+ * Chave de API de serviço (máquina-a-máquina). Escopo SEMPRE por org; se
+ * `instance_id` vier preenchido, o escopo aperta para uma instância só.
+ * Nunca existe chave global — ver a migration 013_api_keys.sql.
+ */
+export interface ApiKey {
+  id: string;
+  org_id: string;
+  /** NULL = qualquer instância DA MESMA ORG. Preenchido = só essa. */
+  instance_id: string | null;
+  /** SHA-256 da chave. O valor em claro só existe na resposta da criação. */
+  key_hash: string;
+  label: string;
+  created_at: string;
+  created_by: string | null;
+  /** Soft revoke: revogada continua explicando o que enviou. */
+  revoked_at: string | null;
+  last_used_at: string | null;
+}
+
 export interface Instance {
   id: string;
   /** [V2] Dono da instância. NOT NULL no banco desde a migration 012. */
