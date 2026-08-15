@@ -24,9 +24,9 @@ import type { AuthInfo } from './util';
  *     outra responde 404 — o MESMO 404 do cross-org, para não vazar nem a
  *     existência da instância alheia.
  *
- * O papel concedido é o MÍNIMO daquela rota (coluna `role` da lista), não um
- * papel fixo: enviar mensagem não exige `owner`, então a chave não recebe
- * `owner` quando está enviando.
+ * O papel concedido é o MÍNIMO daquela rota (coluna `role` da lista), e hoje
+ * isso significa SEMPRE `agent`: chave de serviço nunca recebe `owner` — ver
+ * a invariante em ROTAS_PERMITIDAS.
  */
 
 /** Rota liberada para chave de serviço + papel mínimo que ela exige. */
@@ -38,18 +38,23 @@ interface RotaPermitida {
   descricao: string;
 }
 
+/**
+ * INVARIANTE: nenhuma entrada aqui pode ter `role: 'owner'`.
+ *
+ * Chave de serviço é sempre `agent` — privilégio mínimo absoluto. Foi por
+ * isso que `GET /templates` saiu desta lista: aquele mount é `ownerOnly`, e
+ * incluí-lo obrigaria a chave a carregar `owner` só para consultar
+ * sincronização. Quem envia não precisa disso: se o template não estiver
+ * sincronizado, o próprio envio devolve 400 dizendo exatamente isso.
+ *
+ * Há teste travando esta invariante — ver tests/apikeys.test.ts.
+ */
 export const ROTAS_PERMITIDAS: RotaPermitida[] = [
   {
     method: 'POST',
     re: /^\/instances\/([^/]+)\/messages\/?$/,
     role: 'agent', // envio não é rota de gestão (mount ownerOnly: false)
     descricao: 'POST /api/instances/:id/messages',
-  },
-  {
-    method: 'GET',
-    re: /^\/instances\/([^/]+)\/templates\/?$/,
-    role: 'owner', // o mount de templates é ownerOnly; leitura só passa como owner
-    descricao: 'GET /api/instances/:id/templates',
   },
 ];
 

@@ -68,9 +68,11 @@ aborta com erro em vez de migrar o banco errado.
 DB_DRIVER=postgres DATABASE_URL='postgres://...:5432/postgres' npm test
 ```
 
-**Fumaça**: no painel do Supabase (Table Editor), as ~18 tabelas devem existir
-(`instances`, `messages`, `flows`, `outbox`, `baileys_auth`, `orgs`, `users`…),
-e `orgs` deve ter a linha `org_default`.
+**Fumaça**: no painel do Supabase (Table Editor), as **21 tabelas do schema**
+devem existir (`instances`, `messages`, `flows`, `outbox`, `baileys_auth`,
+`orgs`, `users`, `api_keys`…) — 22 contando a `_migrations`, que o próprio
+migrador cria para saber o que já rodou. E `orgs` deve ter a linha
+`org_default`.
 
 ---
 
@@ -284,7 +286,8 @@ as conversas da org dele → responde → a resposta aparece no Live Chat web.
 
 - [ ] Node **22.x** nos três lugares: `.nvmrc`, `engines` e painel da Vercel (§6.1)
 - [ ] `npm run audit-instances` sem órfãs **antes** de migrar (ver §7)
-- [ ] Migrations aplicadas no Supabase (~21 tabelas: + `org_members`, `invites`)
+- [ ] Migrations aplicadas no Supabase (21 tabelas do schema + `_migrations`;
+      a última é a `013_api_keys`)
 - [ ] `npm test` verde contra o Postgres (valida o PostgresAdapter)
 - [ ] `/health` responde na Vercel
 - [ ] **Primeira conta criada** e as instâncias antigas continuam visíveis nela

@@ -4,7 +4,7 @@ import { createSqliteAdapter } from '../src/repo/adapters/SqliteAdapter';
 import { createApp } from '../src/http/app';
 import { resetEnvCache } from '../src/config';
 import { hashApiKey, API_KEY_PREFIX } from '../src/util/auth';
-import { rotaPermitida } from '../src/http/apiKeyAuth';
+import { rotaPermitida, ROTAS_PERMITIDAS } from '../src/http/apiKeyAuth';
 import type { Repo } from '../src/repo';
 import type { Provider } from '../src/providers/types';
 
@@ -265,15 +265,24 @@ describe('autenticação por chave', () => {
 describe('lista branca de rotas (deny-by-default)', () => {
   it('rotaPermitida casa só o que está liberado', () => {
     expect(rotaPermitida('POST', '/instances/abc/messages')?.instanceId).toBe('abc');
-    expect(rotaPermitida('GET', '/instances/abc/templates')?.instanceId).toBe('abc');
     // Papel mínimo por rota: enviar não exige owner.
     expect(rotaPermitida('POST', '/instances/abc/messages')?.rota.role).toBe('agent');
 
     expect(rotaPermitida('GET', '/instances/abc/messages')).toBeNull(); // verbo errado
+    expect(rotaPermitida('GET', '/instances/abc/templates')).toBeNull(); // ownerOnly: fora
     expect(rotaPermitida('POST', '/instances/abc/campaigns')).toBeNull();
     expect(rotaPermitida('POST', '/instances/abc/contacts')).toBeNull();
     expect(rotaPermitida('POST', '/instances/abc/messages/extra')).toBeNull();
     expect(rotaPermitida('GET', '/instances')).toBeNull();
+  });
+
+  it('INVARIANTE: nenhuma rota liberada concede owner à chave de serviço', () => {
+    // Trava a decisão de privilégio mínimo absoluto. Liberar uma rota
+    // ownerOnly (como GET /templates era) quebra este teste antes do deploy.
+    expect(ROTAS_PERMITIDAS.length).toBeGreaterThan(0);
+    for (const rota of ROTAS_PERMITIDAS) {
+      expect(rota.role, `rota "${rota.descricao}" não pode conceder owner`).toBe('agent');
+    }
   });
 
   it('rota administrativa com chave válida é 403, mesmo na instância certa', async () => {
@@ -289,12 +298,13 @@ describe('lista branca de rotas (deny-by-default)', () => {
       expect(res.status, `POST ${caminho} com API key`).toBe(403);
     }
 
-    // GET de templates está liberado de propósito (o Recrutador confere se o
-    // template está sincronizado antes de enviar).
+    // Templates é ownerOnly e ficou FORA da lista branca (privilégio mínimo
+    // absoluto): a chave leva o mesmo 403 das demais rotas de gestão. Quem
+    // envia descobre template não sincronizado pelo 400 do próprio envio.
     await request(app)
       .get(`/api/instances/${inst.id}/templates`)
       .set('Authorization', `Bearer ${chave.key}`)
-      .expect(200);
+      .expect(403);
   });
 
   it('chave não escala privilégio: não lista nem cria outras chaves', async () => {
