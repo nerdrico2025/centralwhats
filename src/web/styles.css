@@ -146,9 +146,48 @@ body {
   border-radius: 50%;
   background: var(--green);
 }
+/* min-height:0 é onde a CADEIA DE ALTURA começa a se perder. Item de grid tem
+   tamanho mínimo automático = conteúdo; sem zerar isso, uma tela alta faz a
+   linha 1fr crescer e o scroll vaza para a página inteira. Ver .screen--full. */
 .content {
   overflow-y: auto;
   padding: 24px;
+  min-height: 0;
+}
+
+/* ===================================================================
+   TELA DE ALTURA FIXA (Live Chat, builder) — LEIA ANTES DE MEXER
+   ===================================================================
+   A armadilha NÃO é "faltou grid-template-rows". Essa regra já existia em
+   .conversation e mesmo assim o composer saía da tela.
+
+   O problema é que `height: 100%` e `1fr` só funcionam se TODA a cadeia de
+   ancestrais até a raiz tiver altura definida. Basta UM elo sem altura para o
+   percentual virar `auto` e o filho crescer com o conteúdo:
+
+     .app-shell (100vh) → .main (1fr) → .content → <div do root> → .livechat
+                                                    ↑
+                                    era um div SEM classe e SEM altura: aqui a
+                                    cadeia quebrava, e todo o resto seguia junto
+
+   Por isso o root da tela precisa desta classe. Ela dá ao cabeçalho a linha
+   `auto` e ao conteúdo a linha `1fr` COM altura real — que é o que faz o
+   overflow interno (a lista de mensagens) finalmente ter um teto para estourar.
+
+   Sintoma de que alguém quebrou de novo: a página inteira rola e o composer
+   fica abaixo da dobra em conversa com histórico longo. */
+.screen--full {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  height: 100%;
+  min-height: 0;
+}
+/* Variante para tela com um bloco EXTRA entre o cabeçalho e o corpo (o
+   builder tem os avisos de validação). O corpo continua sendo a última linha,
+   e é ela que precisa do `1fr` — sem esta variante o corpo cairia numa linha
+   implícita `auto` e a cadeia de altura quebraria de novo, no mesmo lugar. */
+.screen--full.screen--full-3 {
+  grid-template-rows: auto auto 1fr;
 }
 .page-title {
   font-size: 20px;
@@ -326,11 +365,15 @@ body {
 }
 
 /* === Builder de fluxos (P4.5) === */
+/* Antes: height: calc(100vh - 190px). O 190 era a soma CHUTADA de topbar +
+   paddings + título — qualquer mudança nessas alturas fazia o canvas vazar ou
+   sobrar, sem ninguém relacionar as duas coisas. Agora a altura vem da linha
+   `1fr` do .screen--full, igual ao Live Chat: a estrutura informa o tamanho,
+   nenhum número mágico precisa ser mantido em sincronia. */
 .builder {
   display: grid;
   grid-template-columns: 220px 1fr 280px;
   gap: 12px;
-  height: calc(100vh - 190px);
   min-height: 480px;
 }
 .builder__panel {
@@ -518,10 +561,11 @@ body {
 }
 
 /* === Live Chat (P2.2) === */
+/* A altura vem da linha `1fr` do .screen--full (ver o comentário lá em cima).
+   min-height:0 destrava o scroll das duas colunas. */
 .livechat {
   display: grid;
   grid-template-columns: 320px 1fr;
-  height: 100%;
   min-height: 0;
   background: var(--card);
   border: 1px solid var(--border);

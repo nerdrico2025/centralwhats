@@ -365,7 +365,10 @@ function formatTime(iso) {
 function livechatScreen() {
   const listEl = h('div', { class: 'conv-list' });
   const rightEl = h('div', {});
-  const root = h('div', {}, [
+  // screen--full: sem esta classe o root fica com altura `auto` e o
+  // `height: 100%` do .livechat não tem contra o que resolver — o composer sai
+  // da tela em conversa longa. Ver o comentário grande em styles.css.
+  const root = h('div', { class: 'screen--full' }, [
     pageHeader('Live Chat', 'Conversas em tempo real.'),
     h('div', { class: 'livechat' }, [listEl, rightEl]),
   ]);
@@ -1489,7 +1492,8 @@ function chatbotScreen() {
   const canvasWrap = h('div', { class: 'canvas-wrap' });
   const editorPanel = h('div', { class: 'card builder__panel' });
   const warningsEl = h('div', {});
-  const root = h('div', {}, [
+  // screen--full-3: cabeçalho + avisos + canvas (o canvas é a linha 1fr).
+  const root = h('div', { class: 'screen--full screen--full-3' }, [
     pageHeader('Chatbot', 'Construtor visual de fluxos.'),
     warningsEl,
     h('div', { class: 'builder' }, [listPanel, canvasWrap, editorPanel]),

@@ -1,12 +1,14 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import request from 'supertest';
 import { createSqliteAdapter } from '../src/repo/adapters/SqliteAdapter';
 import { createApp } from '../src/http/app';
 import { sendViaProvider } from '../src/domain/messaging';
 import {
+  analisarInbound,
   BaileysWorker,
   describeDisconnect,
   extractBaileysInbound,
+  resolverEnderecoInbound,
   shouldReconnect,
   toJid,
   toSocketContent,
@@ -300,6 +302,172 @@ describe('worker — consumo da outbox', () => {
     const [a, b] = await Promise.all([worker.processOutboxOnce(), worker.processOutboxOnce()]);
     expect(a.sent + b.sent).toBe(1);
     expect(fake.sent.length).toBe(1);
+  });
+});
+
+describe('inbound em @lid — o bug que descartava TODA mensagem em silêncio', () => {
+  const LID = '271828182845904@lid';
+
+  function msgLid(alt?: string) {
+    return {
+      key: { remoteJid: LID, remoteJidAlt: alt, id: 'WLID' },
+      pushName: 'Ana',
+      message: { conversation: 'oi por lid' },
+    };
+  }
+
+  it('resolverEnderecoInbound distingue PN, LID, grupo e desconhecido', () => {
+    expect(resolverEnderecoInbound('5511999998888@s.whatsapp.net')).toEqual({
+      tipo: 'pn', telefone: '5511999998888',
+    });
+    // O id do LID JAMAIS vira telefone: sem o Alt, fica sem número.
+    expect(resolverEnderecoInbound(LID)).toEqual({ tipo: 'lid', telefone: null });
+    expect(resolverEnderecoInbound(LID, '5511999998888@s.whatsapp.net')).toEqual({
+      tipo: 'lid', telefone: '5511999998888',
+    });
+    // Telefone vindo do mapa LID→PN (3º argumento).
+    expect(resolverEnderecoInbound(LID, null, '5511999998888@s.whatsapp.net')).toEqual({
+      tipo: 'lid', telefone: '5511999998888',
+    });
+    expect(resolverEnderecoInbound('123-456@g.us').tipo).toBe('grupo');
+    expect(resolverEnderecoInbound('algo@novo.servidor').tipo).toBe('desconhecido');
+  });
+
+  it('analisarInbound: @lid COM remoteJidAlt é aceito com o telefone real', () => {
+    const r = analisarInbound(msgLid('5511999998888@s.whatsapp.net'));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.endereco).toBe('lid');
+    expect(r.dados.from).toBe('5511999998888');
+    expect(r.dados.flowInput.text).toBe('oi por lid');
+  });
+
+  it('analisarInbound: @lid SEM telefone devolve o motivo (não um null mudo)', () => {
+    const r = analisarInbound(msgLid());
+    expect(r).toEqual({ ok: false, motivo: 'lid_sem_telefone', jid: LID });
+  });
+
+  it('analisarInbound: grupo e formato desconhecido têm motivos distintos', () => {
+    expect(analisarInbound({ key: { remoteJid: '1@g.us' }, message: { conversation: 'x' } })).toMatchObject({
+      ok: false, motivo: 'grupo',
+    });
+    expect(analisarInbound({ key: { remoteJid: 'x@futuro' }, message: { conversation: 'x' } })).toMatchObject({
+      ok: false, motivo: 'jid_desconhecido',
+    });
+    expect(analisarInbound({ key: { remoteJid: '5511999998888@s.whatsapp.net' } })).toMatchObject({
+      ok: false, motivo: 'sem_conteudo',
+    });
+  });
+
+  it('GRAVA a mensagem quando o inbound chega em @lid (o caso de produção)', async () => {
+    const fake = makeFakeSocket();
+    const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket });
+    await worker.connectInstance(inst);
+    await repo.instances.update(inst.id, { own_number: '5521999243888' });
+    const comNumero = (await repo.instances.getById(inst.id)) as Instance;
+
+    await worker.handleIncoming(comNumero, msgLid('5511999998888@s.whatsapp.net'));
+
+    const msgs = await repo.messages.listByContact(inst.id, '5511999998888');
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0].direction).toBe('in');
+    expect(msgs[0].from_number).toBe('5511999998888');
+    expect(msgs[0].to_number).toBe('5521999243888'); // own_number, sem sentinela
+    await worker.stop();
+  });
+
+  it('sem remoteJidAlt, usa o mapa LID→PN do socket (fallback confirmado na lib)', async () => {
+    const fake = makeFakeSocket();
+    const consultados: string[] = [];
+    fake.socket.signalRepository = {
+      lidMapping: {
+        async getPNForLID(lid: string) {
+          consultados.push(lid);
+          return '5511777776666@s.whatsapp.net';
+        },
+      },
+    };
+    const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket });
+    await worker.connectInstance(inst);
+
+    await worker.handleIncoming(inst, msgLid()); // sem Alt
+
+    expect(consultados).toEqual([LID]);
+    const msgs = await repo.messages.listByContact(inst.id, '5511777776666');
+    expect(msgs).toHaveLength(1);
+    await worker.stop();
+  });
+
+  it('mapa indisponível ou sem resposta: descarta COM log, nunca em silêncio', async () => {
+    const avisos: string[] = [];
+    const spy = vi.spyOn(console, 'warn').mockImplementation((...a: unknown[]) => {
+      avisos.push(a.join(' '));
+    });
+    try {
+      const fake = makeFakeSocket(); // sem signalRepository
+      const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket });
+      await worker.connectInstance(inst);
+
+      await worker.handleIncoming(inst, msgLid());
+
+      expect(await repo.messages.listByContact(inst.id, '5511999998888')).toHaveLength(0);
+      const linha = avisos.find((l) => l.includes('inbound DESCARTADO'));
+      expect(linha).toBeTruthy();
+      expect(linha).toContain('motivo=lid_sem_telefone');
+      expect(linha).toContain(LID); // o remoteJid CRU no log
+      await worker.stop();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('inbound aceito gera log informativo com o telefone resolvido', async () => {
+    const linhas: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => {
+      linhas.push(a.join(' '));
+    });
+    try {
+      const fake = makeFakeSocket();
+      const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket });
+      await worker.connectInstance(inst);
+
+      await worker.handleIncoming(inst, {
+        key: { remoteJid: PHONE + '@s.whatsapp.net', id: 'WPN' },
+        message: { conversation: 'oi' },
+      });
+      await worker.handleIncoming(inst, msgLid('5511999998888@s.whatsapp.net'));
+
+      const pn = linhas.find((l) => l.includes('inbound aceito (pn)'));
+      const lid = linhas.find((l) => l.includes('inbound aceito (lid)'));
+      expect(pn).toContain(`telefone=${PHONE}`);
+      expect(lid).toContain('telefone=5511999998888');
+      await worker.stop();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('grupo continua ignorado (sem regressão) — e agora deixa rastro', async () => {
+    const linhas: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => {
+      linhas.push(a.join(' '));
+    });
+    try {
+      const fake = makeFakeSocket();
+      const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket });
+      await worker.connectInstance(inst);
+
+      await worker.handleIncoming(inst, {
+        key: { remoteJid: '12345-67890@g.us', id: 'WG' },
+        message: { conversation: 'mensagem de grupo' },
+      });
+
+      expect(await repo.messages.listByContact(inst.id, '1234567890')).toHaveLength(0);
+      expect(linhas.find((l) => l.includes('motivo=grupo'))).toBeTruthy();
+      await worker.stop();
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

@@ -27,6 +27,13 @@ export interface BaileysSocketLike {
    * pareamento; é daqui que sai o número próprio da instância (§3.5).
    */
   user?: { id?: string | null } | null;
+  /**
+   * Mapa LID→PN da própria lib (socket.js:927). É o fallback quando um inbound
+   * em `@lid` chega sem `remoteJidAlt`.
+   */
+  signalRepository?: {
+    lidMapping?: { getPNForLID(lid: string): Promise<string | null> };
+  } | null;
   sendMessage(
     jid: string,
     content: Record<string, unknown>,
@@ -228,7 +235,13 @@ export function describeDisconnect(lastDisconnect: unknown): {
 
 /** Forma mínima de mensagem inbound do Baileys que normalizamos. */
 export interface BaileysInboundMessage {
-  key?: { remoteJid?: string | null; id?: string | null; fromMe?: boolean | null };
+  key?: {
+    remoteJid?: string | null;
+    /** Telefone real quando `remoteJid` vem em `@lid` (decode-wa-message.js:180). */
+    remoteJidAlt?: string | null;
+    id?: string | null;
+    fromMe?: boolean | null;
+  };
   pushName?: string | null;
   message?: {
     conversation?: string | null;
@@ -248,21 +261,101 @@ export interface BaileysInboundMessage {
   } | null;
 }
 
-/** Normaliza um inbound do Baileys para o núcleo compartilhado. */
-export function extractBaileysInbound(waMsg: BaileysInboundMessage): {
+/** Inbound normalizado, pronto para o núcleo compartilhado. */
+export interface InboundNormalizado {
   waMessageId: string | null;
   from: string;
   type: string;
   content: unknown;
   profileName: string | null;
   flowInput: { text: string | null; replyId: string | null };
-} | null {
+}
+
+/** Por que um inbound foi descartado — vira log, NUNCA silêncio. */
+export type MotivoDescarte =
+  | 'grupo'
+  | 'jid_desconhecido'
+  | 'lid_sem_telefone'
+  | 'sem_conteudo'
+  | 'tipo_nao_suportado';
+
+export type AnaliseInbound =
+  | { ok: true; dados: InboundNormalizado; endereco: 'pn' | 'lid' }
+  | { ok: false; motivo: MotivoDescarte; jid: string };
+
+/**
+ * ENDEREÇAMENTO DE UMA CONVERSA 1:1 (bug real de produção).
+ *
+ * O WhatsApp tem DOIS jeitos de endereçar a mesma pessoa:
+ *   - PN  — `5511999998888@s.whatsapp.net`, o telefone no próprio jid;
+ *   - LID — `123456789@lid`, um identificador OPACO. O telefone não está ali:
+ *     vem em `key.remoteJidAlt` (decode-wa-message.js:179-180) ou no mapa
+ *     LID→PN que a lib mantém.
+ *
+ * Aceitar só PN fazia TODA mensagem de conta em LID ser descartada — e, como o
+ * descarte era mudo, nenhuma instância Baileys jamais gravou um inbound em
+ * produção sem que ninguém percebesse. Grupos (`@g.us`) seguem fora de escopo.
+ */
+export function resolverEnderecoInbound(
+  jid: string,
+  remoteJidAlt?: string | null,
+  /** Telefone já resolvido pelo mapa LID→PN (o worker faz esse passo, que é async). */
+  telefoneResolvido?: string | null,
+): { tipo: 'pn' | 'lid' | 'grupo' | 'desconhecido'; telefone: string | null } {
+  if (jid.endsWith('@g.us')) return { tipo: 'grupo', telefone: null };
+  if (jid.endsWith('@s.whatsapp.net')) {
+    return { tipo: 'pn', telefone: soDigitos(jid) };
+  }
+  if (jid.endsWith('@lid')) {
+    // Ordem: o Alt do próprio payload, depois o que o mapa resolveu. O id do
+    // LID JAMAIS vira telefone — seria gravar um número inventado no histórico.
+    const doAlt = remoteJidAlt?.endsWith('@s.whatsapp.net') ? soDigitos(remoteJidAlt) : null;
+    return { tipo: 'lid', telefone: doAlt ?? (telefoneResolvido ? soDigitos(telefoneResolvido) : null) };
+  }
+  return { tipo: 'desconhecido', telefone: null };
+}
+
+/** Dígitos antes do sufixo de dispositivo/domínio (`:12@servidor`). */
+function soDigitos(jid: string): string {
+  return jid.split(':')[0].split('@')[0].replace(/\D+/g, '');
+}
+
+/**
+ * Analisa um inbound e diz OU os dados normalizados OU o motivo do descarte.
+ * Nada aqui devolve `null` mudo: quem chama sempre tem o que logar.
+ */
+export function analisarInbound(
+  waMsg: BaileysInboundMessage,
+  telefoneResolvido?: string | null,
+): AnaliseInbound {
   const jid = waMsg.key?.remoteJid ?? '';
-  // Só conversas 1:1 (grupos estão fora de escopo).
-  if (!jid.endsWith('@s.whatsapp.net')) return null;
-  const from = jid.replace(/\D+/g, '');
+  const end = resolverEnderecoInbound(jid, waMsg.key?.remoteJidAlt, telefoneResolvido);
+  if (end.tipo === 'grupo') return { ok: false, motivo: 'grupo', jid };
+  if (end.tipo === 'desconhecido') return { ok: false, motivo: 'jid_desconhecido', jid };
+  if (!end.telefone) return { ok: false, motivo: 'lid_sem_telefone', jid };
+
+  const from = end.telefone;
   const msg = waMsg.message;
-  if (!msg) return null;
+  if (!msg) return { ok: false, motivo: 'sem_conteudo', jid };
+  const dados = montarInbound(waMsg, from, msg);
+  if (!dados) return { ok: false, motivo: 'tipo_nao_suportado', jid };
+  return { ok: true, dados, endereco: end.tipo as 'pn' | 'lid' };
+}
+
+/**
+ * Compat: mesma assinatura de sempre (dados ou `null`). Quem precisa do MOTIVO
+ * do descarte usa `analisarInbound`.
+ */
+export function extractBaileysInbound(waMsg: BaileysInboundMessage): InboundNormalizado | null {
+  const r = analisarInbound(waMsg);
+  return r.ok ? r.dados : null;
+}
+
+function montarInbound(
+  waMsg: BaileysInboundMessage,
+  from: string,
+  msg: NonNullable<BaileysInboundMessage['message']>,
+): InboundNormalizado | null {
 
   const base = {
     waMessageId: waMsg.key?.id ?? null,
@@ -717,8 +810,39 @@ export class BaileysWorker {
 
   /** Inbound do socket → MESMO núcleo do webhook (contato, CRM, msg, fluxos). */
   async handleIncoming(instance: Instance, waMsg: BaileysInboundMessage): Promise<void> {
-    const normalized = extractBaileysInbound(waMsg);
-    if (!normalized) return;
+    let analise = analisarInbound(waMsg);
+
+    // Inbound em @lid SEM o telefone no payload: pergunta ao mapa LID→PN da
+    // própria lib antes de desistir (socket.signalRepository.lidMapping).
+    if (!analise.ok && analise.motivo === 'lid_sem_telefone') {
+      const pn = await this.resolverPnDeLid(instance.id, analise.jid);
+      if (pn) analise = analisarInbound(waMsg, pn);
+    }
+
+    if (!analise.ok) {
+      // NUNCA silencioso (era assim que este bug sobreviveu desde o commit
+      // inicial). Se o WhatsApp inventar um formato novo, ele aparece AQUI, com
+      // o jid cru — em vez de virar outra investigação do zero.
+      const nivel = analise.motivo === 'grupo' ? 'log' : 'warn';
+      // eslint-disable-next-line no-console
+      console[nivel](
+        `[worker] inbound DESCARTADO — instância=${instance.id} (${instance.name}) ` +
+          `motivo=${analise.motivo} remoteJid=${analise.jid || '(vazio)'} ` +
+          `msg=${waMsg.key?.id ?? '-'}`,
+      );
+      return;
+    }
+
+    const normalized = analise.dados;
+    // Aceito: uma linha por inbound, com o telefone JÁ resolvido. É o que
+    // permite conferir o parsing por log, sem cruzar a tabela messages.
+    // eslint-disable-next-line no-console
+    console.log(
+      `[worker] inbound aceito (${analise.endereco}) — instância=${instance.id} ` +
+        `remoteJid=${waMsg.key?.remoteJid ?? '-'} telefone=${normalized.from} ` +
+        `tipo=${normalized.type} msg=${normalized.waMessageId ?? '-'}`,
+    );
+
     await recordInbound(
       this.repo,
       instance,
@@ -738,6 +862,26 @@ export class BaileysWorker {
     );
     // Mesmo gancho da web: inbound dispara a varredura de retomadas.
     await processPendingExecutions(this.repo, instance.id, this.flowDeps());
+  }
+
+  /**
+   * LID → telefone, pelo mapa que a própria lib mantém (e que nós já
+   * persistimos em `baileys_auth`, tipo `lid-mapping`). Falha aqui NUNCA
+   * derruba o inbound: devolve null e o descarte sai logado com o motivo.
+   */
+  private async resolverPnDeLid(instanceId: string, lid: string): Promise<string | null> {
+    try {
+      const mapa = this.sockets.get(instanceId)?.signalRepository?.lidMapping;
+      if (!mapa) return null;
+      return await mapa.getPNForLID(lid);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[worker] falha ao resolver LID ${lid} da instância ${instanceId}:`,
+        (err as Error).message,
+      );
+      return null;
+    }
   }
 
   /**
