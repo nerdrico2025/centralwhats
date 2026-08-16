@@ -53,6 +53,8 @@ export interface BaileysWorkerOpts {
   scanMs?: number;
   /** TTL da outbox de instância sem socket (min). */
   outboxStaleMinutes?: number;
+  /** Intervalo mínimo entre envios da MESMA instância (ms). */
+  minSendIntervalMs?: number;
   /** Backoff máximo de reconexão (ms). */
   maxReconnectDelayMs?: number;
 }
@@ -72,6 +74,27 @@ export const OUTBOX_STALE_MINUTES = Number(process.env.OUTBOX_STALE_MINUTES ?? 6
 
 /** Motivo gravado em outbox.error e messages.error_code (auditável). */
 export const OUTBOX_STALE_REASON = 'instance_disconnected_timeout';
+
+/**
+ * THROTTLE DE ENVIO BAILEYS — intervalo mínimo entre dois envios da MESMA
+ * instância, em ms (default 1000). Configurável por env
+ * BAILEYS_MIN_SEND_INTERVAL_MS.
+ *
+ * POR QUE EXISTE: o WhatsApp Web não devolve rate-limit por mensagem (ver
+ * classifySendError). Excesso de envio não vira erro retentável — vira queda
+ * de conexão e, no limite, logout/bloqueio do número. Contra isso, retry não
+ * serve: o remédio é não mandar rápido demais na origem.
+ *
+ * POR QUE 1000ms: NÃO é medição — é ponto de partida conservador. Dois
+ * motivos: (a) é ordens de grandeza mais lento que o comportamento anterior,
+ * em que um lote de 10 saía tão rápido quanto o socket aceitasse; (b) é o
+ * mesmo default que o projeto já considera razoável para envio em série no
+ * caminho Meta (campaigns.interval_ms DEFAULT 1000). Se um dia houver medição
+ * real do que o número aguenta, este é o botão para girar.
+ */
+export const BAILEYS_MIN_SEND_INTERVAL_MS = Number(
+  process.env.BAILEYS_MIN_SEND_INTERVAL_MS ?? 1000,
+);
 
 /** Telefone → JID do WhatsApp. */
 export function toJid(phone: string): string {
@@ -296,6 +319,32 @@ export class BaileysWorker {
   private connecting = new Set<string>();
   /** Fechamentos INTENCIONAIS (instância desativada/removida): não reconectar. */
   private closing = new Set<string>();
+  /**
+   * Throttle POR INSTÂNCIA (§throttle): instante do último envio e a fila que
+   * serializa os envios daquele número.
+   *
+   * ONDE MORA O ESTADO — memória do worker, e por quê: o worker é processo
+   * SEMPRE-LIGADO e o projeto trava "uma réplica, sempre" (L6/D10 do
+   * 03_MULTITENANCY_E_V2.md — duas réplicas já brigariam pelo socket, muito
+   * antes de brigarem pelo throttle). Sob essa premissa, memória é a resposta
+   * certa: custo zero, sem corrida, sem ida ao banco no caminho de envio.
+   *
+   * ⚠️ A SEGURANÇA DISTO DEPENDE DA CONVENÇÃO "UMA RÉPLICA" CONTINUAR VALENDO.
+   * Escalar o worker horizontalmente SEM revisar este ponto quebra o throttle
+   * em silêncio: cada processo teria o próprio `ultimoEnvioAt`, e N réplicas
+   * multiplicariam por N a taxa de envio do MESMO número — exatamente o risco
+   * de bloqueio que este mecanismo existe para evitar, e sem nenhum sinal de
+   * que parou de funcionar. Quem mexer em escala do worker mexe aqui também.
+   *
+   * Se um dia houver mais de uma réplica, o desenho correto já está decidido
+   * (partição por instância com lock) — e este mapa vira responsabilidade do
+   * dono da partição, não estado global a sincronizar.
+   *
+   * Chave = instance_id, nunca global: cada instância é um número diferente,
+   * com risco próprio. Uma não pode atrasar a outra.
+   */
+  private ultimoEnvioAt = new Map<string, number>();
+  private filaDeEnvio = new Map<string, Promise<unknown>>();
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private scanTimer: ReturnType<typeof setInterval> | null = null;
   private scanning = false;
@@ -306,14 +355,68 @@ export class BaileysWorker {
     private readonly opts: BaileysWorkerOpts,
   ) {}
 
-  /** Sender reativo: envia DIRETO pelo socket vivo da instância. */
+  /**
+   * PORTÃO ÚNICO de envio pelo socket — todo envio Baileys passa por aqui.
+   *
+   * POR QUE UM PORTÃO SÓ: o worker envia por DOIS caminhos (consumo da outbox
+   * e resposta reativa de fluxo, que NÃO passa pela outbox — vai direto ao
+   * socket). Throttle só na outbox deixaria de fora justamente a rajada de
+   * bot: um fluxo com vários nós "Mensagem" dispara em sequência imediata.
+   *
+   * A fila por instância serializa os envios daquele número: sem ela, o
+   * consumo da outbox e uma resposta de fluxo poderiam ler o mesmo
+   * "último envio" e sair juntos, furando o intervalo.
+   */
+  private async enviarComThrottle(
+    instanceId: string,
+    socket: BaileysSocketLike,
+    jid: string,
+    content: Record<string, unknown>,
+  ): Promise<{ key?: { id?: string | null } } | undefined> {
+    const intervalo = this.opts.minSendIntervalMs ?? BAILEYS_MIN_SEND_INTERVAL_MS;
+    const anterior = this.filaDeEnvio.get(instanceId) ?? Promise.resolve();
+
+    const atual = anterior
+      .catch(() => undefined) // falha do envio anterior não trava a fila
+      .then(async () => {
+        const desde = Date.now() - (this.ultimoEnvioAt.get(instanceId) ?? 0);
+        const espera = Math.max(0, intervalo - desde);
+        if (espera > 0) {
+          // Atraso NUNCA é invisível: sem esta linha, "a fila está lenta"
+          // viraria mistério em produção.
+          // eslint-disable-next-line no-console
+          console.log(
+            `[worker] throttle: aguardando ${espera}ms antes do próximo envio ` +
+              `da instância ${instanceId} (mínimo ${intervalo}ms entre envios)`,
+          );
+          await new Promise((r) => setTimeout(r, espera));
+        }
+        this.ultimoEnvioAt.set(instanceId, Date.now());
+        return socket.sendMessage(jid, content);
+      });
+
+    // A fila guarda a versão "que nunca rejeita", para um envio com erro não
+    // derrubar os próximos da mesma instância.
+    this.filaDeEnvio.set(
+      instanceId,
+      atual.catch(() => undefined),
+    );
+    return atual;
+  }
+
+  /** Sender reativo: envia DIRETO pelo socket vivo da instância (com throttle). */
   socketSender(): BaileysSender {
     return {
       send: async (instance, to, payload): Promise<SendResult> => {
         const socket = this.sockets.get(instance.id);
         if (!socket) throw new Error(`Instância ${instance.id} sem socket conectado`);
         const jid = toJid(to);
-        const res = await socket.sendMessage(jid, toSocketContent(payload, jid));
+        const res = await this.enviarComThrottle(
+          instance.id,
+          socket,
+          jid,
+          toSocketContent(payload, jid),
+        );
         return { waMessageId: res?.key?.id ?? null, status: 'sent' };
       },
     };
@@ -651,7 +754,11 @@ export class BaileysWorker {
       for (const item of items) {
         const jid = toJid(item.to_number);
         try {
-          const res = await socket.sendMessage(
+          // MESMO portão do envio reativo: o intervalo mínimo vale para o
+          // número, não para o caminho por onde a mensagem chegou.
+          const res = await this.enviarComThrottle(
+            instanceId,
+            socket,
             jid,
             toSocketContent(item.payload as BaileysSendPayload, jid),
           );

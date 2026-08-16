@@ -209,6 +209,91 @@ describe('worker — consumo da outbox', () => {
     expect(failed[0].error).toContain('428');
   });
 
+  it('THROTTLE: envios consecutivos da MESMA instância respeitam o intervalo', async () => {
+    for (const t of ['um', 'dois', 'três']) {
+      await sendViaProvider(repo, inst, { type: 'text', to: PHONE, text: t });
+    }
+    const carimbos: number[] = [];
+    const fake = makeFakeSocket();
+    const original = fake.socket.sendMessage.bind(fake.socket);
+    fake.socket.sendMessage = async (jid, content) => {
+      carimbos.push(Date.now());
+      return original(jid, content);
+    };
+    const worker = new BaileysWorker(repo, {
+      socketFactory: async () => fake.socket,
+      minSendIntervalMs: 60,
+    });
+    await worker.connectInstance(inst);
+
+    const r = await worker.processOutboxOnce();
+    expect(r.sent).toBe(3);
+    expect(carimbos).toHaveLength(3);
+    // O primeiro sai na hora; os seguintes esperam o intervalo.
+    for (let i = 1; i < carimbos.length; i++) {
+      expect(
+        carimbos[i] - carimbos[i - 1],
+        `intervalo entre o envio ${i} e o ${i + 1}`,
+      ).toBeGreaterThanOrEqual(55); // folga p/ imprecisão do timer
+    }
+    await worker.stop();
+  });
+
+  it('THROTTLE: duas instâncias Baileys NÃO se bloqueiam (cada número tem o seu)', async () => {
+    const inst2 = await repo.instances.create({
+      org_id: 'org_default',
+      name: 'Zap 2', provider_type: 'baileys', phone_number_id: '5511000000001', waba_id: null,
+      token: null, verify_token: null, active: true, connection_status: 'disconnected',
+    });
+    await sendViaProvider(repo, inst, { type: 'text', to: PHONE, text: 'a' });
+    await sendViaProvider(repo, inst2, { type: 'text', to: PHONE, text: 'b' });
+
+    const porInstancia = new Map<string, number>();
+    const worker = new BaileysWorker(repo, {
+      socketFactory: async (i) => {
+        const f = makeFakeSocket();
+        const orig = f.socket.sendMessage.bind(f.socket);
+        f.socket.sendMessage = async (jid, content) => {
+          porInstancia.set(i.id, Date.now());
+          return orig(jid, content);
+        };
+        return f.socket;
+      },
+      // Intervalo LONGO: se houvesse throttle global, a 2ª instância esperaria
+      // por ele e o teste estouraria o limite abaixo.
+      minSendIntervalMs: 5000,
+    });
+    await worker.connectInstance(inst);
+    await worker.connectInstance(inst2);
+
+    const inicio = Date.now();
+    const r = await worker.processOutboxOnce();
+    const decorrido = Date.now() - inicio;
+
+    expect(r.sent).toBe(2);
+    expect(porInstancia.size).toBe(2); // as duas enviaram
+    expect(decorrido, 'as duas devem sair sem esperar uma pela outra').toBeLessThan(1000);
+    await worker.stop();
+  });
+
+  it('THROTTLE não atrapalha o retry: transitório continua voltando à fila', async () => {
+    await sendViaProvider(repo, inst, { type: 'text', to: PHONE, text: 'oi' });
+    const fake = makeFakeSocket();
+    fake.socket.sendMessage = async () => {
+      throw Object.assign(new Error('Connection Closed'), { output: { statusCode: 428 } });
+    };
+    const worker = new BaileysWorker(repo, {
+      socketFactory: async () => fake.socket,
+      minSendIntervalMs: 10,
+    });
+    await worker.connectInstance(inst);
+
+    const r = await worker.processOutboxOnce();
+    expect(r).toEqual({ sent: 0, failed: 0, requeued: 1 });
+    expect(await repo.outbox.listByInstance(inst.id, 'pending')).toHaveLength(1);
+    await worker.stop();
+  });
+
   it('claim atômico: dois consumos simultâneos não enviam o mesmo item duas vezes', async () => {
     await sendViaProvider(repo, inst, { type: 'text', to: PHONE, text: 'unico' });
     const { worker, fake } = await workerWithSocket();
