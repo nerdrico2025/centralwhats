@@ -3,6 +3,7 @@ import type { Instance } from '../repo/types';
 import { getProvider, type BaileysSendPayload, type BaileysSender, type SendResult } from '../providers';
 import { recordInbound } from '../domain/inbound';
 import { processPendingExecutions, type FlowDeps } from '../domain/flows';
+import { classifySendError, descreverErroDeEnvio } from '../providers/classifySendError';
 
 /**
  * WORKER BAILEYS (V2 / P5.2) — processo SEMPRE-LIGADO (Railway/Fly/VPS).
@@ -21,6 +22,11 @@ import { processPendingExecutions, type FlowDeps } from '../domain/flows';
 /** Superfície mínima do socket Baileys que o worker usa (mockável em teste). */
 export interface BaileysSocketLike {
   ev: { on(event: string, cb: (arg: never) => void): void };
+  /**
+   * `creds.me` do Baileys (getter `user` do socket). Só existe DEPOIS do
+   * pareamento; é daqui que sai o número próprio da instância (§3.5).
+   */
+  user?: { id?: string | null } | null;
   sendMessage(
     jid: string,
     content: Record<string, unknown>,
@@ -70,6 +76,20 @@ export const OUTBOX_STALE_REASON = 'instance_disconnected_timeout';
 /** Telefone → JID do WhatsApp. */
 export function toJid(phone: string): string {
   return phone.replace(/\D+/g, '') + '@s.whatsapp.net';
+}
+
+/**
+ * JID do próprio aparelho → telefone (§3.5).
+ *
+ * O Baileys entrega `creds.me.id` no formato `5511999998888:12@s.whatsapp.net`
+ * — número, sufixo de DISPOSITIVO e domínio. Só os dígitos antes do `:`
+ * interessam; o `:12` é o índice do aparelho pareado e muda a cada
+ * re-pareamento, então gravá-lo faria o mesmo número parecer dois.
+ */
+export function ownNumberFromJid(jid: string | null | undefined): string | null {
+  if (!jid) return null;
+  const digits = jid.split(':')[0].split('@')[0].replace(/\D+/g, '');
+  return digits.length >= 8 ? digits : null;
 }
 
 /**
@@ -523,7 +543,21 @@ export class BaileysWorker {
     }
     if (update.connection === 'open') {
       await this.repo.baileysAuth.delete(instance.id, 'qr');
-      await this.repo.instances.update(instance.id, { connection_status: 'connected' });
+      // §3.5 — o número PRÓPRIO da instância só existe depois do pareamento, e
+      // o socket é quem o conhece (`creds.me.id`). Gravar aqui é o que tira o
+      // sentinela '000000000' do inbound e o from_number vazio do outbound.
+      // Grava só quando MUDA: reconexão não precisa escrever no banco.
+      const proprio = ownNumberFromJid(this.sockets.get(instance.id)?.user?.id);
+      const patch: Partial<Instance> = { connection_status: 'connected' };
+      if (proprio && proprio !== instance.own_number) {
+        patch.own_number = proprio;
+        instance.own_number = proprio; // a referência viva também aprende
+        // eslint-disable-next-line no-console
+        console.log(
+          `[worker] número próprio da instância ${instance.name} (${instance.id}): ${proprio}`,
+        );
+      }
+      await this.repo.instances.update(instance.id, patch);
       this.reconnectAttempts.set(instance.id, 0);
     }
     if (update.connection === 'close') {
@@ -585,7 +619,18 @@ export class BaileysWorker {
     await recordInbound(
       this.repo,
       instance,
-      { ...normalized, toNumber: instance.phone_number_id ?? '000000000' },
+      {
+        ...normalized,
+        // Numa mensagem RECEBIDA, `to_number` é o número da EMPRESA — ou seja,
+        // o número desta instância. `own_number` é preenchido no 'open'.
+        //
+        // JANELA DE TRANSIÇÃO: instância pareada antes da migration 014 (ou
+        // que ainda não reconectou) tem own_number nulo. O sentinela só existe
+        // para esse intervalo, e some na primeira reconexão — sem ele, a
+        // gravação falharia no normalizePhone e a mensagem recebida se perderia,
+        // que é bem pior do que um número-marcador no histórico.
+        toNumber: instance.own_number ?? instance.phone_number_id ?? '000000000',
+      },
       this.flowDeps(),
     );
     // Mesmo gancho da web: inbound dispara a varredura de retomadas.
@@ -597,9 +642,10 @@ export class BaileysWorker {
    * socket → confirma no registro pré-logado em messages (queued→sent).
    * TODO resultado fica registrado (sucesso E falha) — nada se perde.
    */
-  async processOutboxOnce(): Promise<{ sent: number; failed: number }> {
+  async processOutboxOnce(): Promise<{ sent: number; failed: number; requeued: number }> {
     let sent = 0;
     let failed = 0;
+    let requeued = 0;
     for (const [instanceId, socket] of this.sockets) {
       const items = await this.repo.outbox.claimPending(instanceId, 10);
       for (const item of items) {
@@ -618,19 +664,51 @@ export class BaileysWorker {
           }
           sent++;
         } catch (err) {
-          const message = (err as Error).message ?? String(err);
-          await this.repo.outbox.markFailed(item.id, message);
+          // Classificação agnóstica (§3.5): antes disto TODA falha virava
+          // `error_code: null` e `failed` definitivo — um blip de socket
+          // matava a mensagem tão permanentemente quanto um número inválido.
+          const cls = classifySendError(err, 'baileys');
+
+          // Transitório volta para a fila. O teto NÃO é contagem (a outbox não
+          // guarda tentativas) e sim IDADE: failStaleOutbox marca como falha o
+          // que passar de OUTBOX_STALE_MINUTES. Sem isso, um erro transitório
+          // eterno giraria para sempre a cada poll.
+          const idadeMin = (Date.now() - Date.parse(item.created_at)) / 60_000;
+          const limite = this.opts.outboxStaleMinutes ?? OUTBOX_STALE_MINUTES;
+          if (cls.retryable && Number.isFinite(idadeMin) && idadeMin < limite) {
+            await this.repo.outbox.requeue(item.id, `${cls.kind}: ${cls.message}`);
+            // eslint-disable-next-line no-console
+            console.warn(
+              `[worker] envio devolvido à fila — instância=${instanceId} item=${item.id} ` +
+                descreverErroDeEnvio(cls),
+            );
+            requeued++;
+            continue;
+          }
+
+          if (cls.kind === 'unknown') {
+            // Erro não mapeado nunca passa calado — é assim que a tabela de
+            // classificação aprende um caso novo.
+            // eslint-disable-next-line no-console
+            console.error(
+              `[worker] envio falhou SEM classificação — instância=${instanceId} ` +
+                `item=${item.id} ${descreverErroDeEnvio(cls)}`,
+            );
+          }
+          const motivo = `${cls.raw_code ?? cls.kind}: ${cls.message}`;
+          await this.repo.outbox.markFailed(item.id, motivo);
           if (item.message_id) {
             await this.repo.messages.updateById(item.message_id, {
               status: 'failed',
-              error_code: null,
-              error_message: message,
+              // Nunca null: o histórico sempre diz algo sobre o motivo.
+              error_code: cls.raw_code ?? cls.kind,
+              error_message: cls.message,
             });
           }
           failed++;
         }
       }
     }
-    return { sent, failed };
+    return { sent, failed, requeued };
   }
 }

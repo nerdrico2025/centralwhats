@@ -124,6 +124,14 @@ export interface ApiKey {
 
 export interface Instance {
   id: string;
+  /**
+   * [§3.5] Número PRÓPRIO do WhatsApp desta instância, só dígitos.
+   *
+   * Meta: não usado (o número da empresa vem no payload do webhook).
+   * Baileys: preenchido no `connection: 'open'`, a partir de `creds.me.id`.
+   * Fica NULL até o primeiro pareamento — quem lê precisa tratar a janela.
+   */
+  own_number?: string | null;
   /** [V2] Dono da instância. NOT NULL no banco desde a migration 012. */
   org_id: string;
   name: string;

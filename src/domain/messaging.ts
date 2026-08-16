@@ -6,6 +6,7 @@ import {
   TemplateParamsError,
   UnsupportedByProviderError,
 } from '../providers/errors';
+import { classifySendError, descreverErroDeEnvio } from '../providers/classifySendError';
 import type {
   ListSection,
   MediaPayload,
@@ -168,7 +169,15 @@ export async function sendViaProvider(
     };
   }
 
-  const from = instance.phone_number_id ?? '';
+  // Número da EMPRESA neste envio. `own_number` é o número real da instância
+  // (Baileys aprende no pareamento — §3.5); `phone_number_id` é o id da Meta,
+  // que só faz sentido em instância oficial.
+  //
+  // JANELA DE TRANSIÇÃO: instância Baileys pareada ANTES da migration 014 fica
+  // com own_number nulo até reconectar (o worker preenche no 'open'). Nesse
+  // intervalo o fallback mantém o comportamento antigo em vez de gravar vazio —
+  // some sozinho na primeira reconexão.
+  const from = instance.own_number ?? instance.phone_number_id ?? '';
   const to = normalizePhone(input.to);
   const type = messageType(input);
   const content = messageContent(contentInput);
@@ -236,6 +245,34 @@ export async function sendViaProvider(
       });
       throw new SendFailedError(err.code, err.message, err.httpStatus, logged.id);
     }
-    throw err;
+
+    // QUALQUER OUTRO ERRO (Baileys, rede, bug nosso). Antes ele era re-lançado
+    // cru: nenhuma linha em `messages`, nenhum código, e o disparo em massa
+    // registrava `error_code: null` sem saber o que aconteceu. Era a falha
+    // silenciosa que o CLAUDE.md proíbe.
+    //
+    // Agora passa pelo classificador agnóstico: o histórico ganha um código
+    // (mesmo que seja o `kind`), e quem decide retry lê `retryable`.
+    const cls = classifySendError(err, provider.type);
+    // eslint-disable-next-line no-console
+    console.error(
+      `[envio] falha na instância ${instance.id} (${provider.type}) — ${descreverErroDeEnvio(cls)}`,
+    );
+    const logged = await repo.messages.create({
+      instance_id: instance.id,
+      direction: 'out',
+      from_number: from,
+      to_number: to,
+      type,
+      content,
+      status: 'failed',
+      // Nunca null: sem código do provider, grava o `kind` — o histórico
+      // sempre diz ALGUMA coisa sobre o motivo.
+      error_code: cls.raw_code ?? cls.kind,
+      error_message: cls.message,
+      wa_message_id: null,
+      campaign_id: campaignId,
+    });
+    throw new SendFailedError(cls.raw_code ?? cls.kind, cls.message, 502, logged.id);
   }
 }

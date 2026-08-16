@@ -102,6 +102,13 @@ export interface OutboxRepo {
   claimPending(instanceId: string, limit: number): Promise<OutboxItem[]>;
   markSent(id: string): Promise<void>;
   markFailed(id: string, error: string): Promise<void>;
+  /**
+   * Devolve um item claimed à fila (sending→pending) — erro TRANSITÓRIO, que
+   * melhora tentando de novo. Guarda o motivo da tentativa que falhou, para o
+   * item não voltar à fila sem explicação. O limite de repetição NÃO mora aqui:
+   * quem chama decide (ver failStaleOutbox / OUTBOX_STALE_MINUTES).
+   */
+  requeue(id: string, error: string): Promise<void>;
   listByInstance(instanceId: string, status?: string): Promise<OutboxItem[]>;
   /** Linka o item ao registro pré-logado em messages (feito pela mensageria). */
   setMessageId(id: string, messageId: string): Promise<void>;

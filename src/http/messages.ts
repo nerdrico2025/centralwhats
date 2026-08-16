@@ -113,8 +113,10 @@ export function createMessagesRouter(repo: Repo, deps: MessagingDeps = {}): Rout
           if (err.code === 'TEMPLATE_PARAMS') {
             throw new HttpError(400, err.message, { logged_message_id: err.loggedMessageId });
           }
-          // Erro da Meta já gravado em messages; devolve estruturado ao client.
-          throw new HttpError(502, 'Falha no envio pela Meta', {
+          // Falha do provider já gravada em messages; devolve estruturada ao
+          // client. Não diz mais "pela Meta": desde §3.5 o erro pode vir do
+          // Baileys, classificado pela mesma camada agnóstica.
+          throw new HttpError(502, 'Falha no envio pelo provider', {
             code: err.code,
             message: err.message,
             logged_message_id: err.loggedMessageId,

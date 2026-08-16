@@ -1,0 +1,19 @@
+-- §3.5 — Número PRÓPRIO da instância. Espelho de postgres/014_instances_own_number.sql.
+--
+-- POR QUÊ: `phone_number_id` é um identificador da META. Instância Baileys, por
+-- definição, não tem um — ela pareia por QR. O código então caía em sentinela:
+-- inbound gravava `to_number='000000000'` e outbound gravava `from_number=''`,
+-- ou seja, o histórico mentia sobre qual número recebeu/enviou.
+--
+-- POR QUE COLUNA NOVA e não reusar `phone_number_id`: aquele campo é a chave
+-- que o webhook da Meta usa para achar a instância pelo payload
+-- (resolveInstanceByPhoneNumberId). Enfiar um telefone ali acopla dois
+-- domínios diferentes num campo só e cria um caminho de colisão que ninguém
+-- lembraria de checar depois.
+--
+-- NULLABLE de propósito: instância Meta não usa (o número dela vem do payload),
+-- e instância Baileys só descobre o próprio número ao PAREAR. Fica nulo até a
+-- primeira conexão — a janela de transição está documentada no código que lê.
+-- SQLite não tem "IF NOT EXISTS" em ADD COLUMN; o migrador roda cada arquivo
+-- uma única vez (tabela _migrations), então a repetição não acontece.
+ALTER TABLE instances ADD COLUMN own_number TEXT;

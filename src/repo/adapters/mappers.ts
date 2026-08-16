@@ -157,6 +157,9 @@ export function mapInstance(r: Row): Instance {
     name: str(r.name),
     provider_type: r.provider_type as Instance['provider_type'],
     phone_number_id: strOrNull(r.phone_number_id),
+    // Coluna nova (migration 014): tolera banco ainda não migrado devolvendo
+    // null, em vez de estourar na leitura.
+    own_number: strOrNull(r.own_number),
     waba_id: strOrNull(r.waba_id),
     // Segredos: decifrados AQUI, na fronteira do adapter. O resto do sistema
     // (rotas, domínio, worker) só vê texto claro e não sabe que há cifra.

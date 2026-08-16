@@ -1,6 +1,7 @@
 import type { Repo } from '../repo';
 import type { Campaign, CampaignSend, Instance, Template } from '../repo/types';
-import { sendViaProvider, SendFailedError, type MessagingDeps } from './messaging';
+import { sendViaProvider, type MessagingDeps } from './messaging';
+import { classifySendError, descreverErroDeEnvio } from '../providers/classifySendError';
 import { resolveRecipients } from './campaigns';
 
 /** Erro de disparo com mensagem para o client (mapeado a 400 na rota). */
@@ -11,9 +12,11 @@ export class DispatchError extends Error {
   }
 }
 
-// Retry SÓ em rate-limit (CLAUDE.md). Erro permanente (número inválido) não
-// melhora tentando de novo.
-const RATE_LIMIT_CODES = new Set(['130429', '131056']);
+// Retry SÓ em erro que melhora repetindo (CLAUDE.md). Quem decide isso é o
+// classificador agnóstico (providers/classifySendError) — aqui não há mais
+// código de provider nenhum. Para a Meta, na prática, "retryable" continua
+// sendo rate-limit (130429/131056); a diferença é que agora um provider novo
+// entra sem tocar nesta regra de negócio.
 const MAX_ATTEMPTS = 5;
 const DEFAULT_BUDGET_MS = 8000;
 /** Claim mais velho que isto = tick que morreu; a linha volta para a fila. */
@@ -130,35 +133,39 @@ async function processOne(
       attempts,
     });
   } catch (err) {
-    if (err instanceof SendFailedError) {
-      // Retry SÓ em rate-limit (com espera até o próximo tick), até MAX_ATTEMPTS.
-      if (RATE_LIMIT_CODES.has(err.code ?? '') && attempts < MAX_ATTEMPTS) {
-        await repo.campaigns.updateSend(send.id, {
-          status: 'pending', // continua na fila; espera natural até o próximo tick
-          claimed_at: null, // libera o claim para o próximo tick pegar
-          attempts,
-          error_code: err.code,
-          error_message: 'rate-limit; será retentado',
-        });
-      } else {
-        await repo.campaigns.updateSend(send.id, {
-          status: 'failed',
-          sent_at: nowIso,
-          attempts,
-          error_code: err.code,
-          error_message: err.message,
-        });
-      }
-    } else {
-      // Erro inesperado — NUNCA perde: registra como falha com o motivo.
+    // UM único ponto de decisão, para os dois providers. `err` aqui é sempre
+    // SendFailedError (messaging.ts embrulha tudo), mas classificar direto o
+    // que vier mantém isto correto se algo escapar por outro caminho.
+    const cls = classifySendError(err, instance.provider_type);
+
+    if (cls.retryable && attempts < MAX_ATTEMPTS) {
       await repo.campaigns.updateSend(send.id, {
-        status: 'failed',
-        sent_at: nowIso,
+        status: 'pending', // continua na fila; espera natural até o próximo tick
+        claimed_at: null, // libera o claim para o próximo tick pegar
         attempts,
-        error_code: null,
-        error_message: String((err as Error)?.message ?? err),
+        error_code: cls.raw_code,
+        error_message: `${cls.kind}; será retentado (tentativa ${attempts}/${MAX_ATTEMPTS})`,
       });
+      return;
     }
+
+    if (cls.kind === 'unknown') {
+      // Não classificado NUNCA passa calado: sem este log, um erro novo de
+      // provider vira só mais uma linha 'failed' no banco.
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[campanha ${campaign.id}] envio para ${send.contact_phone} falhou sem classificação — ` +
+          descreverErroDeEnvio(cls),
+      );
+    }
+    await repo.campaigns.updateSend(send.id, {
+      status: 'failed',
+      sent_at: nowIso,
+      attempts,
+      // Sem código do provider, grava o `kind`: nunca null silencioso.
+      error_code: cls.raw_code ?? cls.kind,
+      error_message: cls.message,
+    });
   }
 }
 

@@ -87,13 +87,14 @@ export function createSqliteAdapter(opts: { path: string }): Repo {
         const id = uid();
         run(
           `INSERT INTO instances
-             (id,org_id,name,provider_type,phone_number_id,waba_id,token,verify_token,active,connection_status,created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+             (id,org_id,name,provider_type,phone_number_id,own_number,waba_id,token,verify_token,active,connection_status,created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
           id,
           data.org_id,
           data.name,
           data.provider_type ?? 'meta',
           data.phone_number_id,
+          data.own_number ?? null,
           data.waba_id,
           sealSecret(data.token),
           sealSecret(data.verify_token),
@@ -127,6 +128,7 @@ export function createSqliteAdapter(opts: { path: string }): Repo {
         if (patch.org_id !== undefined) set('org_id', patch.org_id);
         if (patch.provider_type !== undefined) set('provider_type', patch.provider_type);
         if (patch.phone_number_id !== undefined) set('phone_number_id', patch.phone_number_id);
+        if (patch.own_number !== undefined) set('own_number', patch.own_number);
         if (patch.waba_id !== undefined) set('waba_id', patch.waba_id);
         if (patch.token !== undefined) set('token', sealSecret(patch.token));
         if (patch.verify_token !== undefined) set('verify_token', sealSecret(patch.verify_token));
@@ -1282,6 +1284,11 @@ export function createSqliteAdapter(opts: { path: string }): Repo {
       },
       async markFailed(id, error) {
         run(`UPDATE outbox SET status='failed', sent_at=?, error=? WHERE id=?`, now(), error, id);
+      },
+      async requeue(id, error) {
+        // Volta para 'pending' (o claim seguinte pega de novo) mantendo o
+        // motivo visível — nunca some da fila nem volta em silêncio.
+        run(`UPDATE outbox SET status='pending', error=? WHERE id=?`, error, id);
       },
       async listByInstance(instanceId, status) {
         const rows = status

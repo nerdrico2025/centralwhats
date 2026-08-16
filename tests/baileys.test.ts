@@ -137,7 +137,7 @@ describe('worker — consumo da outbox', () => {
     const { worker, fake } = await workerWithSocket();
 
     const r = await worker.processOutboxOnce();
-    expect(r).toEqual({ sent: 1, failed: 0 });
+    expect(r).toEqual({ sent: 1, failed: 0, requeued: 0 });
     expect(fake.sent[0].jid).toBe(PHONE + '@s.whatsapp.net');
     expect(fake.sent[0].content).toEqual({ text: 'oi' });
 
@@ -153,14 +153,60 @@ describe('worker — consumo da outbox', () => {
     const { worker } = await workerWithSocket(() => true);
 
     const r = await worker.processOutboxOnce();
-    expect(r).toEqual({ sent: 0, failed: 1 });
+    // 'socket caiu no meio do envio' não casa com nenhum mapeamento conhecido:
+    // vira unknown/não-retryable — falha definitiva, com o motivo preservado.
+    expect(r).toEqual({ sent: 0, failed: 1, requeued: 0 });
     const failedItems = await repo.outbox.listByInstance(inst.id, 'failed');
     expect(failedItems[0].error).toContain('socket caiu');
+    expect(failedItems[0].error).toContain('unknown');
 
     const msgs = await repo.messages.listByContact(inst.id, PHONE);
     const failed = msgs.find((mm) => mm.id === message.id);
     expect(failed?.status).toBe('failed');
     expect(failed?.error_message).toContain('socket caiu');
+  });
+
+  it('erro TRANSITÓRIO devolve o item à fila em vez de matá-lo (§3.5)', async () => {
+    const { message } = await sendViaProvider(repo, inst, { type: 'text', to: PHONE, text: 'oi' });
+    // 428 = socket fechado: transitório, vale tentar de novo.
+    const fake = makeFakeSocket();
+    fake.socket.sendMessage = async () => {
+      throw Object.assign(new Error('Connection Closed'), { output: { statusCode: 428 } });
+    };
+    const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket });
+    await worker.connectInstance(inst);
+
+    const r = await worker.processOutboxOnce();
+    expect(r).toEqual({ sent: 0, failed: 0, requeued: 1 });
+
+    // Volta para 'pending' COM o motivo — nunca some da fila em silêncio.
+    const pend = await repo.outbox.listByInstance(inst.id, 'pending');
+    expect(pend).toHaveLength(1);
+    expect(pend[0].error).toContain('transient');
+
+    // E a mensagem NÃO é marcada como falha: ela ainda vai ser enviada.
+    const msgs = await repo.messages.listByContact(inst.id, PHONE);
+    expect(msgs.find((mm) => mm.id === message.id)?.status).toBe('queued');
+  });
+
+  it('transitório em item VELHO vira falha (não gira para sempre)', async () => {
+    await sendViaProvider(repo, inst, { type: 'text', to: PHONE, text: 'oi' });
+    const fake = makeFakeSocket();
+    fake.socket.sendMessage = async () => {
+      throw Object.assign(new Error('Connection Closed'), { output: { statusCode: 428 } });
+    };
+    // outboxStaleMinutes = 0: todo item já nasce "velho" para o teto de idade.
+    const worker = new BaileysWorker(repo, {
+      socketFactory: async () => fake.socket,
+      outboxStaleMinutes: 0,
+    });
+    await worker.connectInstance(inst);
+    await new Promise((r) => setTimeout(r, 10));
+
+    const r = await worker.processOutboxOnce();
+    expect(r).toEqual({ sent: 0, failed: 1, requeued: 0 });
+    const failed = await repo.outbox.listByInstance(inst.id, 'failed');
+    expect(failed[0].error).toContain('428');
   });
 
   it('claim atômico: dois consumos simultâneos não enviam o mesmo item duas vezes', async () => {
@@ -240,6 +286,30 @@ describe('worker — QR, status e reconexão', () => {
     });
     expect((await repo.instances.getById(inst.id))?.connection_status).toBe('disconnected');
     expect(await repo.baileysAuth.get(inst.id, 'creds')).toBeNull();
+  });
+
+  it('open grava o número PRÓPRIO da instância e mata o sentinela (§3.5)', async () => {
+    const fake = makeFakeSocket();
+    fake.socket.user = { id: '5511988887777:12@s.whatsapp.net' };
+    const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket });
+    await worker.connectInstance(inst);
+    expect((await repo.instances.getById(inst.id))?.own_number).toBeNull();
+
+    await worker.handleConnectionUpdate(inst, { connection: 'open' });
+    const salva = await repo.instances.getById(inst.id);
+    expect(salva?.own_number).toBe('5511988887777'); // sem o sufixo :12
+    expect(salva?.connection_status).toBe('connected');
+
+    // Inbound depois do pareamento grava o número REAL como to_number.
+    await worker.handleIncoming(inst, {
+      key: { remoteJid: PHONE + '@s.whatsapp.net', id: 'WOWN' },
+      message: { conversation: 'oi' },
+    });
+    const msgs = await repo.messages.listByContact(inst.id, PHONE);
+    const inbound = msgs.find((mm) => mm.wa_message_id === 'WOWN');
+    expect(inbound?.to_number).toBe('5511988887777');
+    expect(inbound?.to_number).not.toBe('000000000');
+    await worker.stop();
   });
 
   it('close limpa o QR persistido (QR morto não pode continuar no painel)', async () => {
