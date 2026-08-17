@@ -40,9 +40,24 @@ describe('classifySendError — Meta', () => {
     }
   });
 
-  it('variáveis de template inválidas: permanente, com o código preservado', () => {
+  it('variáveis de template inválidas: invalid_request (não `unknown`), sem retry', () => {
+    // Erro do CHAMADOR, e nós SABEMOS qual é — por isso não é `unknown`.
+    // `unknown` fica reservado para o que merece investigação.
     const c = classifySendError(new TemplateParamsError('faltou {{2}}'), 'meta');
-    expect(c).toMatchObject({ retryable: false, raw_code: 'TEMPLATE_PARAMS' });
+    expect(c).toMatchObject({
+      kind: 'invalid_request',
+      retryable: false,
+      raw_code: 'TEMPLATE_PARAMS',
+    });
+  });
+
+  it('TEMPLATE_PARAMS chegando embrulhado (code, não instância) também é invalid_request', () => {
+    // É como o erro chega ao dispatch: SendFailedError com .code.
+    const c = classifySendError(
+      Object.assign(new Error('faltou {{2}}'), { code: 'TEMPLATE_PARAMS' }),
+      'meta',
+    );
+    expect(c).toMatchObject({ kind: 'invalid_request', retryable: false });
   });
 
   it('código desconhecido da Meta: unknown e NÃO retryable (comportamento antigo preservado)', () => {

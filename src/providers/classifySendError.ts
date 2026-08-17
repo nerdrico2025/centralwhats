@@ -20,7 +20,10 @@ import { MetaApiError, TemplateParamsError } from './errors';
 
 export type SendErrorKind =
   | 'rate_limit'
+  /** Destinatário que não melhora repetindo (número inválido/indisponível). */
   | 'invalid_recipient'
+  /** Requisição malformada PELO CHAMADOR — culpa nossa, não do provider. */
+  | 'invalid_request'
   | 'auth'
   | 'transient'
   | 'unknown';
@@ -93,10 +96,13 @@ function classificarMeta(error: unknown): SendErrorClass {
   const http = (error as { httpStatus?: unknown } | null)?.httpStatus;
 
   if (error instanceof TemplateParamsError || code === TEMPLATE_PARAMS_CODE) {
-    // NOTA: o enum de `kind` não tem um caso para "requisição malformada pelo
-    // chamador". `unknown` com retryable=false é o comportamento correto
-    // (jamais retentar), e o raw_code preserva a identificação exata.
-    return { kind: 'unknown', retryable: false, raw_code: TEMPLATE_PARAMS_CODE, message };
+    // Variáveis do template incompatíveis com a estrutura cadastrada na Meta:
+    // erro do CHAMADOR, detectado ANTES da Graph API. Não é `unknown` — nós
+    // sabemos exatamente o que é. Separar isso importa para observabilidade:
+    // `unknown` deve significar "apareceu algo que não sabemos classificar" e
+    // merecer investigação; isto aqui só merece corrigir a chamada.
+    // Retry segue proibido (repetir a mesma requisição errada dá o mesmo erro).
+    return { kind: 'invalid_request', retryable: false, raw_code: TEMPLATE_PARAMS_CODE, message };
   }
   if (code && META_RATE_LIMIT.has(code)) {
     return { kind: 'rate_limit', retryable: true, raw_code: code, message };

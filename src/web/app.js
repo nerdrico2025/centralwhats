@@ -2725,18 +2725,86 @@ function instanciasScreen() {
 
   let editing = null; // instância em edição (null = criar nova)
   let qrTimer = null;
+  let listTimer = null;
+  // Assinatura do que está DESENHADO. O polling só redesenha quando algo mudou
+  // de fato — redesenhar a cada 3s trocaria o DOM debaixo do mouse do operador
+  // (hover, foco, clique em andamento) sem nenhum ganho.
+  let assinaturaDesenhada = null;
   registerCleanup(() => { if (qrTimer) clearInterval(qrTimer); });
+  registerCleanup(() => { if (listTimer) clearInterval(listTimer); });
+
+  /** O que, mudando, precisa reaparecer na lista. */
+  function assinaturaDaLista(list) {
+    return list
+      .map((i) => [i.id, i.name, i.provider_type, i.connection_status, i.active,
+        i.phone_number_id ?? '', i.secrets_unreadable ? 1 : 0].join(':'))
+      .join('|');
+  }
 
   async function loadList() {
-    listCard.innerHTML = '';
-    listCard.appendChild(h('h3', { class: 'card__title' }, 'Instâncias'));
+    // Estado de carregando SÓ na primeira vez: nas recargas seguintes a lista
+    // atual continua na tela até a nova chegar (sem piscar).
+    if (assinaturaDesenhada === null && !listCard.children.length) {
+      listCard.appendChild(h('h3', { class: 'card__title' }, 'Instâncias'));
+      listCard.appendChild(h('div', { class: 'muted' }, 'Carregando…'));
+    }
     let list = [];
     try {
       list = await api.listInstances();
     } catch (e) {
+      listCard.innerHTML = '';
+      listCard.appendChild(h('h3', { class: 'card__title' }, 'Instâncias'));
       listCard.appendChild(h('div', { class: 'muted' }, 'Erro: ' + e.message));
+      assinaturaDesenhada = null; // força redesenho quando voltar a funcionar
       return;
     }
+    desenharLista(list);
+  }
+
+  /**
+   * Tick do polling: atualiza o status sem F5. Diferente do loadList manual em
+   * dois pontos — não redesenha se nada mudou, e uma falha de rede NÃO apaga a
+   * lista que está na tela (o operador continua vendo o último estado bom,
+   * com o aviso do que aconteceu).
+   */
+  async function tickLista() {
+    let list;
+    try {
+      list = await api.listInstances();
+    } catch (e) {
+      // Nunca silencioso: avisa SEM destruir o que já está desenhado.
+      // eslint-disable-next-line no-console
+      console.warn('[instâncias] atualização automática falhou:', e.message);
+      mostrarAvisoDeAtualizacao('Atualização automática falhou (' + e.message + ').');
+      return;
+    }
+    limparAvisoDeAtualizacao();
+    desenharLista(list);
+  }
+
+  function mostrarAvisoDeAtualizacao(texto) {
+    let el = listCard.querySelector('[data-aviso-polling]');
+    if (!el) {
+      el = h('div', {
+        class: 'muted', style: 'font-size:12px;margin-bottom:8px;color:#92400e',
+      });
+      el.setAttribute('data-aviso-polling', '1');
+      listCard.insertBefore(el, listCard.children[1] ?? null);
+    }
+    el.textContent = texto;
+  }
+
+  function limparAvisoDeAtualizacao() {
+    const el = listCard.querySelector('[data-aviso-polling]');
+    if (el) el.remove();
+  }
+
+  function desenharLista(list) {
+    const assinatura = assinaturaDaLista(list);
+    if (assinatura === assinaturaDesenhada) return; // nada mudou: não mexe no DOM
+    assinaturaDesenhada = assinatura;
+    listCard.innerHTML = '';
+    listCard.appendChild(h('h3', { class: 'card__title' }, 'Instâncias'));
     if (!list.length) {
       listCard.appendChild(h('div', { class: 'muted' }, 'Nenhuma instância. Crie ao lado.'));
       return;
@@ -2918,6 +2986,15 @@ function instanciasScreen() {
 
   loadList();
   renderForm();
+  // Polling do status, 3s — MESMO intervalo do pareamento por QR (showQr), e
+  // pelo mesmo motivo: é o ritmo em que o status muda quando alguém está
+  // olhando (pending → connecting → connected). Sem isto, desativar ou apagar
+  // uma instância só aparecia depois de um F5 na mão.
+  //
+  // Seguro contra sobrescrita de estado local: este tick só redesenha o
+  // listCard. O formulário de edição e o QR vivem no sideCard e não são
+  // tocados — não há edição inline na lista.
+  listTimer = setInterval(() => { void tickLista(); }, 3000);
   return root;
 }
 
