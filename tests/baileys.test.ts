@@ -595,6 +595,133 @@ describe('inbound em @lid — o bug que descartava TODA mensagem em silêncio', 
   });
 });
 
+describe('avatar do contato (worker busca, API só lê)', () => {
+  function socketComFoto(url: string | undefined, erro?: Error) {
+    const fake = makeFakeSocket();
+    const chamadas: string[] = [];
+    fake.socket.profilePictureUrl = async (jid: string) => {
+      chamadas.push(jid);
+      if (erro) throw erro;
+      return url;
+    };
+    return { fake, chamadas };
+  }
+
+  async function comInbound(worker: BaileysWorker, id = 'W1') {
+    await worker.handleIncoming(inst, {
+      key: { remoteJid: PHONE + '@s.whatsapp.net', id },
+      message: { conversation: 'oi' },
+    });
+  }
+
+  it('busca e grava a foto na primeira mensagem do contato', async () => {
+    const { fake, chamadas } = socketComFoto('https://cdn.wa/foto.jpg');
+    const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket });
+    await worker.connectInstance(inst);
+
+    await comInbound(worker);
+    await new Promise((r) => setTimeout(r, 30)); // busca é não-bloqueante
+
+    expect(chamadas).toEqual([PHONE + '@s.whatsapp.net']);
+    const c = await repo.contacts.getByPhone(inst.id, PHONE);
+    expect(c?.avatar_url).toBe('https://cdn.wa/foto.jpg');
+    expect(c?.avatar_fetched_at).toBeTruthy();
+    await worker.stop();
+  });
+
+  it('CACHE NEGATIVO: sem foto grava o carimbo e não repete a consulta', async () => {
+    const { fake, chamadas } = socketComFoto(undefined); // contato sem foto
+    const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket });
+    await worker.connectInstance(inst);
+
+    await comInbound(worker, 'W1');
+    await new Promise((r) => setTimeout(r, 30));
+    const c1 = await repo.contacts.getByPhone(inst.id, PHONE);
+    expect(c1?.avatar_url).toBeNull();
+    expect(c1?.avatar_fetched_at).toBeTruthy(); // carimbo mesmo SEM foto
+
+    // Segunda mensagem dentro do TTL: NÃO consulta de novo.
+    await comInbound(worker, 'W2');
+    await new Promise((r) => setTimeout(r, 30));
+    expect(chamadas).toHaveLength(1);
+    await worker.stop();
+  });
+
+  it('foto oculta por privacidade (lança) também vira cache negativo', async () => {
+    const { fake } = socketComFoto(undefined, Object.assign(new Error('forbidden'), {
+      output: { statusCode: 403 },
+    }));
+    const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket });
+    await worker.connectInstance(inst);
+
+    await comInbound(worker);
+    await new Promise((r) => setTimeout(r, 30));
+
+    const c = await repo.contacts.getByPhone(inst.id, PHONE);
+    expect(c?.avatar_url).toBeNull();
+    expect(c?.avatar_fetched_at).toBeTruthy(); // não vai reconsultar a cada msg
+    await worker.stop();
+  });
+
+  it('TTL vencido volta a consultar', async () => {
+    const { fake, chamadas } = socketComFoto('https://cdn.wa/nova.jpg');
+    const worker = new BaileysWorker(repo, {
+      socketFactory: async () => fake.socket,
+      avatarTtlHours: 0, // tudo já vencido
+      minProfileIntervalMs: 1,
+    });
+    await worker.connectInstance(inst);
+
+    await comInbound(worker, 'W1');
+    await new Promise((r) => setTimeout(r, 30));
+    await comInbound(worker, 'W2');
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(chamadas.length).toBeGreaterThanOrEqual(2);
+    await worker.stop();
+  });
+
+  it('falha na busca NÃO derruba nem atrasa a gravação da mensagem', async () => {
+    const fake = makeFakeSocket();
+    fake.socket.profilePictureUrl = async () => {
+      throw new Error('rede fora');
+    };
+    const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket });
+    await worker.connectInstance(inst);
+
+    await comInbound(worker);
+    // A mensagem está gravada mesmo com a busca de avatar falhando.
+    expect(await repo.messages.listByContact(inst.id, PHONE)).toHaveLength(1);
+    await worker.stop();
+  });
+
+  it('instância Meta: nenhuma consulta (socket sem profilePictureUrl)', async () => {
+    const fake = makeFakeSocket(); // sem profilePictureUrl, como o caminho Meta
+    const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket });
+    await worker.connectInstance(inst);
+
+    await comInbound(worker);
+    await new Promise((r) => setTimeout(r, 20));
+
+    const c = await repo.contacts.getByPhone(inst.id, PHONE);
+    expect(c?.avatar_url).toBeNull();
+    expect(c?.avatar_fetched_at).toBeNull(); // nem tentou
+    await worker.stop();
+  });
+
+  it('listConversations devolve avatar_url (JOIN existente, sem N+1)', async () => {
+    const { fake } = socketComFoto('https://cdn.wa/foto.jpg');
+    const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket });
+    await worker.connectInstance(inst);
+    await comInbound(worker);
+    await new Promise((r) => setTimeout(r, 30));
+
+    const convs = await repo.messages.listConversations(inst.id);
+    expect(convs[0].avatar_url).toBe('https://cdn.wa/foto.jpg');
+    await worker.stop();
+  });
+});
+
 describe('worker — inbound pelo socket usa o MESMO motor (reuso total)', () => {
   it('mensagem recebida grava tudo e o fluxo responde REATIVAMENTE pelo socket', async () => {
     await repo.flows.create({

@@ -243,11 +243,12 @@ export function createSqliteAdapter(opts: { path: string }): Repo {
         // inbound e o to em outbound. Window functions: última msg (rn=1) +
         // não-lidas (SUM sobre a partição). Uma query só, sem N+1.
         const rows = all(
-          `SELECT phone, name, last_type, last_content, last_direction, last_at, unread
+          `SELECT phone, name, avatar_url, last_type, last_content, last_direction, last_at, unread
              FROM (
                SELECT
                  msg.conv_phone AS phone,
                  c.name AS name,
+                 c.avatar_url AS avatar_url,
                  msg.type AS last_type,
                  msg.content AS last_content,
                  msg.direction AS last_direction,
@@ -319,6 +320,15 @@ export function createSqliteAdapter(opts: { path: string }): Repo {
       async getById(instanceId, id) {
         const r = get(`SELECT * FROM contacts WHERE instance_id=? AND id=?`, instanceId, id);
         return r ? m.mapContact(r) : null;
+      },
+      async setAvatar(instanceId, phone, url, fetchedAt) {
+        run(
+          `UPDATE contacts SET avatar_url=?, avatar_fetched_at=? WHERE instance_id=? AND phone=?`,
+          url,
+          fetchedAt,
+          instanceId,
+          normalizePhone(phone),
+        );
       },
       async getByPhone(instanceId, phone) {
         const r = get(

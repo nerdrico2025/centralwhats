@@ -362,6 +362,38 @@ function formatTime(iso) {
   }
 }
 
+/**
+ * Avatar do contato, com placeholder de iniciais.
+ *
+ * O `onerror` NÃO é opcional: a URL de foto do WhatsApp EXPIRA, e sem ele o
+ * painel mostraria ícone de imagem quebrada em vez do placeholder. Imagem e
+ * placeholder ocupam exatamente a mesma caixa — trocar um pelo outro não
+ * empurra nada (zero layout shift).
+ *
+ * Instância Meta nunca tem avatar_url (a Cloud API não expõe foto de contato);
+ * ali o placeholder é o estado normal, não uma falha.
+ */
+function iniciaisDe(nome, telefone) {
+  const base = (nome || '').trim();
+  if (!base) return (telefone || '?').slice(-2);
+  const partes = base.split(/\s+/).filter(Boolean);
+  const ini = partes.length > 1 ? partes[0][0] + partes[partes.length - 1][0] : partes[0].slice(0, 2);
+  return ini.toUpperCase();
+}
+
+function avatarDe(nome, telefone, url) {
+  const box = h('div', { class: 'avatar' });
+  const placeholder = h('span', { class: 'avatar__iniciais' }, iniciaisDe(nome, telefone));
+  box.appendChild(placeholder);
+  if (url) {
+    const img = h('img', { class: 'avatar__img', src: url, alt: '', loading: 'lazy' });
+    // Falhou (URL expirada, rede): some a imagem e o placeholder reaparece.
+    img.onerror = () => img.remove();
+    box.appendChild(img);
+  }
+  return box;
+}
+
 function livechatScreen() {
   const listEl = h('div', { class: 'conv-list' });
   // conversation-pane: sem esta classe a coluna da direita não tem
@@ -412,11 +444,16 @@ function livechatScreen() {
             onclick: () => selectConversation(c.phone),
           },
           [
-            h('div', { class: 'conv-item__top' }, [
-              h('span', { class: 'conv-item__name' }, c.name || c.phone),
-              c.unread ? h('span', { class: 'conv-unread' }, String(c.unread)) : null,
+            h('div', { class: 'conv-item__linha' }, [
+              avatarDe(c.name, c.phone, c.avatar_url),
+              h('div', { style: 'min-width:0;flex:1' }, [
+                h('div', { class: 'conv-item__top' }, [
+                  h('span', { class: 'conv-item__name' }, c.name || c.phone),
+                  c.unread ? h('span', { class: 'conv-unread' }, String(c.unread)) : null,
+                ]),
+                h('div', { class: 'conv-item__preview' }, previewOf(c)),
+              ]),
             ]),
-            h('div', { class: 'conv-item__preview' }, previewOf(c)),
           ],
         ),
       );
@@ -459,9 +496,10 @@ function livechatScreen() {
     const conv = convs.find((c) => c.phone === selected);
     const nomeEl = h('strong', {}, (conv && conv.name) || selected);
     const header = h('div', { class: 'conversation__header' }, [
-      nomeEl,
-      ' ',
-      h('span', { class: 'muted' }, selected),
+      h('div', { class: 'conv-item__linha' }, [
+        avatarDe(conv && conv.name, selected, conv && conv.avatar_url),
+        h('div', {}, [nomeEl, ' ', h('span', { class: 'muted' }, selected)]),
+      ]),
     ]);
     const msgsEl = h('div', { class: 'conversation__messages' });
     const input = h('textarea', {

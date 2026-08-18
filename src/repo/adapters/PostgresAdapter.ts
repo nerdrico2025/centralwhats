@@ -204,11 +204,12 @@ export function createPostgresAdapter(opts: { connectionString: string }): Repo 
       async listConversations(instanceId) {
         // Ver comentário no SqliteAdapter — mesma query com window functions.
         const rows = await all(
-          `SELECT phone, name, last_type, last_content, last_direction, last_at, unread
+          `SELECT phone, name, avatar_url, last_type, last_content, last_direction, last_at, unread
              FROM (
                SELECT
                  msg.conv_phone AS phone,
                  c.name AS name,
+                 c.avatar_url AS avatar_url,
                  msg.type AS last_type,
                  msg.content AS last_content,
                  msg.direction AS last_direction,
@@ -280,6 +281,12 @@ export function createPostgresAdapter(opts: { connectionString: string }): Repo 
           id,
         ]);
         return r ? m.mapContact(r) : null;
+      },
+      async setAvatar(instanceId, phone, url, fetchedAt) {
+        await run(
+          `UPDATE contacts SET avatar_url=$1, avatar_fetched_at=$2 WHERE instance_id=$3 AND phone=$4`,
+          [url, fetchedAt, instanceId, normalizePhone(phone)],
+        );
       },
       async getByPhone(instanceId, phone) {
         const r = await get(`SELECT * FROM contacts WHERE instance_id=$1 AND phone=$2`, [

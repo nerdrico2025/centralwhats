@@ -34,6 +34,8 @@ export interface BaileysSocketLike {
   signalRepository?: {
     lidMapping?: { getPNForLID(lid: string): Promise<string | null> };
   } | null;
+  /** Foto de perfil (Socket/chats.d.ts:40). `undefined` = sem foto. */
+  profilePictureUrl?(jid: string, type?: 'preview' | 'image'): Promise<string | undefined>;
   /**
    * Gera um id de mensagem no MESMO formato que a lib usaria
    * (generateMessageIDV2(sock.user?.id) — messages-send.js:1086). Fornecido
@@ -70,6 +72,10 @@ export interface BaileysWorkerOpts {
   outboxStaleMinutes?: number;
   /** Intervalo mínimo entre envios da MESMA instância (ms). */
   minSendIntervalMs?: number;
+  /** TTL do avatar do contato (horas). */
+  avatarTtlHours?: number;
+  /** Intervalo mínimo entre consultas de foto de perfil (ms). */
+  minProfileIntervalMs?: number;
   /** Backoff máximo de reconexão (ms). */
   maxReconnectDelayMs?: number;
 }
@@ -109,6 +115,24 @@ export const OUTBOX_STALE_REASON = 'instance_disconnected_timeout';
  */
 export const BAILEYS_MIN_SEND_INTERVAL_MS = Number(
   process.env.BAILEYS_MIN_SEND_INTERVAL_MS ?? 1000,
+);
+
+/**
+ * TTL do avatar do contato, em horas (default 24).
+ * Configurável por env AVATAR_TTL_HOURS.
+ */
+export const AVATAR_TTL_HOURS = Number(process.env.AVATAR_TTL_HOURS ?? 24);
+
+/**
+ * Intervalo mínimo entre duas consultas de FOTO DE PERFIL da mesma instância
+ * (default 2000ms). Configurável por env BAILEYS_MIN_PROFILE_INTERVAL_MS.
+ *
+ * Mais lento que o throttle de envio de propósito: buscar avatar é acessório,
+ * e uma conversa nova por mensagem já é raro. O risco a evitar é o mesmo —
+ * rajada de consultas ao WhatsApp a partir de um mesmo número.
+ */
+export const BAILEYS_MIN_PROFILE_INTERVAL_MS = Number(
+  process.env.BAILEYS_MIN_PROFILE_INTERVAL_MS ?? 2000,
 );
 
 /** Telefone → JID do WhatsApp. */
@@ -446,6 +470,18 @@ export class BaileysWorker {
    */
   private ultimoEnvioAt = new Map<string, number>();
   private filaDeEnvio = new Map<string, Promise<unknown>>();
+  /**
+   * Throttle das consultas de FOTO DE PERFIL, por instância — mesmo desenho da
+   * fila de envio.
+   *
+   * ⚠️ A SEGURANÇA DISTO DEPENDE DA CONVENÇÃO "UMA RÉPLICA" CONTINUAR VALENDO.
+   * Escalar o worker horizontalmente SEM revisar este ponto quebra o throttle
+   * em silêncio: cada processo teria o próprio carimbo, e N réplicas
+   * multiplicariam por N a taxa de consultas do MESMO número — sem nenhum
+   * sinal de que parou de funcionar. Quem mexer em escala mexe aqui também.
+   */
+  private ultimoPerfilAt = new Map<string, number>();
+  private filaDePerfil = new Map<string, Promise<unknown>>();
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private scanTimer: ReturnType<typeof setInterval> | null = null;
   private scanning = false;
@@ -555,6 +591,61 @@ export class BaileysWorker {
     // A fila guarda a versão "que nunca rejeita", para um envio com erro não
     // derrubar os próximos da mesma instância.
     this.filaDeEnvio.set(
+      instanceId,
+      atual.catch(() => undefined),
+    );
+    return atual;
+  }
+
+  /**
+   * Atualiza a foto do contato, se estiver vencida. ACESSÓRIO por definição:
+   * nunca bloqueia nem derruba o processamento da mensagem — por isso é
+   * chamado sem await e engole o próprio erro (com log).
+   *
+   * Cache negativo: sem foto ou recusa por privacidade grava `avatar_url` nulo
+   * COM carimbo. Sem isso, contato sem foto viraria uma chamada de rede por
+   * mensagem, para sempre.
+   */
+  async atualizarAvatarSeVencido(instance: Instance, phone: string): Promise<void> {
+    const socket = this.sockets.get(instance.id);
+    if (!socket?.profilePictureUrl) return; // Meta não passa por aqui
+
+    const contato = await this.repo.contacts.getByPhone(instance.id, phone);
+    if (!contato) return;
+    const ttlMs = (this.opts.avatarTtlHours ?? AVATAR_TTL_HOURS) * 3600_000;
+    const buscadoEm = contato.avatar_fetched_at ? Date.parse(contato.avatar_fetched_at) : 0;
+    if (buscadoEm && Date.now() - buscadoEm < ttlMs) return; // ainda vale
+
+    const url = await this.comThrottleDePerfil(instance.id, async () => {
+      try {
+        return (await socket.profilePictureUrl!(toJid(phone), 'preview')) ?? null;
+      } catch (err) {
+        // Recusa por privacidade lança (Boom). Não é erro nosso: é "sem foto".
+        // eslint-disable-next-line no-console
+        console.log(
+          `[worker] avatar indisponível para ${phone} (instância ${instance.id}): ` +
+            `${(err as Error).message}`,
+        );
+        return null;
+      }
+    });
+    await this.repo.contacts.setAvatar(instance.id, phone, url, new Date().toISOString());
+  }
+
+  /** Fila de consultas de perfil por instância (ver ultimoPerfilAt). */
+  private async comThrottleDePerfil<T>(instanceId: string, fn: () => Promise<T>): Promise<T> {
+    const intervalo = this.opts.minProfileIntervalMs ?? BAILEYS_MIN_PROFILE_INTERVAL_MS;
+    const anterior = this.filaDePerfil.get(instanceId) ?? Promise.resolve();
+    const atual = anterior
+      .catch(() => undefined)
+      .then(async () => {
+        const desde = Date.now() - (this.ultimoPerfilAt.get(instanceId) ?? 0);
+        const espera = Math.max(0, intervalo - desde);
+        if (espera > 0) await new Promise((r) => setTimeout(r, espera));
+        this.ultimoPerfilAt.set(instanceId, Date.now());
+        return fn();
+      });
+    this.filaDePerfil.set(
       instanceId,
       atual.catch(() => undefined),
     );
@@ -961,6 +1052,13 @@ export class BaileysWorker {
       },
       this.flowDeps(),
     );
+    // Avatar: acessório e NÃO-bloqueante — a mensagem já está gravada, e uma
+    // falha ou lentidão aqui não pode atrasar fluxo nem derrubar o inbound.
+    void this.atualizarAvatarSeVencido(instance, normalized.from).catch((err) => {
+      // eslint-disable-next-line no-console
+      console.warn(`[worker] falha ao atualizar avatar de ${normalized.from}:`, err);
+    });
+
     // Mesmo gancho da web: inbound dispara a varredura de retomadas.
     await processPendingExecutions(this.repo, instance.id, this.flowDeps());
   }

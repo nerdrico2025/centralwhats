@@ -606,6 +606,39 @@ body {
 .conv-item.active {
   background: #eef7f0;
 }
+/* Avatar: imagem e placeholder ocupam EXATAMENTE a mesma caixa, e a imagem
+   fica por cima. Quando a URL do WhatsApp expira, o onerror remove o <img> e o
+   placeholder reaparece sem mover um pixel do layout. */
+.avatar {
+  position: relative;
+  width: 40px;
+  height: 40px;
+  flex: 0 0 40px;
+  border-radius: 50%;
+  overflow: hidden;
+  background: var(--border);
+  display: grid;
+  place-items: center;
+}
+.avatar__iniciais {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-muted);
+  user-select: none;
+}
+.avatar__img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.conv-item__linha {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
 .conv-item__top {
   display: flex;
   align-items: center;

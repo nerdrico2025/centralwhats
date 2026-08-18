@@ -183,6 +183,13 @@ export interface Contact {
   name_source: 'manual' | 'profile' | null;
   last_seen: string | null;
   last_read_at: string | null;
+  /** URL da foto de perfil (Baileys). Nula = sem foto ou provider sem suporte. */
+  avatar_url?: string | null;
+  /**
+   * Quando tentamos buscar a foto pela ÚLTIMA vez — preenchido mesmo quando não
+   * há foto. É o que evita repetir a chamada a cada mensagem (cache negativo).
+   */
+  avatar_fetched_at?: string | null;
 }
 
 /** Métricas agregadas do Dashboard (por instância + alguns globais). */
@@ -202,6 +209,8 @@ export interface DashboardMetrics {
 export interface ConversationSummary {
   phone: string;
   name: string | null;
+  /** Vem do JOIN com contacts que a query já fazia — sem N+1. */
+  avatar_url?: string | null;
   unread: number;
   last_message_at: string;
   last_message_direction: MessageDirection;

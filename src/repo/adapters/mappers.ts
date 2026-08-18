@@ -211,6 +211,10 @@ export function mapContact(r: Row): Contact {
     name_source: strOrNull(r.name_source) as Contact['name_source'],
     last_seen: strOrNull(r.last_seen),
     last_read_at: strOrNull(r.last_read_at),
+    // Colunas novas (migration 015): banco ainda não migrado devolve null em
+    // vez de estourar na leitura.
+    avatar_url: strOrNull(r.avatar_url),
+    avatar_fetched_at: strOrNull(r.avatar_fetched_at),
   };
 }
 
@@ -218,6 +222,7 @@ export function mapConversation(r: Row): import('../types').ConversationSummary 
   return {
     phone: str(r.phone),
     name: strOrNull(r.name),
+    avatar_url: strOrNull(r.avatar_url),
     unread: num(r.unread),
     last_message_at: str(r.last_at),
     last_message_direction: r.last_direction as 'in' | 'out',

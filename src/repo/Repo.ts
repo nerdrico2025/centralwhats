@@ -284,6 +284,17 @@ export interface ContactsRepo {
     name: string | null,
     source: 'manual' | 'profile',
   ): Promise<Contact | null>;
+  /**
+   * Grava a foto de perfil E o carimbo da tentativa. `url` null com `fetchedAt`
+   * preenchido é o CACHE NEGATIVO: contato sem foto (ou que a esconde) não pode
+   * virar uma chamada de rede por mensagem, para sempre.
+   */
+  setAvatar(
+    instanceId: string,
+    phone: string,
+    url: string | null,
+    fetchedAt: string,
+  ): Promise<void>;
   touchLastSeen(instanceId: string, phone: string, at: string): Promise<void>;
   /** Marca a conversa como lida até `at` (Live Chat). */
   markRead(instanceId: string, phone: string, at: string): Promise<void>;
