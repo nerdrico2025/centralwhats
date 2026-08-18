@@ -348,13 +348,54 @@ describe('worker — consumo da outbox', () => {
     await worker.stop();
   });
 
-  it('socket SEM gerarMessageId cai no comportamento antigo (id do retorno)', async () => {
-    const { message } = await sendViaProvider(repo, inst, { type: 'text', to: PHONE, text: 'oi' });
-    const { worker } = await workerWithSocket(); // fake sem gerarMessageId
+  it('socket SEM gerarMessageId: comportamento antigo, mas AVISADO em warn', async () => {
+    const avisos: string[] = [];
+    const spy = vi.spyOn(console, 'warn').mockImplementation((...a: unknown[]) => {
+      avisos.push(a.join(' '));
+    });
+    try {
+      const { message } = await sendViaProvider(repo, inst, { type: 'text', to: PHONE, text: 'oi' });
+      const { worker } = await workerWithSocket(); // fake sem gerarMessageId
 
-    expect((await worker.processOutboxOnce()).sent).toBe(1);
-    expect((await repo.messages.getById(message.id))?.wa_message_id).toBe('BAILEYS.1');
-    await worker.stop();
+      expect((await worker.processOutboxOnce()).sent).toBe(1);
+      expect((await repo.messages.getById(message.id))?.wa_message_id).toBe('BAILEYS.1');
+
+      // A degradação NÃO pode ser muda: é a corrida com o eco voltando, e é
+      // pré-condição da rodada do fromMe que este aviso nunca apareça.
+      const aviso = avisos.find((l) => l.includes('SEM reserva de messageId'));
+      expect(aviso).toBeTruthy();
+      expect(aviso).toContain('NÃO aceite `fromMe`');
+      await worker.stop();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('reserva prévia NÃO se disfarça de retry no log (e o retry continua avisando)', async () => {
+    const linhas: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => {
+      linhas.push(a.join(' '));
+    });
+    try {
+      const fake = makeFakeSocket();
+      fake.socket.gerarMessageId = () => 'ID.1';
+      const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket });
+      await worker.connectInstance(inst);
+
+      // Caminho reativo: reserva prévia em TODA mensagem — nunca é retry.
+      await sendViaProvider(
+        repo, inst, { type: 'text', to: PHONE, text: 'do bot' }, worker.flowDeps(),
+      );
+      expect(linhas.filter((l) => l.includes('retry reutilizando'))).toHaveLength(0);
+
+      // Primeiro envio pela outbox também não é retry.
+      await sendViaProvider(repo, inst, { type: 'text', to: PHONE, text: 'do painel' });
+      await worker.processOutboxOnce();
+      expect(linhas.filter((l) => l.includes('retry reutilizando'))).toHaveLength(0);
+      await worker.stop();
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('fluxo reativo: linha criada ANTES do envio, já com o id reservado', async () => {

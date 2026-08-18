@@ -480,8 +480,14 @@ export class BaileysWorker {
      * antes do eco, que a lib agenda num nextTick dentro do sendMessage.
      */
     reserva?: {
-      /** Id já reservado numa tentativa anterior — reutilizado no retry. */
+      /**
+       * Id já existente. Duas origens MUITO diferentes, e o log precisa
+       * distingui-las: `reserva-previa` = acabou de ser reservado e gravado
+       * por quem chamou (fluxo reativo); `retry` = sobrou de uma tentativa
+       * anterior que falhou.
+       */
       existente?: string | null;
+      origem: 'reserva-previa' | 'retry';
       /** Grava o id. O `await` DESTA promise é a garantia da invariante. */
       persistir: (messageId: string) => Promise<void>;
     },
@@ -512,13 +518,35 @@ export class BaileysWorker {
           // ele, então uma retentativa do que já chegou não vira entrega dupla.
           messageId = reserva.existente ?? socket.gerarMessageId?.();
           if (messageId) {
-            if (reserva.existente) {
+            if (reserva.origem === 'retry') {
               // eslint-disable-next-line no-console
               console.log(
                 `[worker] retry reutilizando messageId ${messageId} (instância ${instanceId})`,
               );
             }
             await reserva.persistir(messageId); // await CONCLUÍDO antes do socket
+          } else {
+            /**
+             * ⚠️ DEGRADAÇÃO SILENCIOSA — NÃO PODE PASSAR DESPERCEBIDA.
+             *
+             * Sem `gerarMessageId` (lib sem generateMessageIDV2, ou socket
+             * fake), o id só é conhecido DEPOIS do envio — exatamente a
+             * corrida com o eco que a reserva existe para eliminar. O envio
+             * continua funcionando, mas a invariante caiu para esta mensagem.
+             *
+             * PRÉ-CONDIÇÃO DA RODADA DO `fromMe`: confirmar que este aviso
+             * NUNCA apareceu em produção. Aceitar `fromMe` com este fallback
+             * ativo não duplica mensagem — DESTRÓI: o eco insere a linha
+             * primeiro, e a gravação do id seguinte colide com
+             * ux_messages_wamid, marcando como falha um envio entregue.
+             */
+            // eslint-disable-next-line no-console
+            console.warn(
+              `[worker] SEM reserva de messageId na instância ${instanceId}: o socket não ` +
+                'expõe gerarMessageId. O envio segue pelo caminho ANTIGO (id só depois do ' +
+                'envio) e a corrida com o eco volta a existir para esta mensagem. ' +
+                'NÃO aceite `fromMe` enquanto este aviso aparecer.',
+            );
           }
         }
         return socket.sendMessage(jid, content, messageId ? { messageId } : undefined);
@@ -552,8 +580,15 @@ export class BaileysWorker {
           socket,
           jid,
           toSocketContent(payload, jid),
+          // Sempre 'reserva-previa': sendViaProvider já reservou e gravou o id
+          // antes de chegar aqui. NUNCA é retry — o retry do reativo é do
+          // motor de fluxos, não deste caminho.
           opts?.messageId
-            ? { existente: opts.messageId, persistir: async () => undefined }
+            ? {
+                existente: opts.messageId,
+                origem: 'reserva-previa' as const,
+                persistir: async () => undefined,
+              }
             : undefined,
         );
         return { waMessageId: res?.key?.id ?? null, status: 'sent' };
@@ -983,6 +1018,8 @@ export class BaileysWorker {
             toSocketContent(item.payload as BaileysSendPayload, jid),
             {
               existente: jaReservado,
+              // Id que sobrou de tentativa anterior = retry de verdade.
+              origem: jaReservado ? ('retry' as const) : ('reserva-previa' as const),
               persistir: async (messageId) => {
                 idPersistido = messageId;
                 if (item.message_id) {
