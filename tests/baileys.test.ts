@@ -296,6 +296,89 @@ describe('worker — consumo da outbox', () => {
     await worker.stop();
   });
 
+  it('INVARIANTE: o wa_message_id está gravado ANTES do socket.sendMessage', async () => {
+    const { message } = await sendViaProvider(repo, inst, { type: 'text', to: PHONE, text: 'oi' });
+    const fake = makeFakeSocket();
+    fake.socket.gerarMessageId = () => 'ID.RESERVADO.1';
+    // No instante do envio, a linha JÁ tem que ter o id — é isto que vence o
+    // eco que a lib agenda num nextTick dentro do sendMessage.
+    let gravadoNoMomentoDoEnvio = null;
+    let idRecebidoPeloSocket;
+    fake.socket.sendMessage = async (_jid, _content, opts) => {
+      idRecebidoPeloSocket = opts?.messageId;
+      gravadoNoMomentoDoEnvio = (await repo.messages.getById(message.id))?.wa_message_id ?? null;
+      return { key: { id: opts?.messageId ?? 'BAILEYS.X' } };
+    };
+    const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket });
+    await worker.connectInstance(inst);
+
+    const r = await worker.processOutboxOnce();
+    expect(r.sent).toBe(1);
+    expect(idRecebidoPeloSocket).toBe('ID.RESERVADO.1'); // repassado à lib
+    expect(gravadoNoMomentoDoEnvio).toBe('ID.RESERVADO.1'); // JÁ persistido
+    const final = await repo.messages.getById(message.id);
+    expect(final?.wa_message_id).toBe('ID.RESERVADO.1');
+    expect(final?.status).toBe('sent');
+    await worker.stop();
+  });
+
+  it('retry REUTILIZA o messageId (servidor deduplica; sem entrega dupla)', async () => {
+    const { message } = await sendViaProvider(repo, inst, { type: 'text', to: PHONE, text: 'oi' });
+    const fake = makeFakeSocket();
+    let n = 0;
+    fake.socket.gerarMessageId = () => 'ID.GERADO.' + ++n;
+    const idsVistos = [];
+    fake.socket.sendMessage = async (_j, _c, opts) => {
+      idsVistos.push(opts?.messageId);
+      // 1ª tentativa: transitório (volta pra fila). 2ª: passa.
+      if (idsVistos.length === 1) {
+        throw Object.assign(new Error('Connection Closed'), { output: { statusCode: 428 } });
+      }
+      return { key: { id: opts?.messageId } };
+    };
+    const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket });
+    await worker.connectInstance(inst);
+
+    expect((await worker.processOutboxOnce()).requeued).toBe(1);
+    expect((await worker.processOutboxOnce()).sent).toBe(1);
+
+    // MESMO id nas duas tentativas — não um id novo por tentativa.
+    expect(idsVistos).toEqual(['ID.GERADO.1', 'ID.GERADO.1']);
+    expect((await repo.messages.getById(message.id))?.wa_message_id).toBe('ID.GERADO.1');
+    await worker.stop();
+  });
+
+  it('socket SEM gerarMessageId cai no comportamento antigo (id do retorno)', async () => {
+    const { message } = await sendViaProvider(repo, inst, { type: 'text', to: PHONE, text: 'oi' });
+    const { worker } = await workerWithSocket(); // fake sem gerarMessageId
+
+    expect((await worker.processOutboxOnce()).sent).toBe(1);
+    expect((await repo.messages.getById(message.id))?.wa_message_id).toBe('BAILEYS.1');
+    await worker.stop();
+  });
+
+  it('fluxo reativo: linha criada ANTES do envio, já com o id reservado', async () => {
+    const fake = makeFakeSocket();
+    fake.socket.gerarMessageId = () => 'ID.REATIVO.1';
+    let existiaNoMomentoDoEnvio = null;
+    fake.socket.sendMessage = async (_j, _c, opts) => {
+      existiaNoMomentoDoEnvio = await repo.messages.getByWaMessageId(inst.id, 'ID.REATIVO.1');
+      return { key: { id: opts?.messageId } };
+    };
+    const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket });
+    await worker.connectInstance(inst);
+
+    // Caminho reativo: sendViaProvider com o socketSender do worker.
+    const { message } = await sendViaProvider(
+      repo, inst, { type: 'text', to: PHONE, text: 'resposta do bot' }, worker.flowDeps(),
+    );
+
+    expect(existiaNoMomentoDoEnvio).not.toBeNull(); // já persistida
+    expect(message.wa_message_id).toBe('ID.REATIVO.1');
+    expect((await repo.messages.getById(message.id))?.status).toBe('sent');
+    await worker.stop();
+  });
+
   it('claim atômico: dois consumos simultâneos não enviam o mesmo item duas vezes', async () => {
     await sendViaProvider(repo, inst, { type: 'text', to: PHONE, text: 'unico' });
     const { worker, fake } = await workerWithSocket();

@@ -34,9 +34,17 @@ export interface BaileysSocketLike {
   signalRepository?: {
     lidMapping?: { getPNForLID(lid: string): Promise<string | null> };
   } | null;
+  /**
+   * Gera um id de mensagem no MESMO formato que a lib usaria
+   * (generateMessageIDV2(sock.user?.id) — messages-send.js:1086). Fornecido
+   * pela factory real; o worker nunca importa o Baileys direto.
+   */
+  gerarMessageId?(): string;
   sendMessage(
     jid: string,
     content: Record<string, unknown>,
+    /** `messageId` pré-reservado; a lib o usa no lugar de gerar um. */
+    opts?: { messageId?: string },
   ): Promise<{ key?: { id?: string | null } } | undefined>;
   end?(err?: Error): void;
 }
@@ -465,6 +473,18 @@ export class BaileysWorker {
     socket: BaileysSocketLike,
     jid: string,
     content: Record<string, unknown>,
+    /**
+     * Reserva do `wa_message_id` ANTES do envio. A persistência acontece
+     * DENTRO da vez desta mensagem na fila (não no enfileiramento): a linha
+     * continua refletindo o envio real, e ainda assim é gravada com folga
+     * antes do eco, que a lib agenda num nextTick dentro do sendMessage.
+     */
+    reserva?: {
+      /** Id já reservado numa tentativa anterior — reutilizado no retry. */
+      existente?: string | null;
+      /** Grava o id. O `await` DESTA promise é a garantia da invariante. */
+      persistir: (messageId: string) => Promise<void>;
+    },
   ): Promise<{ key?: { id?: string | null } } | undefined> {
     const intervalo = this.opts.minSendIntervalMs ?? BAILEYS_MIN_SEND_INTERVAL_MS;
     const anterior = this.filaDeEnvio.get(instanceId) ?? Promise.resolve();
@@ -485,7 +505,23 @@ export class BaileysWorker {
           await new Promise((r) => setTimeout(r, espera));
         }
         this.ultimoEnvioAt.set(instanceId, Date.now());
-        return socket.sendMessage(jid, content);
+
+        let messageId: string | undefined;
+        if (reserva) {
+          // Retry reutiliza o MESMO id: o servidor do WhatsApp deduplica por
+          // ele, então uma retentativa do que já chegou não vira entrega dupla.
+          messageId = reserva.existente ?? socket.gerarMessageId?.();
+          if (messageId) {
+            if (reserva.existente) {
+              // eslint-disable-next-line no-console
+              console.log(
+                `[worker] retry reutilizando messageId ${messageId} (instância ${instanceId})`,
+              );
+            }
+            await reserva.persistir(messageId); // await CONCLUÍDO antes do socket
+          }
+        }
+        return socket.sendMessage(jid, content, messageId ? { messageId } : undefined);
       });
 
     // A fila guarda a versão "que nunca rejeita", para um envio com erro não
@@ -500,7 +536,14 @@ export class BaileysWorker {
   /** Sender reativo: envia DIRETO pelo socket vivo da instância (com throttle). */
   socketSender(): BaileysSender {
     return {
-      send: async (instance, to, payload): Promise<SendResult> => {
+      /**
+       * O id é reservado ANTES do envio e a linha em `messages` é gravada por
+       * sendViaProvider com ele — por isso aqui a `persistir` é no-op: o
+       * trabalho já foi feito, só repassamos o id ao socket.
+       */
+      reserveMessageId: (instance) =>
+        this.sockets.get(instance.id)?.gerarMessageId?.() ?? null,
+      send: async (instance, to, payload, opts): Promise<SendResult> => {
         const socket = this.sockets.get(instance.id);
         if (!socket) throw new Error(`Instância ${instance.id} sem socket conectado`);
         const jid = toJid(to);
@@ -509,6 +552,9 @@ export class BaileysWorker {
           socket,
           jid,
           toSocketContent(payload, jid),
+          opts?.messageId
+            ? { existente: opts.messageId, persistir: async () => undefined }
+            : undefined,
         );
         return { waMessageId: res?.key?.id ?? null, status: 'sent' };
       },
@@ -699,9 +745,29 @@ export class BaileysWorker {
         console.error('[worker] connection.update:', err);
       });
     }) as never);
-    socket.ev.on('messages.upsert', ((u: { messages?: BaileysInboundMessage[] }) => {
+    socket.ev.on('messages.upsert', ((u: {
+      messages?: BaileysInboundMessage[];
+      type?: string;
+    }) => {
       for (const msg of u.messages ?? []) {
-        if (msg.key?.fromMe) continue;
+        if (msg.key?.fromMe) {
+          // ÚLTIMO descarte silencioso do caminho de inbound — agora logado,
+          // no mesmo formato dos demais. Continua descartando: aceitar `fromMe`
+          // é a próxima rodada.
+          //
+          // O `type` do upsert vai no log de propósito: o eco do NOSSO socket
+          // chega como 'append' (messages-send.js:1137) e mensagem enviada de
+          // outro aparelho deve chegar como 'notify'. É DADO DE OBSERVAÇÃO para
+          // a rodada do fromMe — não é mecanismo de dedup, e nada foi
+          // construído em cima disso.
+          // eslint-disable-next-line no-console
+          console.log(
+            `[worker] inbound DESCARTADO (fromMe) — instância=${instance.id} ` +
+              `(${instance.name}) upsertType=${u.type ?? '-'} ` +
+              `remoteJid=${msg.key?.remoteJid ?? '-'} msg=${msg.key?.id ?? '-'}`,
+          );
+          continue;
+        }
         void this.handleIncoming(instance, msg).catch((err) => {
           // Instância e id da mensagem no log: com várias instâncias no mesmo
           // worker, um stack solto não diz de qual número veio a falha.
@@ -898,19 +964,43 @@ export class BaileysWorker {
       for (const item of items) {
         const jid = toJid(item.to_number);
         try {
+          // Id JÁ reservado numa tentativa anterior? Reutiliza (o servidor
+          // deduplica por ele). A linha em messages foi criada no enqueue com
+          // wa_message_id nulo — quem o preenche é a reserva abaixo.
+          const jaReservado = item.message_id
+            ? ((await this.repo.messages.getById(item.message_id))?.wa_message_id ?? null)
+            : null;
+
           // MESMO portão do envio reativo: o intervalo mínimo vale para o
           // número, não para o caminho por onde a mensagem chegou.
+          // Fica com o id efetivamente reservado (null se o socket não souber
+          // gerar — ver o fallback logo abaixo).
+          let idPersistido: string | null = jaReservado;
           const res = await this.enviarComThrottle(
             instanceId,
             socket,
             jid,
             toSocketContent(item.payload as BaileysSendPayload, jid),
+            {
+              existente: jaReservado,
+              persistir: async (messageId) => {
+                idPersistido = messageId;
+                if (item.message_id) {
+                  await this.repo.messages.updateById(item.message_id, {
+                    wa_message_id: messageId,
+                  });
+                }
+              },
+            },
           );
           await this.repo.outbox.markSent(item.id);
           if (item.message_id) {
+            // Com reserva, só o status evolui — regravar o wa_message_id aqui
+            // reabriria a corrida com o eco. SEM reserva (socket que não sabe
+            // gerar id), cai no comportamento antigo: id do retorno do envio.
             await this.repo.messages.updateById(item.message_id, {
               status: 'sent',
-              wa_message_id: res?.key?.id ?? null,
+              ...(idPersistido ? {} : { wa_message_id: res?.key?.id ?? null }),
             });
           }
           sent++;

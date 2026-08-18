@@ -26,7 +26,26 @@ export type BaileysSendPayload =
  *  - Worker (sempre-ligado): SOCKET — envia direto pela conexão viva.
  */
 export interface BaileysSender {
-  send(instance: Instance, to: string, payload: BaileysSendPayload): Promise<SendResult>;
+  send(
+    instance: Instance,
+    to: string,
+    payload: BaileysSendPayload,
+    /** Id JÁ reservado e persistido pelo chamador (ver reserveMessageId). */
+    opts?: { messageId?: string | null },
+  ): Promise<SendResult>;
+  /**
+   * Reserva o id da PRÓXIMA mensagem, quando o transporte permite.
+   *
+   * POR QUE EXISTE: o Baileys emite o eco da própria mensagem
+   * (`messages.upsert` com fromMe) num `process.nextTick` DENTRO do
+   * `sendMessage`, antes dele retornar — sempre antes de qualquer ida ao
+   * Postgres. Quem grava o `wa_message_id` depois do envio perde essa corrida.
+   * Reservando o id ANTES, a linha já existe quando o eco chega.
+   *
+   * `null` = transporte não permite (a outbox não tem socket; a Meta atribui o
+   * wamid do lado dela). Nesse caso vale o comportamento antigo.
+   */
+  reserveMessageId?(instance: Instance): string | null;
 }
 
 /** Sender da camada web: enfileira na outbox (retorna status 'queued'). */
@@ -39,6 +58,7 @@ export function makeOutboxSender(repo: Repo): BaileysSender {
         payload,
         message_id: null, // linkado pelo serviço de mensageria após logar
       });
+      // Sem socket aqui: quem reserva o id é o WORKER, na hora de enviar.
       return { waMessageId: null, status: 'queued', outboxId: item.id };
     },
   };
@@ -68,12 +88,24 @@ export class BaileysProvider implements Provider {
 
   constructor(private readonly sender: BaileysSender) {}
 
+  /**
+   * Id reservado para o envio DESTA instância de provider. O provider é criado
+   * por envio (getProvider em sendViaProvider), então não há estado
+   * atravessando mensagens — é um repasse, não um cache.
+   */
+  private idReservado: string | null = null;
+
+  reserveMessageId(instance: Instance): string | null {
+    this.idReservado = this.sender.reserveMessageId?.(instance) ?? null;
+    return this.idReservado;
+  }
+
   sendText(instance: Instance, to: string, text: string): Promise<SendResult> {
-    return this.sender.send(instance, to, { type: 'text', text });
+    return this.sender.send(instance, to, { type: 'text', text }, { messageId: this.idReservado });
   }
 
   sendMedia(instance: Instance, to: string, media: MediaPayload): Promise<SendResult> {
-    return this.sender.send(instance, to, { type: 'media', media });
+    return this.sender.send(instance, to, { type: 'media', media }, { messageId: this.idReservado });
   }
 
   sendTemplate(): Promise<SendResult> {
@@ -87,7 +119,7 @@ export class BaileysProvider implements Provider {
     body: string,
     buttons: ReplyButton[],
   ): Promise<SendResult> {
-    return this.sender.send(instance, to, { type: 'buttons', body, buttons });
+    return this.sender.send(instance, to, { type: 'buttons', body, buttons }, { messageId: this.idReservado });
   }
 
   sendList(
@@ -97,7 +129,7 @@ export class BaileysProvider implements Provider {
     buttonText: string,
     sections: ListSection[],
   ): Promise<SendResult> {
-    return this.sender.send(instance, to, { type: 'list', body, buttonText, sections });
+    return this.sender.send(instance, to, { type: 'list', body, buttonText, sections }, { messageId: this.idReservado });
   }
 
   sendReaction(
@@ -106,7 +138,7 @@ export class BaileysProvider implements Provider {
     messageId: string,
     emoji: string,
   ): Promise<SendResult> {
-    return this.sender.send(instance, to, { type: 'reaction', messageId, emoji });
+    return this.sender.send(instance, to, { type: 'reaction', messageId, emoji }, { messageId: this.idReservado });
   }
 
   sendCtaUrl(): Promise<SendResult> {

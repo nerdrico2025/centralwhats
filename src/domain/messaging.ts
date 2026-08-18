@@ -182,6 +182,63 @@ export async function sendViaProvider(
   const type = messageType(input);
   const content = messageContent(contentInput);
 
+  /**
+   * RESERVA DO ID ANTES DO ENVIO (Baileys).
+   *
+   * POR QUÊ: o Baileys emite o eco da própria mensagem num `process.nextTick`
+   * DENTRO do sendMessage, antes dele retornar. Gravar o `wa_message_id` só
+   * depois do envio perde essa corrida por vários milissegundos (uma ida ao
+   * Postgres). Com o id reservado, a linha JÁ EXISTE quando o eco chega — é o
+   * que vai permitir deduplicar mensagens `fromMe` sem heurística.
+   *
+   * A Meta não implementa `reserveMessageId` (o wamid é dela): ali `pre` fica
+   * null e vale exatamente o fluxo de antes.
+   */
+  const idReservado = provider.reserveMessageId?.(instance) ?? null;
+  const pre = idReservado
+    ? await repo.messages.create({
+        instance_id: instance.id,
+        direction: 'out',
+        from_number: from,
+        to_number: to,
+        type,
+        content,
+        status: 'queued',
+        error_code: null,
+        error_message: null,
+        wa_message_id: idReservado,
+        campaign_id: campaignId,
+      })
+    : null;
+
+  /** Registra falha: atualiza a linha pré-logada, ou cria uma se não houver. */
+  const registrarFalha = async (
+    errorCode: string | null,
+    errorMessage: string,
+  ): Promise<Message> => {
+    if (pre) {
+      await repo.messages.updateById(pre.id, {
+        status: 'failed',
+        error_code: errorCode,
+        error_message: errorMessage,
+      });
+      return { ...pre, status: 'failed', error_code: errorCode, error_message: errorMessage };
+    }
+    return repo.messages.create({
+      instance_id: instance.id,
+      direction: 'out',
+      from_number: from,
+      to_number: to,
+      type,
+      content,
+      status: 'failed',
+      error_code: errorCode,
+      error_message: errorMessage,
+      wa_message_id: null,
+      campaign_id: campaignId,
+    });
+  };
+
   try {
     const result = await callProvider(
       provider,
@@ -190,6 +247,13 @@ export async function sendViaProvider(
       resolvedTemplateLanguage,
       templateComponents,
     );
+    if (pre) {
+      // O id já está gravado; aqui só o status evolui.
+      const status = result.status === 'queued' ? 'queued' : 'sent';
+      await repo.messages.updateById(pre.id, { status });
+      if (result.outboxId) await repo.outbox.setMessageId(result.outboxId, pre.id);
+      return { message: { ...pre, status }, result };
+    }
     const message = await repo.messages.create({
       instance_id: instance.id,
       direction: 'out',
@@ -213,36 +277,12 @@ export async function sendViaProvider(
     // Parâmetros de template inválidos: barrado ANTES da Graph API, mas ainda é
     // um envio que aconteceu do ponto de vista do usuário — loga igual.
     if (err instanceof TemplateParamsError) {
-      const logged = await repo.messages.create({
-        instance_id: instance.id,
-        direction: 'out',
-        from_number: from,
-        to_number: to,
-        type,
-        content,
-        status: 'failed',
-        error_code: 'TEMPLATE_PARAMS',
-        error_message: err.message,
-        wa_message_id: null,
-        campaign_id: campaignId,
-      });
+      const logged = await registrarFalha('TEMPLATE_PARAMS', err.message);
       throw new SendFailedError('TEMPLATE_PARAMS', err.message, 400, logged.id);
     }
     if (err instanceof MetaApiError) {
       // Loga a FALHA (nunca "só grava se deu certo").
-      const logged = await repo.messages.create({
-        instance_id: instance.id,
-        direction: 'out',
-        from_number: from,
-        to_number: to,
-        type,
-        content,
-        status: 'failed',
-        error_code: err.code,
-        error_message: err.message,
-        wa_message_id: null,
-        campaign_id: campaignId,
-      });
+      const logged = await registrarFalha(err.code, err.message);
       throw new SendFailedError(err.code, err.message, err.httpStatus, logged.id);
     }
 
@@ -258,21 +298,9 @@ export async function sendViaProvider(
     console.error(
       `[envio] falha na instância ${instance.id} (${provider.type}) — ${descreverErroDeEnvio(cls)}`,
     );
-    const logged = await repo.messages.create({
-      instance_id: instance.id,
-      direction: 'out',
-      from_number: from,
-      to_number: to,
-      type,
-      content,
-      status: 'failed',
-      // Nunca null: sem código do provider, grava o `kind` — o histórico
-      // sempre diz ALGUMA coisa sobre o motivo.
-      error_code: cls.raw_code ?? cls.kind,
-      error_message: cls.message,
-      wa_message_id: null,
-      campaign_id: campaignId,
-    });
+    // Nunca null: sem código do provider, grava o `kind` — o histórico
+    // sempre diz ALGUMA coisa sobre o motivo.
+    const logged = await registrarFalha(cls.raw_code ?? cls.kind, cls.message);
     throw new SendFailedError(cls.raw_code ?? cls.kind, cls.message, 502, logged.id);
   }
 }

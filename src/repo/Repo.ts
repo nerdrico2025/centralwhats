@@ -244,6 +244,8 @@ export interface MessagesRepo {
     instanceId: string,
     waMessageId: string,
   ): Promise<Message | null>;
+  /** Leitura por id — usada para reaproveitar o wa_message_id já reservado. */
+  getById(id: string): Promise<Message | null>;
   updateStatusByWaMessageId(
     instanceId: string,
     waMessageId: string,

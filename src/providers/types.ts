@@ -63,6 +63,15 @@ export interface Provider {
   readonly type: Instance['provider_type'];
   readonly capabilities: ProviderCapabilities;
 
+  /**
+   * Reserva o id da PRÓXIMA mensagem, quando o provider permite.
+   *
+   * OPCIONAL de propósito: só o Baileys consegue (o id é do cliente). A Meta
+   * atribui o `wamid` do lado dela e simplesmente NÃO implementa isto — por
+   * isso o caminho oficial não muda nem de assinatura.
+   */
+  reserveMessageId?(instance: Instance): string | null;
+
   sendText(instance: Instance, to: string, text: string): Promise<SendResult>;
 
   sendMedia(

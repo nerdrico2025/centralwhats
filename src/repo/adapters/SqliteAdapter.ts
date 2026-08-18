@@ -174,6 +174,10 @@ export function createSqliteAdapter(opts: { path: string }): Repo {
         );
         return m.mapMessage(get(`SELECT * FROM messages WHERE id=?`, id)!);
       },
+      async getById(id) {
+        const r = get(`SELECT * FROM messages WHERE id=?`, id);
+        return r ? m.mapMessage(r) : null;
+      },
       async getByWaMessageId(instanceId, waMessageId) {
         const r = get(
           `SELECT * FROM messages WHERE instance_id=? AND wa_message_id=?`,

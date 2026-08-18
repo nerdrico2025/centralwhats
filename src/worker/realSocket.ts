@@ -60,6 +60,8 @@ export async function resolveWaVersion(deps: {
 interface BaileysLib {
   default?: (opts: unknown) => BaileysSocketLike;
   makeWASocket?: (opts: unknown) => BaileysSocketLike;
+  /** Gerador de id de mensagem da própria lib (Utils/generics.d.ts:32). */
+  generateMessageIDV2?: (userId?: string) => string;
   fetchLatestBaileysVersion: () => Promise<{ version: WaVersion }>;
   DEFAULT_CONNECTION_CONFIG?: { version?: WaVersion };
 }
@@ -119,6 +121,18 @@ export function makeRealSocketFactory(repo: Repo): SocketFactory {
     socket.ev.on('creds.update', (() => {
       void saveCreds();
     }) as never);
+
+    // Gerador de id EXPOSTO ao worker. Fica aqui, e não no baileysWorker,
+    // porque este é o único arquivo que carrega a lib — o worker segue sem
+    // importar Baileys (mesma disciplina do node:sqlite).
+    //
+    // `sock.user?.id` é EXATAMENTE o argumento que a lib usa quando gera o id
+    // por conta própria (messages-send.js:1086). Formato divergente do que ela
+    // produziria seria risco sem ganho.
+    if (baileys.generateMessageIDV2) {
+      socket.gerarMessageId = (): string =>
+        baileys.generateMessageIDV2!(socket.user?.id ?? undefined);
+    }
     return socket;
   };
 }

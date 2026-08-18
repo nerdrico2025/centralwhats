@@ -146,6 +146,10 @@ export function createPostgresAdapter(opts: { connectionString: string }): Repo 
         );
         return m.mapMessage(r!);
       },
+      async getById(id) {
+        const r = await get(`SELECT * FROM messages WHERE id=$1`, [id]);
+        return r ? m.mapMessage(r) : null;
+      },
       async getByWaMessageId(instanceId, waMessageId) {
         const r = await get(
           `SELECT * FROM messages WHERE instance_id=$1 AND wa_message_id=$2`,
