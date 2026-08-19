@@ -877,21 +877,19 @@ export class BaileysWorker {
     }) => {
       for (const msg of u.messages ?? []) {
         if (msg.key?.fromMe) {
-          // ÚLTIMO descarte silencioso do caminho de inbound — agora logado,
-          // no mesmo formato dos demais. Continua descartando: aceitar `fromMe`
-          // é a próxima rodada.
-          //
-          // O `type` do upsert vai no log de propósito: o eco do NOSSO socket
-          // chega como 'append' (messages-send.js:1137) e mensagem enviada de
-          // outro aparelho deve chegar como 'notify'. É DADO DE OBSERVAÇÃO para
-          // a rodada do fromMe — não é mecanismo de dedup, e nada foi
-          // construído em cima disso.
-          // eslint-disable-next-line no-console
-          console.log(
-            `[worker] inbound DESCARTADO (fromMe) — instância=${instance.id} ` +
-              `(${instance.name}) upsertType=${u.type ?? '-'} ` +
-              `remoteJid=${msg.key?.remoteJid ?? '-'} msg=${msg.key?.id ?? '-'}`,
-          );
+          // Mensagem NOSSA: ou é o eco de um envio do painel (já registrado),
+          // ou foi enviada de fora — do celular, de outro aparelho pareado.
+          // O `upsertType` segue no log como observação: em produção o eco do
+          // nosso socket vem 'append' e o envio de fora vem 'notify'. É SINAL,
+          // não mecanismo: quem decide é o wa_message_id.
+          void this.handleOutgoingEcho(instance, msg, u.type).catch((err) => {
+            // eslint-disable-next-line no-console
+            console.error(
+              `[worker] eco fromMe falhou — instância=${instance.id} (${instance.name}) ` +
+                `msg=${msg.key?.id ?? '-'}:`,
+              err,
+            );
+          });
           continue;
         }
         void this.handleIncoming(instance, msg).catch((err) => {
@@ -998,6 +996,113 @@ export class BaileysWorker {
         await this.repo.baileysAuth.clear(instance.id);
       }
     }
+  }
+
+  /**
+   * MENSAGEM ENVIADA POR NÓS (`key.fromMe`), vinda do socket.
+   *
+   * Duas origens, e o `wa_message_id` distingue as duas com CERTEZA (nada de
+   * heurística de texto + janela de tempo):
+   *
+   *  - ECO de envio do painel/bot: o id JÁ está em `messages`, porque desde
+   *    §reserva ele é gravado ANTES do socket.sendMessage. Ignora.
+   *  - ENVIO DE FORA (celular, outro aparelho pareado): id desconhecido.
+   *    Grava como saída, para o Live Chat mostrar o que foi dito por fora.
+   *
+   * NÃO É CAMINHO DE INBOUND. De propósito não passa por `recordInbound`:
+   *  - `handleFlowInbound` NUNCA roda — responder pelo celular com uma palavra
+   *    que por acaso é gatilho não pode ligar o chatbot em cima do cliente.
+   *    Esta é a regra mais importante daqui, e a forma de garanti-la é não ter
+   *    o caminho, em vez de ter e desviar.
+   *  - `touchLastSeen` não roda: `last_seen` é "quando o CONTATO falou".
+   *  - CRM não é tocado (decisão de negócio em aberto — ver relatório).
+   *  - `processPendingExecutions` não roda: ele retoma delays vencidos e não
+   *    depende do conteúdo; o inbound seguinte do contato já o dispara.
+   */
+  async handleOutgoingEcho(
+    instance: Instance,
+    waMsg: BaileysInboundMessage,
+    upsertType?: string,
+  ): Promise<void> {
+    const waMessageId = waMsg.key?.id ?? null;
+    const jidCru = waMsg.key?.remoteJid ?? '-';
+    const marca =
+      `instância=${instance.id} (${instance.name}) upsertType=${upsertType ?? '-'} ` +
+      `remoteJid=${jidCru} msg=${waMessageId ?? '-'}`;
+
+    // 1. DEDUP DETERMINÍSTICO — o caso comum (envio pelo painel).
+    if (waMessageId) {
+      const jaExiste = await this.repo.messages.getByWaMessageId(instance.id, waMessageId);
+      if (jaExiste) {
+        // eslint-disable-next-line no-console
+        console.log(`[worker] eco de mensagem já registrada, ignorado — ${marca}`);
+        return;
+      }
+    }
+
+    // 2. Endereço do CONTATO. Numa mensagem fromMe o `remoteJid` continua
+    // sendo o jid dele (chatId = recipient), então a resolução é a MESMA do
+    // inbound — inclusive @lid. Reusada, não duplicada. Ela também é o filtro:
+    // grupo, status@broadcast, protocolo, reação e edição não passam daqui.
+    let analise = analisarInbound(waMsg);
+    if (!analise.ok && analise.motivo === 'lid_sem_telefone') {
+      const pn = await this.resolverPnDeLid(instance.id, analise.jid);
+      if (pn) analise = analisarInbound(waMsg, pn);
+    }
+    if (!analise.ok) {
+      // eslint-disable-next-line no-console
+      console.log(`[worker] eco fromMe DESCARTADO — motivo=${analise.motivo} ${marca}`);
+      return;
+    }
+
+    const contato = analise.dados.from;
+    // Número da empresa. Mesmo fallback do inbound (janela até own_number ser
+    // preenchido no primeiro 'open' pós-migration 014).
+    const proprio = instance.own_number ?? instance.phone_number_id ?? '000000000';
+
+    // 3. Contato: cria se não existir, SEM tocar em nome nem last_seen.
+    // `pushName` aqui é o nome do DONO DA CONTA, não do contato — e o upsert
+    // faz COALESCE, então null preserva o que já houver. Contato novo fica com
+    // nome nulo e o painel exibe o telefone; o profile.name real entra quando
+    // o contato escrever.
+    await this.repo.contacts.upsert({
+      instance_id: instance.id,
+      phone: contato,
+      name: null,
+      last_seen: null,
+    });
+
+    // 4. A mensagem, com os papéis invertidos.
+    try {
+      await this.repo.messages.create({
+        instance_id: instance.id,
+        direction: 'out',
+        from_number: proprio,
+        to_number: contato,
+        type: analise.dados.type,
+        content: analise.dados.content,
+        status: 'sent',
+        error_code: null,
+        error_message: null,
+        wa_message_id: waMessageId,
+        campaign_id: null,
+      });
+    } catch (err) {
+      // Corrida de dois ecos do mesmo id: ux_messages_wamid barra o segundo.
+      // Se a linha existe agora, o trabalho está feito — não é falha.
+      if (waMessageId && (await this.repo.messages.getByWaMessageId(instance.id, waMessageId))) {
+        // eslint-disable-next-line no-console
+        console.log(`[worker] eco concorrente já gravado, ignorado — ${marca}`);
+        return;
+      }
+      throw err;
+    }
+
+    // eslint-disable-next-line no-console
+    console.log(
+      `[worker] envio de FORA registrado (${analise.endereco}) — ${marca} ` +
+        `de=${proprio} para=${contato} tipo=${analise.dados.type}`,
+    );
   }
 
   /** Inbound do socket → MESMO núcleo do webhook (contato, CRM, msg, fluxos). */

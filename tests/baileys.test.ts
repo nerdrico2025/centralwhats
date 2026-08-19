@@ -722,6 +722,159 @@ describe('avatar do contato (worker busca, API só lê)', () => {
   });
 });
 
+describe('fromMe — mensagem enviada por nós aparece no Live Chat', () => {
+  const CONTATO = '554799582500';
+
+  function msgFromMe(id: string, texto = 'enviado do celular', jid = CONTATO + '@s.whatsapp.net') {
+    return {
+      key: { remoteJid: jid, id, fromMe: true },
+      pushName: 'Rafael (dono da conta)', // NUNCA pode virar nome do contato
+      message: { conversation: texto },
+    };
+  }
+
+  async function comWorker() {
+    const fake = makeFakeSocket();
+    const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket });
+    await worker.connectInstance(inst);
+    await repo.instances.update(inst.id, { own_number: '5521999243888' });
+    const comNumero = (await repo.instances.getById(inst.id)) as Instance;
+    return { worker, fake, inst: comNumero };
+  }
+
+  it('ECO de envio do painel é IGNORADO (id já registrado pela reserva prévia)', async () => {
+    const { worker, inst: i } = await comWorker();
+    // Simula o que a reserva do §messageId faz: a linha já existe com o id.
+    const { message } = await sendViaProvider(repo, i, { type: 'text', to: CONTATO, text: 'oi' });
+    await repo.messages.updateById(message.id, { wa_message_id: 'ID.DO.PAINEL' });
+
+    await worker.handleOutgoingEcho(i, msgFromMe('ID.DO.PAINEL', 'oi'), 'append');
+
+    // UMA linha só — o eco não duplicou.
+    const msgs = await repo.messages.listByContact(i.id, CONTATO);
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0].id).toBe(message.id);
+    await worker.stop();
+  });
+
+  it('envio DE FORA (id desconhecido) é gravado como saída, com papéis invertidos', async () => {
+    const { worker, inst: i } = await comWorker();
+
+    await worker.handleOutgoingEcho(i, msgFromMe('ID.DO.CELULAR'), 'notify');
+
+    const msgs = await repo.messages.listByContact(i.id, CONTATO);
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0].direction).toBe('out');
+    expect(msgs[0].from_number).toBe('5521999243888'); // own_number
+    expect(msgs[0].to_number).toBe(CONTATO);
+    expect(msgs[0].wa_message_id).toBe('ID.DO.CELULAR');
+    expect(msgs[0].status).toBe('sent');
+    await worker.stop();
+  });
+
+  it('REGRA MAIS IMPORTANTE: fromMe com palavra-chave NÃO dispara fluxo', async () => {
+    const { worker, inst: i } = await comWorker();
+    await repo.flows.create({
+      instance_id: i.id,
+      name: 'gatilho',
+      trigger_keywords: ['promo'],
+      nodes: [
+        { id: 's', type: 'start' },
+        { id: 'm', type: 'message', data: { text: 'RESPOSTA AUTOMÁTICA' } },
+      ],
+      edges: [{ from: 's', to: 'm' }],
+      active: true,
+    });
+
+    // Texto idêntico ao gatilho, mas enviado POR NÓS.
+    await worker.handleOutgoingEcho(i, msgFromMe('ID.GATILHO', 'promo'), 'notify');
+
+    const msgs = await repo.messages.listByContact(i.id, CONTATO);
+    // Só a mensagem que nós enviamos. NENHUMA resposta do bot.
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0].direction).toBe('out');
+    expect(msgs.some((m) => JSON.stringify(m.content).includes('RESPOSTA AUTOMÁTICA'))).toBe(false);
+    expect(await repo.flowExecutions.listActiveByContact?.(i.id, CONTATO) ?? []).toHaveLength(0);
+    await worker.stop();
+  });
+
+  it('NÃO atualiza last_seen (isso é "quando o CONTATO falou")', async () => {
+    const { worker, inst: i } = await comWorker();
+    await repo.contacts.upsert({
+      instance_id: i.id, phone: CONTATO, name: 'Contato Existente', last_seen: '2020-01-01T00:00:00.000Z',
+    });
+
+    await worker.handleOutgoingEcho(i, msgFromMe('ID.LS'), 'notify');
+
+    const c = await repo.contacts.getByPhone(i.id, CONTATO);
+    expect(c?.last_seen).toBe('2020-01-01T00:00:00.000Z'); // intocado
+    expect(c?.name).toBe('Contato Existente'); // pushName NÃO sobrescreveu
+    await worker.stop();
+  });
+
+  it('contato novo nasce SEM o pushName do dono da conta', async () => {
+    const { worker, inst: i } = await comWorker();
+    expect(await repo.contacts.getByPhone(i.id, CONTATO)).toBeNull();
+
+    await worker.handleOutgoingEcho(i, msgFromMe('ID.NOVO'), 'notify');
+
+    const c = await repo.contacts.getByPhone(i.id, CONTATO);
+    expect(c).not.toBeNull();
+    expect(c?.name).toBeNull(); // painel exibe o telefone; nunca "Rafael (dono da conta)"
+    await worker.stop();
+  });
+
+  it('fromMe em @lid resolve o telefone do contato (mesma lógica do inbound)', async () => {
+    const { worker, inst: i } = await comWorker();
+
+    await worker.handleOutgoingEcho(
+      i,
+      {
+        key: {
+          remoteJid: '15543587311743@lid',
+          remoteJidAlt: CONTATO + '@s.whatsapp.net',
+          id: 'ID.LID',
+          fromMe: true,
+        },
+        message: { conversation: 'oi por lid' },
+      },
+      'notify',
+    );
+
+    const msgs = await repo.messages.listByContact(i.id, CONTATO);
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0].to_number).toBe(CONTATO);
+    await worker.stop();
+  });
+
+  it('grupo e status@broadcast continuam fora (filtro reusado, com log)', async () => {
+    const { worker, inst: i } = await comWorker();
+
+    await worker.handleOutgoingEcho(i, msgFromMe('ID.G', 'x', '123@g.us'), 'notify');
+    await worker.handleOutgoingEcho(i, msgFromMe('ID.B', 'x', 'status@broadcast'), 'notify');
+
+    // Nada gravado por nenhum dos dois.
+    const todas = await repo.messages.listByContact(i.id, CONTATO);
+    expect(todas).toHaveLength(0);
+    await worker.stop();
+  });
+
+  it('painel + celular para o mesmo contato = duas mensagens distintas', async () => {
+    const { worker, inst: i } = await comWorker();
+    const { message } = await sendViaProvider(repo, i, { type: 'text', to: CONTATO, text: 'do painel' });
+    await repo.messages.updateById(message.id, { wa_message_id: 'ID.PAINEL' });
+
+    await worker.handleOutgoingEcho(i, msgFromMe('ID.PAINEL', 'do painel'), 'append'); // eco: ignora
+    await worker.handleOutgoingEcho(i, msgFromMe('ID.CELULAR', 'do celular'), 'notify'); // grava
+
+    const msgs = await repo.messages.listByContact(i.id, CONTATO);
+    expect(msgs).toHaveLength(2);
+    expect(msgs.every((m) => m.direction === 'out')).toBe(true);
+    expect(new Set(msgs.map((m) => m.wa_message_id))).toEqual(new Set(['ID.PAINEL', 'ID.CELULAR']));
+    await worker.stop();
+  });
+});
+
 describe('worker — inbound pelo socket usa o MESMO motor (reuso total)', () => {
   it('mensagem recebida grava tudo e o fluxo responde REATIVAMENTE pelo socket', async () => {
     await repo.flows.create({
