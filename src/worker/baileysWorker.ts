@@ -36,8 +36,6 @@ export interface BaileysSocketLike {
   } | null;
   /** Foto de perfil (Socket/chats.d.ts:40). `undefined` = sem foto. */
   profilePictureUrl?(jid: string, type?: 'preview' | 'image'): Promise<string | undefined>;
-  /** [DIAGNÓSTICO TEMPORÁRIO] privacidade da conta (Socket/chats.d.ts:33). */
-  fetchPrivacySettings?(force?: boolean): Promise<unknown>;
   /**
    * Gera um id de mensagem no MESMO formato que a lib usaria
    * (generateMessageIDV2(sock.user?.id) — messages-send.js:1086). Fornecido
@@ -634,59 +632,6 @@ export class BaileysWorker {
     await this.repo.contacts.setAvatar(instance.id, phone, url, new Date().toISOString());
   }
 
-  /**
-   * ⚠️ DIAGNÓSTICO TEMPORÁRIO — REMOVER APÓS COLETAR O DADO. ⚠️
-   *
-   * Pergunta que ele responde: por que `profilePictureUrl` volta VAZIA (sem
-   * lançar) para um contato que tem foto. Três hipóteses, e este log separa
-   * as três de uma vez:
-   *
-   *  1. privacidade do contato  → ambos os JIDs vazios E privacidade OK
-   *  2. JID errado (@lid)       → viaLid traz URL e viaTelefone não
-   *  3. tcToken ausente         → privacidade com ERRO (fetchPrivacySettings
-   *     falhou no boot, e é ela que decide se a consulta leva o token —
-   *     chats.js:558). Sem token, o servidor responde sem url e sem erro.
-   *
-   * Roda FORA do TTL de propósito: o contato de teste já foi carimbado, então
-   * esperar o TTL vencer adiaria o diagnóstico em 24h.
-   */
-  async diagnosticoAvatarLid(
-    instance: Instance,
-    phone: string,
-    jidOriginal: string | null | undefined,
-  ): Promise<void> {
-    if (!jidOriginal?.endsWith('@lid')) return; // só o caso em investigação
-    const socket = this.sockets.get(instance.id);
-    if (!socket?.profilePictureUrl) return;
-
-    const tentar = async (jid: string): Promise<string> => {
-      try {
-        return (await socket.profilePictureUrl!(jid, 'preview')) ?? '(vazio)';
-      } catch (err) {
-        return `ERRO: ${(err as Error).message}`;
-      }
-    };
-
-    // Mesma fila de perfil: o diagnóstico não fura o throttle da instância.
-    const viaTelefone = await this.comThrottleDePerfil(instance.id, () => tentar(toJid(phone)));
-    const viaLid = await this.comThrottleDePerfil(instance.id, () => tentar(jidOriginal));
-
-    let privacidade: string;
-    try {
-      privacidade = JSON.stringify((await socket.fetchPrivacySettings?.(true)) ?? null);
-    } catch (err) {
-      privacidade = `ERRO: ${(err as Error).message}`;
-    }
-
-    // eslint-disable-next-line no-console
-    console.log(
-      `[worker] AVATAR-DIAG telefone=${phone} jidOriginal=${jidOriginal}\n` +
-        `   viaTelefone(${toJid(phone)}) = ${viaTelefone}\n` +
-        `   viaLid(${jidOriginal}) = ${viaLid}\n` +
-        `   privacidade = ${privacidade}`,
-    );
-  }
-
   /** Fila de consultas de perfil por instância (ver ultimoPerfilAt). */
   private async comThrottleDePerfil<T>(instanceId: string, fn: () => Promise<T>): Promise<T> {
     const intervalo = this.opts.minProfileIntervalMs ?? BAILEYS_MIN_PROFILE_INTERVAL_MS;
@@ -1166,11 +1111,6 @@ export class BaileysWorker {
       // eslint-disable-next-line no-console
       console.warn(`[worker] falha ao atualizar avatar de ${contato}:`, err);
     });
-    // ⚠️ TEMPORÁRIO — remover junto com diagnosticoAvatarLid.
-    void this.diagnosticoAvatarLid(instance, contato, waMsg.key?.remoteJid).catch((err) => {
-      // eslint-disable-next-line no-console
-      console.warn('[worker] AVATAR-DIAG falhou:', err);
-    });
 
     // eslint-disable-next-line no-console
     console.log(
@@ -1237,13 +1177,6 @@ export class BaileysWorker {
       // eslint-disable-next-line no-console
       console.warn(`[worker] falha ao atualizar avatar de ${normalized.from}:`, err);
     });
-    // ⚠️ TEMPORÁRIO — remover junto com diagnosticoAvatarLid.
-    void this.diagnosticoAvatarLid(instance, normalized.from, waMsg.key?.remoteJid).catch(
-      (err) => {
-        // eslint-disable-next-line no-console
-        console.warn('[worker] AVATAR-DIAG falhou:', err);
-      },
-    );
 
     // Mesmo gancho da web: inbound dispara a varredura de retomadas.
     await processPendingExecutions(this.repo, instance.id, this.flowDeps());
