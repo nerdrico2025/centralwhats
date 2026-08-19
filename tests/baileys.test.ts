@@ -859,6 +859,51 @@ describe('fromMe — mensagem enviada por nós aparece no Live Chat', () => {
     await worker.stop();
   });
 
+  it('fromMe dispara a MESMA busca de avatar que o inbound (gatilho que faltava)', async () => {
+    const fake = makeFakeSocket();
+    const consultados: string[] = [];
+    fake.socket.profilePictureUrl = async (jid: string) => {
+      consultados.push(jid);
+      return 'https://cdn.wa/foto-do-contato.jpg';
+    };
+    const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket });
+    await worker.connectInstance(inst);
+    await repo.instances.update(inst.id, { own_number: '5521999243888' });
+    const i = (await repo.instances.getById(inst.id)) as Instance;
+
+    await worker.handleOutgoingEcho(i, msgFromMe('ID.AVATAR'), 'notify');
+    await new Promise((r) => setTimeout(r, 30)); // busca é não-bloqueante
+
+    // Consultou o JID do CONTATO (não o nosso número).
+    expect(consultados).toEqual([CONTATO + '@s.whatsapp.net']);
+    const c = await repo.contacts.getByPhone(i.id, CONTATO);
+    expect(c?.avatar_url).toBe('https://cdn.wa/foto-do-contato.jpg');
+    expect(c?.avatar_fetched_at).toBeTruthy();
+    await worker.stop();
+  });
+
+  it('eco IGNORADO não dispara busca de avatar (nada a fazer, nada a consultar)', async () => {
+    const fake = makeFakeSocket();
+    const consultados: string[] = [];
+    fake.socket.profilePictureUrl = async (jid: string) => {
+      consultados.push(jid);
+      return undefined;
+    };
+    const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket });
+    await worker.connectInstance(inst);
+    await repo.instances.update(inst.id, { own_number: '5521999243888' });
+    const i = (await repo.instances.getById(inst.id)) as Instance;
+
+    const { message } = await sendViaProvider(repo, i, { type: 'text', to: CONTATO, text: 'oi' });
+    await repo.messages.updateById(message.id, { wa_message_id: 'ID.ECO' });
+    await worker.handleOutgoingEcho(i, msgFromMe('ID.ECO', 'oi'), 'append');
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Eco de mensagem já registrada sai antes de tudo — inclusive do avatar.
+    expect(consultados).toHaveLength(0);
+    await worker.stop();
+  });
+
   it('painel + celular para o mesmo contato = duas mensagens distintas', async () => {
     const { worker, inst: i } = await comWorker();
     const { message } = await sendViaProvider(repo, i, { type: 'text', to: CONTATO, text: 'do painel' });

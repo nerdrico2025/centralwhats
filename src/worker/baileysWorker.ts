@@ -1098,6 +1098,20 @@ export class BaileysWorker {
       throw err;
     }
 
+    // Avatar: MESMO gancho do inbound (handleIncoming), pelo mesmo motivo —
+    // acabamos de tocar neste contato, então é a hora de conferir a foto.
+    //
+    // Ficou de fora quando este caminho nasceu: o avatar foi escrito antes do
+    // `fromMe` existir, e ninguém ligou os dois. Resultado em produção: um
+    // contato que só recebe mensagens NOSSAS nunca teria a foto buscada.
+    //
+    // Não-bloqueante e sem lógica duplicada: TTL, throttle por instância e
+    // cache negativo vivem todos dentro de atualizarAvatarSeVencido.
+    void this.atualizarAvatarSeVencido(instance, contato).catch((err) => {
+      // eslint-disable-next-line no-console
+      console.warn(`[worker] falha ao atualizar avatar de ${contato}:`, err);
+    });
+
     // eslint-disable-next-line no-console
     console.log(
       `[worker] envio de FORA registrado (${analise.endereco}) — ${marca} ` +
