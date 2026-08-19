@@ -363,6 +363,55 @@ function formatTime(iso) {
 }
 
 /**
+ * Horário da lista de conversas, estilo WhatsApp (FASE 2B):
+ *   hoje → HH:MM · ontem → "Ontem" · últimos 7 dias → dia da semana ·
+ *   mais antigo → DD/MM/AAAA. Sempre em America/Sao_Paulo — o carimbo em
+ *   `messages.created_at` é ISO COM offset (`toISOString()`, sufixo Z), então
+ *   dá pra converter direto sem risco do deslocamento de 3h de um ISO "naive".
+ *
+ * Diferença em DIAS DE CALENDÁRIO em SP, não em janelas de 24h corridas: um
+ * evento às 23h59 de ontem e a leitura às 00h01 de hoje são só 2 minutos de
+ * diferença, mas dias de calendário DIFERENTES — e é isso que o rótulo
+ * "Ontem" precisa refletir, não 24h completas.
+ */
+function diaSPde(date) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Sao_Paulo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(date);
+}
+
+function formatConvTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const hojeStr = diaSPde(new Date());
+  const dStr = diaSPde(d);
+  if (dStr === hojeStr) {
+    return new Intl.DateTimeFormat('pt-BR', {
+      timeZone: 'America/Sao_Paulo',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).format(d);
+  }
+  // As duas strings são "YYYY-MM-DD" — parse como meia-noite UTC dá a
+  // diferença em dias de calendário exata, sem entrar em fuso de novo.
+  const diffDias = Math.round((Date.parse(hojeStr) - Date.parse(dStr)) / 86_400_000);
+  if (diffDias === 1) return 'Ontem';
+  if (diffDias >= 2 && diffDias <= 6) {
+    return new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Sao_Paulo', weekday: 'long' }).format(d);
+  }
+  return new Intl.DateTimeFormat('pt-BR', {
+    timeZone: 'America/Sao_Paulo',
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+  }).format(d);
+}
+
+/**
  * Avatar do contato, com placeholder de iniciais.
  *
  * O `onerror` NÃO é opcional: a URL de foto do WhatsApp EXPIRA, e sem ele o
@@ -381,8 +430,11 @@ function iniciaisDe(nome, telefone) {
   return ini.toUpperCase();
 }
 
-function avatarDe(nome, telefone, url) {
-  const box = h('div', { class: 'avatar' });
+/** `tamanho` é um modificador de CSS opcional (ex.: 'lg') — mesma caixa,
+ * mesma lógica de fallback, só o diâmetro muda. */
+function avatarDe(nome, telefone, url, tamanho) {
+  const classe = tamanho ? `avatar avatar--${tamanho}` : 'avatar';
+  const box = h('div', { class: classe });
   const placeholder = h('span', { class: 'avatar__iniciais' }, iniciaisDe(nome, telefone));
   box.appendChild(placeholder);
   if (url) {
@@ -436,6 +488,10 @@ function livechatScreen() {
       return;
     }
     for (const c of convs) {
+      // Ticks (✓/✓✓) NÃO entram aqui: a listagem (`repo.messages.listConversations`)
+      // não devolve o status da última mensagem, só a thread devolve — ver
+      // FASE 2C, onde o dado existe. Implementar ticks na LISTA exigiria
+      // mudança de backend fora do escopo deste commit (auditoria 1.2.3).
       listEl.appendChild(
         h(
           'div',
@@ -444,14 +500,19 @@ function livechatScreen() {
             onclick: () => selectConversation(c.phone),
           },
           [
-            h('div', { class: 'conv-item__linha' }, [
-              avatarDe(c.name, c.phone, c.avatar_url),
-              h('div', { style: 'min-width:0;flex:1' }, [
-                h('div', { class: 'conv-item__top' }, [
-                  h('span', { class: 'conv-item__name' }, c.name || c.phone),
-                  c.unread ? h('span', { class: 'conv-unread' }, String(c.unread)) : null,
-                ]),
-                h('div', { class: 'conv-item__preview' }, previewOf(c)),
+            avatarDe(c.name, c.phone, c.avatar_url, 'lg'),
+            h('div', { class: 'conv-item__body' }, [
+              h('div', { class: 'conv-item__top' }, [
+                h('span', { class: 'conv-item__name' }, c.name || c.phone),
+                h(
+                  'span',
+                  { class: 'conv-item__time' + (c.unread ? ' conv-item__time--unread' : '') },
+                  formatConvTime(c.last_message_at),
+                ),
+              ]),
+              h('div', { class: 'conv-item__bottom' }, [
+                h('span', { class: 'conv-item__preview' }, previewOf(c)),
+                c.unread ? h('span', { class: 'conv-unread' }, String(c.unread)) : null,
               ]),
             ]),
           ],

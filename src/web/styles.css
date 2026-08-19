@@ -595,9 +595,19 @@ body {
   min-height: 0;
   min-width: 0;
 }
+/* Linha estilo WhatsApp (FASE 2B): avatar + coluna (nome/hora, prévia/badge).
+   ALTURA FIXA — não pode variar com o tamanho do texto, senão cada
+   passagem do polling reflui a lista inteira. O separador entre linhas
+   mora no BORDER-BOTTOM de .conv-item__body (não de .conv-item): como o
+   avatar fica fora dela, a linha nasce depois do avatar sozinha, sem
+   `margin-left` calculado à mão. */
 .conv-item {
-  padding: 12px 14px;
-  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 14px;
+  height: 72px;
+  flex: 0 0 72px;
   cursor: pointer;
 }
 .conv-item:hover {
@@ -605,6 +615,16 @@ body {
 }
 .conv-item.active {
   background: #eef7f0;
+}
+.conv-item__body {
+  min-width: 0;
+  flex: 1;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
 }
 /* Avatar: imagem e placeholder ocupam EXATAMENTE a mesma caixa, e a imagem
    fica por cima. Quando a URL do WhatsApp expira, o onerror remove o <img> e o
@@ -620,11 +640,21 @@ body {
   display: grid;
   place-items: center;
 }
+/* Modificador de tamanho (lista estilo WhatsApp) — mesma caixa, mesma lógica
+   de fallback do .avatar base, só o diâmetro muda. */
+.avatar--lg {
+  width: 48px;
+  height: 48px;
+  flex-basis: 48px;
+}
 .avatar__iniciais {
   font-size: 13px;
   font-weight: 700;
   color: var(--text-muted);
   user-select: none;
+}
+.avatar--lg .avatar__iniciais {
+  font-size: 15px;
 }
 .avatar__img {
   position: absolute;
@@ -639,24 +669,43 @@ body {
   gap: 10px;
   min-width: 0;
 }
-.conv-item__top {
+.conv-item__top,
+.conv-item__bottom {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  min-width: 0;
 }
 .conv-item__name {
   font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conv-item__time {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+/* Verde quando a conversa tem não-lidas — mesmo sinal do badge. */
+.conv-item__time--unread {
+  color: var(--green);
+  font-weight: 700;
 }
 .conv-item__preview {
+  min-width: 0;
+  flex: 1;
   color: var(--text-muted);
   font-size: 13px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  margin-top: 2px;
 }
 .conv-unread {
+  flex: 0 0 auto;
   background: var(--green);
   color: #04220f;
   border-radius: 999px;
