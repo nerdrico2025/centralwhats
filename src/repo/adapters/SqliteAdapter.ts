@@ -370,6 +370,16 @@ export function createSqliteAdapter(opts: { path: string }): Repo {
           normalizePhone(phone),
         );
       },
+      async listNeedingAvatar(instanceId, limit) {
+        // NULL fica por último num ORDER BY ... DESC no SQLite — contato nunca
+        // visto (last_seen nulo) naturalmente vai para o fim da fila.
+        return all(
+          `SELECT * FROM contacts WHERE instance_id=? AND avatar_fetched_at IS NULL
+             ORDER BY last_seen DESC LIMIT ?`,
+          instanceId,
+          limit,
+        ).map(m.mapContact);
+      },
     },
 
     // ---------------------------------------------------------------- templates

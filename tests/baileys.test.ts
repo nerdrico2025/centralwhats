@@ -722,6 +722,110 @@ describe('avatar do contato (worker busca, API só lê)', () => {
   });
 });
 
+describe('backfill de avatar em conta-gotas (FASE 2A)', () => {
+  function socketComFoto(url: string | undefined) {
+    const fake = makeFakeSocket();
+    const chamadas: string[] = [];
+    fake.socket.profilePictureUrl = async (jid: string) => {
+      chamadas.push(jid);
+      return url;
+    };
+    return { fake, chamadas };
+  }
+
+  it('busca quem nunca recebeu mensagem nova desde o deploy (gatilho de mensagem nunca dispara para eles)', async () => {
+    const { fake, chamadas } = socketComFoto('https://cdn.wa/velho.jpg');
+    const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket, minProfileIntervalMs: 1 });
+    await worker.connectInstance(inst);
+    await repo.contacts.upsert({
+      instance_id: inst.id, phone: PHONE, name: null, last_seen: '2020-01-01T00:00:00.000Z',
+    });
+
+    const r = await worker.backfillAvatarsOnce();
+    expect(r).toEqual({ tentados: 1, comFoto: 1, semFoto: 0, falhas: 0 });
+    expect(chamadas).toEqual([PHONE + '@s.whatsapp.net']);
+    const c = await repo.contacts.getByPhone(inst.id, PHONE);
+    expect(c?.avatar_url).toBe('https://cdn.wa/velho.jpg');
+    await worker.stop();
+  });
+
+  it('conta-gotas: respeita avatarBackfillBatch por instância, por passagem', async () => {
+    const { fake, chamadas } = socketComFoto('https://cdn.wa/foto.jpg');
+    const worker = new BaileysWorker(repo, {
+      socketFactory: async () => fake.socket,
+      minProfileIntervalMs: 1,
+      avatarBackfillBatch: 2,
+    });
+    await worker.connectInstance(inst);
+    for (const p of ['5511111111111', '5511222222222', '5511333333333']) {
+      await repo.contacts.upsert({ instance_id: inst.id, phone: p, name: null, last_seen: null });
+    }
+
+    const r = await worker.backfillAvatarsOnce();
+    expect(r.tentados).toBe(2); // NÃO varre os 3 — teto do lote
+    expect(chamadas).toHaveLength(2);
+    await worker.stop();
+  });
+
+  it('prioriza o contato mais ativo (last_seen DESC)', async () => {
+    const { fake, chamadas } = socketComFoto('https://cdn.wa/foto.jpg');
+    const worker = new BaileysWorker(repo, {
+      socketFactory: async () => fake.socket,
+      minProfileIntervalMs: 1,
+      avatarBackfillBatch: 1,
+    });
+    await worker.connectInstance(inst);
+    await repo.contacts.upsert({
+      instance_id: inst.id, phone: '5511111111111', name: null, last_seen: '2024-01-01T00:00:00.000Z',
+    });
+    await repo.contacts.upsert({
+      instance_id: inst.id, phone: '5511222222222', name: null, last_seen: '2026-01-01T00:00:00.000Z',
+    });
+
+    await worker.backfillAvatarsOnce();
+    expect(chamadas).toEqual(['5511222222222@s.whatsapp.net']); // last_seen mais recente primeiro
+    await worker.stop();
+  });
+
+  it('CACHE NEGATIVO já preenchido não volta a entrar no backfill', async () => {
+    const { fake, chamadas } = socketComFoto('https://cdn.wa/foto.jpg');
+    const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket, minProfileIntervalMs: 1 });
+    await worker.connectInstance(inst);
+    await repo.contacts.upsert({ instance_id: inst.id, phone: PHONE, name: null, last_seen: null });
+    await repo.contacts.setAvatar(inst.id, PHONE, null, new Date().toISOString());
+
+    const r = await worker.backfillAvatarsOnce();
+    expect(r).toEqual({ tentados: 0, comFoto: 0, semFoto: 0, falhas: 0 });
+    expect(chamadas).toHaveLength(0);
+    await worker.stop();
+  });
+
+  it('conta com foto e sem foto separadamente — nada de descarte silencioso', async () => {
+    const fake = makeFakeSocket();
+    fake.socket.profilePictureUrl = async (jid: string) =>
+      jid.startsWith('5511111') ? 'https://cdn.wa/foto.jpg' : undefined;
+    const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket, minProfileIntervalMs: 1 });
+    await worker.connectInstance(inst);
+    await repo.contacts.upsert({ instance_id: inst.id, phone: '5511111111111', name: null, last_seen: null });
+    await repo.contacts.upsert({ instance_id: inst.id, phone: '5511222222222', name: null, last_seen: null });
+
+    const r = await worker.backfillAvatarsOnce();
+    expect(r).toEqual({ tentados: 2, comFoto: 1, semFoto: 1, falhas: 0 });
+    await worker.stop();
+  });
+
+  it('instância Meta (sem profilePictureUrl) nunca entra no backfill', async () => {
+    const fake = makeFakeSocket(); // sem profilePictureUrl, como o caminho Meta
+    const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket, minProfileIntervalMs: 1 });
+    await worker.connectInstance(inst);
+    await repo.contacts.upsert({ instance_id: inst.id, phone: PHONE, name: null, last_seen: null });
+
+    const r = await worker.backfillAvatarsOnce();
+    expect(r).toEqual({ tentados: 0, comFoto: 0, semFoto: 0, falhas: 0 });
+    await worker.stop();
+  });
+});
+
 describe('fromMe — mensagem enviada por nós aparece no Live Chat', () => {
   const CONTATO = '554799582500';
 

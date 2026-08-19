@@ -76,6 +76,10 @@ export interface BaileysWorkerOpts {
   avatarTtlHours?: number;
   /** Intervalo mínimo entre consultas de foto de perfil (ms). */
   minProfileIntervalMs?: number;
+  /** Intervalo entre passagens do backfill de avatar em conta-gotas (ms). */
+  avatarBackfillIntervalMs?: number;
+  /** Máximo de contatos buscados por instância a cada passagem do backfill. */
+  avatarBackfillBatch?: number;
   /** Backoff máximo de reconexão (ms). */
   maxReconnectDelayMs?: number;
 }
@@ -134,6 +138,22 @@ export const AVATAR_TTL_HOURS = Number(process.env.AVATAR_TTL_HOURS ?? 24);
 export const BAILEYS_MIN_PROFILE_INTERVAL_MS = Number(
   process.env.BAILEYS_MIN_PROFILE_INTERVAL_MS ?? 2000,
 );
+
+/**
+ * BACKFILL DE AVATAR EM CONTA-GOTAS — intervalo entre passagens (ms, default
+ * 5min) e tamanho do lote por instância a cada passagem (default 20).
+ * Configuráveis por env AVATAR_BACKFILL_INTERVAL_MS / AVATAR_BACKFILL_BATCH.
+ *
+ * POR QUE conta-gotas e não varredura: a regra do projeto continua "não varrer
+ * todos os contatos ao conectar" — isto só pega quem `atualizarAvatarSeVencido`
+ * nunca viu (contato sem mensagem nova desde o deploy da foto). Prioriza quem
+ * está mais ativo (`last_seen DESC`) e passa pelo MESMO throttle/cache negativo
+ * de sempre — nenhuma chamada de rede nova, só a seleção de quem tentar agora.
+ */
+export const AVATAR_BACKFILL_INTERVAL_MS = Number(
+  process.env.AVATAR_BACKFILL_INTERVAL_MS ?? 5 * 60_000,
+);
+export const AVATAR_BACKFILL_BATCH = Number(process.env.AVATAR_BACKFILL_BATCH ?? 20);
 
 /** Telefone → JID do WhatsApp. */
 export function toJid(phone: string): string {
@@ -482,6 +502,7 @@ export class BaileysWorker {
    */
   private ultimoPerfilAt = new Map<string, number>();
   private filaDePerfil = new Map<string, Promise<unknown>>();
+  private backfillTimer: ReturnType<typeof setInterval> | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private scanTimer: ReturnType<typeof setInterval> | null = null;
   private scanning = false;
@@ -605,16 +626,20 @@ export class BaileysWorker {
    * Cache negativo: sem foto ou recusa por privacidade grava `avatar_url` nulo
    * COM carimbo. Sem isso, contato sem foto viraria uma chamada de rede por
    * mensagem, para sempre.
+   *
+   * Devolve a URL encontrada (ou `null`) — usado pelo backfill (FASE 2A) para
+   * contar quantos vieram com foto vs. vazios. Chamadores em fogo-e-esquece
+   * (`void ...catch`) seguem ignorando o retorno sem quebrar nada.
    */
-  async atualizarAvatarSeVencido(instance: Instance, phone: string): Promise<void> {
+  async atualizarAvatarSeVencido(instance: Instance, phone: string): Promise<string | null> {
     const socket = this.sockets.get(instance.id);
-    if (!socket?.profilePictureUrl) return; // Meta não passa por aqui
+    if (!socket?.profilePictureUrl) return null; // Meta não passa por aqui
 
     const contato = await this.repo.contacts.getByPhone(instance.id, phone);
-    if (!contato) return;
+    if (!contato) return null;
     const ttlMs = (this.opts.avatarTtlHours ?? AVATAR_TTL_HOURS) * 3600_000;
     const buscadoEm = contato.avatar_fetched_at ? Date.parse(contato.avatar_fetched_at) : 0;
-    if (buscadoEm && Date.now() - buscadoEm < ttlMs) return; // ainda vale
+    if (buscadoEm && Date.now() - buscadoEm < ttlMs) return contato.avatar_url ?? null; // ainda vale
 
     const url = await this.comThrottleDePerfil(instance.id, async () => {
       try {
@@ -630,6 +655,70 @@ export class BaileysWorker {
       }
     });
     await this.repo.contacts.setAvatar(instance.id, phone, url, new Date().toISOString());
+    return url;
+  }
+
+  /**
+   * Backfill de avatar em CONTA-GOTAS (FASE 2A) — roda periodicamente
+   * (`avatarBackfillIntervalMs`), no máximo `avatarBackfillBatch` contatos por
+   * instância Baileys CONECTADA a cada passagem, contato mais ativo primeiro.
+   * Reaproveita `atualizarAvatarSeVencido` inteiro: mesmo throttle por
+   * instância, mesmo cache negativo, mesmo jid já resolvido (nunca `@lid`
+   * cru — `listNeedingAvatar` devolve o `phone` já normalizado da tabela
+   * `contacts`, que é sempre o telefone real).
+   *
+   * ⚠️ MESMA CONVENÇÃO "UMA RÉPLICA" do resto do worker: com N réplicas, cada
+   * uma rodaria seu próprio backfill sobre o mesmo lote de pendentes — não
+   * duplica dado (setAvatar é idempotente), mas multiplica por N as consultas
+   * de perfil ao WhatsApp. Quem escalar o worker revisa este ponto também.
+   *
+   * Nunca falha em silêncio: loga tentados/com foto/sem foto/falhas a cada
+   * passagem que encontrou algo a fazer.
+   */
+  async backfillAvatarsOnce(): Promise<{
+    tentados: number;
+    comFoto: number;
+    semFoto: number;
+    falhas: number;
+  }> {
+    const batch = this.opts.avatarBackfillBatch ?? AVATAR_BACKFILL_BATCH;
+    let tentados = 0;
+    let comFoto = 0;
+    let semFoto = 0;
+    let falhas = 0;
+
+    for (const [instanceId, socket] of this.sockets) {
+      if (!socket.profilePictureUrl) continue; // defensivo — não deveria haver socket Meta aqui
+
+      const instance = await this.repo.instances.getById(instanceId);
+      if (!instance) continue;
+
+      const pendentes = await this.repo.contacts.listNeedingAvatar(instanceId, batch);
+      for (const contato of pendentes) {
+        tentados++;
+        try {
+          const url = await this.atualizarAvatarSeVencido(instance, contato.phone);
+          if (url) comFoto++;
+          else semFoto++;
+        } catch (err) {
+          falhas++;
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[worker] backfill de avatar falhou para ${contato.phone} (instância ${instanceId}):`,
+            err,
+          );
+        }
+      }
+    }
+
+    if (tentados) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[worker] backfill de avatar: ${tentados} tentados, ${comFoto} com foto, ` +
+          `${semFoto} sem foto, ${falhas} falharam`,
+      );
+    }
+    return { tentados, comFoto, semFoto, falhas };
   }
 
   /** Fila de consultas de perfil por instância (ver ultimoPerfilAt). */
@@ -718,12 +807,24 @@ export class BaileysWorker {
         console.error('[worker] erro na varredura de instâncias:', err);
       });
     }, scanMs);
+
+    // Conta-gotas de avatar (FASE 2A): pega quem `atualizarAvatarSeVencido`
+    // nunca viu. Timer legítimo pelo mesmo motivo dos dois acima — processo
+    // longo-vivo por desenho.
+    const backfillMs = this.opts.avatarBackfillIntervalMs ?? AVATAR_BACKFILL_INTERVAL_MS;
+    this.backfillTimer = setInterval(() => {
+      void this.backfillAvatarsOnce().catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error('[worker] erro no backfill de avatar:', err);
+      });
+    }, backfillMs);
   }
 
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.pollTimer) clearInterval(this.pollTimer);
     if (this.scanTimer) clearInterval(this.scanTimer);
+    if (this.backfillTimer) clearInterval(this.backfillTimer);
     for (const socket of this.sockets.values()) socket.end?.();
     this.sockets.clear();
   }

@@ -324,6 +324,17 @@ export function createPostgresAdapter(opts: { connectionString: string }): Repo 
           normalizePhone(phone),
         ]);
       },
+      async listNeedingAvatar(instanceId, limit) {
+        // Postgres, ao contrário do SQLite, põe NULL PRIMEIRO num DESC por
+        // padrão — sem NULLS LAST aqui, contato nunca visto furaria a fila.
+        return (
+          await all(
+            `SELECT * FROM contacts WHERE instance_id=$1 AND avatar_fetched_at IS NULL
+               ORDER BY last_seen DESC NULLS LAST LIMIT $2`,
+            [instanceId, limit],
+          )
+        ).map(m.mapContact);
+      },
     },
 
     templates: {

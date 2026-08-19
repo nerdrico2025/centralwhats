@@ -298,6 +298,12 @@ export interface ContactsRepo {
   touchLastSeen(instanceId: string, phone: string, at: string): Promise<void>;
   /** Marca a conversa como lida até `at` (Live Chat). */
   markRead(instanceId: string, phone: string, at: string): Promise<void>;
+  /**
+   * Contatos SEM foto ainda tentada (`avatar_fetched_at IS NULL`), contato
+   * mais ativo primeiro (`last_seen DESC`) — a fonte do backfill em
+   * conta-gotas (FASE 2A). Nunca devolve mais que `limit`.
+   */
+  listNeedingAvatar(instanceId: string, limit: number): Promise<Contact[]>;
 }
 
 export interface TemplatesRepo {
