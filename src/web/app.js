@@ -363,6 +363,20 @@ function formatTime(iso) {
 }
 
 /**
+ * Tick de status na bolha OUTBOUND (FASE 2C) — só existe na THREAD porque só
+ * ali o backend devolve `status` por mensagem (`repo.messages.listByContact`).
+ * A LISTA (FASE 2B) não tem esse dado na listagem — ver comentário em
+ * `renderList`. 'queued'/'failed' não têm tick próprio no app oficial (a
+ * mensagem ainda nem foi confirmada, ou não foi entregue) — sem marca aqui.
+ */
+function tickDe(status) {
+  if (status === 'read') return h('span', { class: 'bubble__tick bubble__tick--read' }, '✓✓');
+  if (status === 'delivered') return h('span', { class: 'bubble__tick' }, '✓✓');
+  if (status === 'sent') return h('span', { class: 'bubble__tick' }, '✓');
+  return null;
+}
+
+/**
  * Horário da lista de conversas, estilo WhatsApp (FASE 2B):
  *   hoje → HH:MM · ontem → "Ontem" · últimos 7 dias → dia da semana ·
  *   mais antigo → DD/MM/AAAA. Sempre em America/Sao_Paulo — o carimbo em
@@ -555,11 +569,16 @@ function livechatScreen() {
   /** Monta a casca da conversa. Só quando a conversa muda DE VERDADE. */
   function montarConversa() {
     const conv = convs.find((c) => c.phone === selected);
-    const nomeEl = h('strong', {}, (conv && conv.name) || selected);
+    // Nome em negrito na PRIMEIRA linha, telefone menor e cinza na SEGUNDA
+    // (FASE 2C) — antes ficavam lado a lado na mesma linha.
+    const nomeEl = h('strong', { class: 'conversation__header-name' }, (conv && conv.name) || selected);
     const header = h('div', { class: 'conversation__header' }, [
       h('div', { class: 'conv-item__linha' }, [
         avatarDe(conv && conv.name, selected, conv && conv.avatar_url),
-        h('div', {}, [nomeEl, ' ', h('span', { class: 'muted' }, selected)]),
+        h('div', { class: 'conversation__header-info' }, [
+          nomeEl,
+          h('span', { class: 'muted conversation__header-phone' }, selected),
+        ]),
       ]),
     ]);
     const msgsEl = h('div', { class: 'conversation__messages' });
@@ -621,7 +640,10 @@ function livechatScreen() {
       msgsEl.appendChild(
         h('div', { class: 'bubble bubble--' + (mm.direction === 'in' ? 'in' : 'out') }, [
           h('div', {}, messageText(mm.type, mm.content)),
-          h('div', { class: 'bubble__time' }, formatTime(mm.created_at)),
+          h('div', { class: 'bubble__meta' }, [
+            h('span', {}, formatTime(mm.created_at)),
+            mm.direction === 'out' ? tickDe(mm.status) : null,
+          ]),
         ]),
       );
     }

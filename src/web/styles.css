@@ -723,22 +723,36 @@ body {
   height: 100%;
   min-height: 0;
 }
-/* UMA LINHA, sempre. O header mora numa linha `auto` do grid: deixá-lo
-   crescer é deixá-lo empurrar o composer. Entre truncar o nome e o operador
-   não conseguir responder, truncar o nome é obviamente melhor — e o telefone
-   completo continua na lista ao lado. */
+/* ALTURA PREVISÍVEL, sempre. O header mora numa linha `auto` do grid: deixá-lo
+   crescer sem teto é deixá-lo empurrar o composer (mesmo risco da regra do
+   grid-template-rows). Nome (FASE 2C: primeira linha) e telefone (segunda)
+   truncam CADA UM com o próprio ellipsis em vez de quebrar — a soma das duas
+   é sempre duas linhas de texto, nunca mais. */
 .conversation__header {
   padding: 12px 16px;
   border-bottom: 1px solid var(--border);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
   min-width: 0;
 }
 /* Filho flex (o bloco nome+telefone ao lado do avatar) também precisa poder
-   encolher para o ellipsis valer. */
+   encolher para o ellipsis das linhas internas valer. */
 .conversation__header .conv-item__linha > div {
   min-width: 0;
+  overflow: hidden;
+}
+.conversation__header-info {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.conversation__header-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.conversation__header-phone {
+  font-size: 12px;
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -784,9 +798,21 @@ body {
   align-self: flex-end;
   background: #dcf8c6;
 }
-.bubble__time {
+.bubble__meta {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 3px;
+  margin-top: 3px;
   font-size: 10px;
   color: var(--text-muted);
-  margin-top: 3px;
-  text-align: right;
+}
+.bubble__tick {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+/* Azul do WhatsApp — só quando LIDA. Enviada/entregue ficam no cinza padrão
+   (mesmo elemento, .bubble__tick, cor herdada). */
+.bubble__tick--read {
+  color: #53bdeb;
 }
