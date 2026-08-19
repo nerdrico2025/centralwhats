@@ -364,7 +364,10 @@ function formatTime(iso) {
 
 function livechatScreen() {
   const listEl = h('div', { class: 'conv-list' });
-  const rightEl = h('div', {});
+  // conversation-pane: sem esta classe a coluna da direita não tem
+  // `min-height: 0` e o composer é CORTADO em conversas de nome longo — ver o
+  // comentário em styles.css. A coluna da esquerda sempre teve; esta não.
+  const rightEl = h('div', { class: 'conversation-pane' });
   // screen--full: sem esta classe o root fica com altura `auto` e o
   // `height: 100%` do .livechat não tem contra o que resolver — o composer sai
   // da tela em conversa longa. Ver o comentário grande em styles.css.

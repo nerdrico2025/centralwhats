@@ -577,6 +577,24 @@ body {
   overflow-y: auto;
   min-height: 0;
 }
+
+/* A COLUNA DA DIREITA precisa do mesmo min-height:0 que a da esquerda.
+   ELA FOI ESQUECIDA, e é por isso que o composer sumia.
+   Mecanismo (mesma família do ed0b9bb, um nível mais fundo): item de grid tem
+   tamanho MÍNIMO automático igual ao min-content do conteúdo. Sem zerar isso,
+   o piso desta coluna é o min-content de .conversation — que inclui o
+   min-content do header. Nome de contato mais longo quebra em mais linhas na
+   largura mínima, o piso sobe, a linha do grid cresce além do .livechat, e o
+   `overflow: hidden` dele CORTA o que sobra: o composer. Sem scroll em lugar
+   nenhum, porque nada nesse trecho tem overflow rolável — o operador
+   simplesmente não consegue responder.
+   Isso explica o sintoma ser SELETIVO por conversa: depende do nome.
+   min-width:0 pelo mesmo motivo no eixo horizontal (telefone é um token
+   longo e não quebrável). */
+.conversation-pane {
+  min-height: 0;
+  min-width: 0;
+}
 .conv-item {
   padding: 12px 14px;
   border-bottom: 1px solid var(--border);
@@ -623,9 +641,24 @@ body {
   height: 100%;
   min-height: 0;
 }
+/* UMA LINHA, sempre. O header mora numa linha `auto` do grid: deixá-lo
+   crescer é deixá-lo empurrar o composer. Entre truncar o nome e o operador
+   não conseguir responder, truncar o nome é obviamente melhor — e o telefone
+   completo continua na lista ao lado. */
 .conversation__header {
   padding: 12px 16px;
   border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+/* Filho flex (o bloco nome+telefone ao lado do avatar) também precisa poder
+   encolher para o ellipsis valer. */
+.conversation__header .conv-item__linha > div {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .conversation__messages {
   overflow-y: auto;
