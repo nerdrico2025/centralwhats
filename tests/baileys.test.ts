@@ -824,6 +824,32 @@ describe('backfill de avatar em conta-gotas (FASE 2A)', () => {
     expect(r).toEqual({ tentados: 0, comFoto: 0, semFoto: 0, falhas: 0 });
     await worker.stop();
   });
+
+  it('TRAVA DE REENTRÂNCIA: timer disparando com uma passagem ainda em voo pula o ciclo', async () => {
+    let liberar;
+    const travado = new Promise((r) => {
+      liberar = r;
+    });
+    const fake = makeFakeSocket();
+    fake.socket.profilePictureUrl = async () => {
+      await travado; // segura a primeira passagem "em voo", como uma rede lenta de verdade
+      return 'https://cdn.wa/foto.jpg';
+    };
+    const worker = new BaileysWorker(repo, { socketFactory: async () => fake.socket, minProfileIntervalMs: 1 });
+    await worker.connectInstance(inst);
+    await repo.contacts.upsert({ instance_id: inst.id, phone: PHONE, name: null, last_seen: null });
+
+    const p1 = worker.backfillAvatarsOnce(); // dispara e NÃO espera — fica "em voo"
+    await new Promise((r) => setTimeout(r, 10)); // dá tempo da flag ser setada e o fetch começar
+    const r2 = await worker.backfillAvatarsOnce(); // "timer" dispara de novo — deve pular
+
+    expect(r2).toEqual({ tentados: 0, comFoto: 0, semFoto: 0, falhas: 0 });
+
+    liberar(); // libera a primeira passagem
+    const r1 = await p1;
+    expect(r1).toEqual({ tentados: 1, comFoto: 1, semFoto: 0, falhas: 0 }); // a original completou normal
+    await worker.stop();
+  });
 });
 
 describe('fromMe — mensagem enviada por nós aparece no Live Chat', () => {

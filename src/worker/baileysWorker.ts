@@ -506,6 +506,7 @@ export class BaileysWorker {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private scanTimer: ReturnType<typeof setInterval> | null = null;
   private scanning = false;
+  private backfilling = false;
   private stopped = false;
 
   constructor(
@@ -674,6 +675,15 @@ export class BaileysWorker {
    *
    * Nunca falha em silêncio: loga tentados/com foto/sem foto/falhas a cada
    * passagem que encontrou algo a fazer.
+   *
+   * TRAVA DE REENTRÂNCIA (`backfilling`, mesmo padrão de `scanning` em
+   * `scanInstancesOnce`): uma passagem pode levar mais que
+   * `avatarBackfillIntervalMs` pra terminar — cada fetch é serial pelo
+   * throttle de perfil, e o tempo real por contato varia com a rede, não só
+   * com o intervalo mínimo configurado. Sem a trava, o próximo disparo do
+   * timer entra por cima da passagem anterior ainda em voo: não corrompe
+   * dado (`setAvatar` é idempotente), mas desperdiça consulta de perfil —
+   * dois passes competindo pela mesma fila do WhatsApp.
    */
   async backfillAvatarsOnce(): Promise<{
     tentados: number;
@@ -681,44 +691,56 @@ export class BaileysWorker {
     semFoto: number;
     falhas: number;
   }> {
-    const batch = this.opts.avatarBackfillBatch ?? AVATAR_BACKFILL_BATCH;
-    let tentados = 0;
-    let comFoto = 0;
-    let semFoto = 0;
-    let falhas = 0;
-
-    for (const [instanceId, socket] of this.sockets) {
-      if (!socket.profilePictureUrl) continue; // defensivo — não deveria haver socket Meta aqui
-
-      const instance = await this.repo.instances.getById(instanceId);
-      if (!instance) continue;
-
-      const pendentes = await this.repo.contacts.listNeedingAvatar(instanceId, batch);
-      for (const contato of pendentes) {
-        tentados++;
-        try {
-          const url = await this.atualizarAvatarSeVencido(instance, contato.phone);
-          if (url) comFoto++;
-          else semFoto++;
-        } catch (err) {
-          falhas++;
-          // eslint-disable-next-line no-console
-          console.warn(
-            `[worker] backfill de avatar falhou para ${contato.phone} (instância ${instanceId}):`,
-            err,
-          );
-        }
-      }
-    }
-
-    if (tentados) {
+    if (this.backfilling) {
       // eslint-disable-next-line no-console
       console.log(
-        `[worker] backfill de avatar: ${tentados} tentados, ${comFoto} com foto, ` +
-          `${semFoto} sem foto, ${falhas} falharam`,
+        '[worker] backfill de avatar: passagem anterior ainda em andamento, pulando este ciclo',
       );
+      return { tentados: 0, comFoto: 0, semFoto: 0, falhas: 0 };
     }
-    return { tentados, comFoto, semFoto, falhas };
+    this.backfilling = true;
+    try {
+      const batch = this.opts.avatarBackfillBatch ?? AVATAR_BACKFILL_BATCH;
+      let tentados = 0;
+      let comFoto = 0;
+      let semFoto = 0;
+      let falhas = 0;
+
+      for (const [instanceId, socket] of this.sockets) {
+        if (!socket.profilePictureUrl) continue; // defensivo — não deveria haver socket Meta aqui
+
+        const instance = await this.repo.instances.getById(instanceId);
+        if (!instance) continue;
+
+        const pendentes = await this.repo.contacts.listNeedingAvatar(instanceId, batch);
+        for (const contato of pendentes) {
+          tentados++;
+          try {
+            const url = await this.atualizarAvatarSeVencido(instance, contato.phone);
+            if (url) comFoto++;
+            else semFoto++;
+          } catch (err) {
+            falhas++;
+            // eslint-disable-next-line no-console
+            console.warn(
+              `[worker] backfill de avatar falhou para ${contato.phone} (instância ${instanceId}):`,
+              err,
+            );
+          }
+        }
+      }
+
+      if (tentados) {
+        // eslint-disable-next-line no-console
+        console.log(
+          `[worker] backfill de avatar: ${tentados} tentados, ${comFoto} com foto, ` +
+            `${semFoto} sem foto, ${falhas} falharam`,
+        );
+      }
+      return { tentados, comFoto, semFoto, falhas };
+    } finally {
+      this.backfilling = false;
+    }
   }
 
   /** Fila de consultas de perfil por instância (ver ultimoPerfilAt). */
