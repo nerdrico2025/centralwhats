@@ -17,6 +17,24 @@
 --   UPDATE contacts SET last_read_at = NULL
 --     WHERE last_read_at = '2026-08-19T00:00:00.000Z';
 --
+-- DUAS DECISÕES REVISADAS E CONFIRMADAS (revisão de 2026-08-19, depois do
+-- commit inicial deste arquivo) — registradas aqui para quem ler isto sem o
+-- histórico da conversa:
+--
+--   (a) ESCOPO GLOBAL, de propósito — sem `AND instance_id = '...'`. Migration
+--       roda uma vez só (tabela `_migrations`) e não aceita parâmetro; um
+--       filtro por instância exigiria um arquivo por instância ou uma lista
+--       fixa de ids, e o Rafael confirmou que quer TODAS de uma vez. O revert
+--       continua exato do mesmo jeito — quem discrimina "o que este backfill
+--       tocou" é o timestamp fixo, não o escopo.
+--
+--   (b) TIMESTAMP MANTIDO em 2026-08-19T00:00:00.000Z (UTC) — de propósito,
+--       NÃO trocado pelo instante de aplicação. Isto é UTC = 18/08 21h em
+--       America/Sao_Paulo: qualquer inbound recebido DEPOIS desse instante
+--       (hora local) segue contando como não-lida depois do backfill — só o
+--       histórico anterior a esse corte é zerado, não "tudo até agora".
+--       Confirmado como o comportamento desejado.
+--
 -- NOTA CLAUDE.md: isto é um UPDATE de dado, não "adição nullable" (a regra
 -- geral de migration deste projeto). Documentado aqui por instrução explícita
 -- do Rafael, com o SQL e a estratégia de revert definidos por ele — não é
