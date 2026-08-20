@@ -983,40 +983,6 @@ export class BaileysWorker {
       this.connecting.delete(instance.id);
     }
     this.sockets.set(instance.id, socket);
-
-    // ⚠️⚠️ DIAGNÓSTICO TEMPORÁRIO — CHAMADA AO VIVO DE profilePictureUrl ⚠️⚠️
-    // NÃO faz parte de nenhum commit definitivo. Só log, nenhuma escrita no
-    // banco (não chama atualizarAvatarSeVencido nem setAvatar) — testa os
-    // DOIS jids possíveis pro contato "Rafael" (554799582500) pra ver se a
-    // resolução phone-based (o que o código de produção usa hoje) se
-    // comporta diferente da lid-based (o que os logs de mensagem mostraram
-    // ser o endereçamento real desse contato). REMOVER depois do diagnóstico.
-    if (instance.id === 'a63e3b85-4c40-45e9-b363-29489e14b0ac') {
-      void (async () => {
-        // Dá tempo do socket terminar de abrir antes de disparar a chamada.
-        await new Promise((r) => setTimeout(r, 5000));
-        if (!socket.profilePictureUrl) return;
-        for (const [rotulo, jid] of [
-          ['phone-based', '554799582500@s.whatsapp.net'],
-          ['lid-based', '2254941716650@lid'],
-        ] as const) {
-          try {
-            const url = await socket.profilePictureUrl(jid, 'preview');
-            // eslint-disable-next-line no-console
-            console.log(`[TEMP-DIAG-AVATAR] ${rotulo} jid=${jid} → url=${url ?? '(vazio)'}`);
-          } catch (err) {
-            const e = err as { message?: string; output?: { statusCode?: number }; data?: { reason?: unknown } };
-            // eslint-disable-next-line no-console
-            console.log(
-              `[TEMP-DIAG-AVATAR] ${rotulo} jid=${jid} → ERRO statusCode=${e?.output?.statusCode ?? '-'} ` +
-                `reason=${String(e?.data?.reason ?? '-')} message=${e?.message ?? String(err)}`,
-            );
-          }
-        }
-      })();
-    }
-    // ⚠️⚠️ FIM DO DIAGNÓSTICO TEMPORÁRIO ⚠️⚠️
-
     socket.ev.on('connection.update', ((update: {
       qr?: string;
       connection?: string;
