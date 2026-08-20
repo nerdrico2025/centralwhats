@@ -1027,6 +1027,30 @@ export class BaileysWorker {
         });
       }
     }) as never);
+
+    // ⚠️⚠️ INSTRUMENTAÇÃO TEMPORÁRIA — MEDIÇÃO DE LATÊNCIA DO unreadCount ⚠️⚠️
+    // NÃO faz parte de nenhum commit definitivo. Só log, nenhuma escrita no
+    // banco, escopado à instância a63e3b85 de propósito (não polui log de
+    // instâncias reais de outros clientes). REMOVER assim que a medição
+    // terminar — ver a rodada que pediu isto.
+    if (instance.id === 'a63e3b85-4c40-45e9-b363-29489e14b0ac') {
+      socket.ev.on('chats.update', ((updates: Array<{ id?: string; unreadCount?: number | null }>) => {
+        try {
+          for (const u of updates ?? []) {
+            if (u.unreadCount === undefined) continue; // update sem esse campo — não é o que medimos
+            // eslint-disable-next-line no-console
+            console.log(
+              `[TEMP-MEDICAO-UNREADCOUNT] chats.update recebido em=${Date.now()} ` +
+                `remoteJid=${u.id ?? '-'} unreadCount=${u.unreadCount}`,
+            );
+          }
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.error('[TEMP-MEDICAO-UNREADCOUNT] erro no listener temporário:', err);
+        }
+      }) as never);
+    }
+    // ⚠️⚠️ FIM DA INSTRUMENTAÇÃO TEMPORÁRIA ⚠️⚠️
   }
 
   /** QR/conexão: reflete em connection_status e persiste o QR pro painel. */
